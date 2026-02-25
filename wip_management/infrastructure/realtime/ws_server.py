@@ -20,26 +20,37 @@ class WebSocketServerAdapter:
         await ws.accept()
         async with self._lock:
             self._connections.add(ws)
+            count = len(self._connections)
+        log.info("WS client connected active=%s", count)
 
     async def disconnect(self, ws: WebSocket) -> None:
         async with self._lock:
             self._connections.discard(ws)
+            count = len(self._connections)
+        log.info("WS client disconnected active=%s", count)
 
     async def broadcast(self, payload: dict[str, Any]) -> None:
         async with self._lock:
             targets = list(self._connections)
+        if not targets:
+            log.debug("WS broadcast skipped no clients payload_type=%s", payload.get("type"))
+            return
         dead: list[WebSocket] = []
         for ws in targets:
             try:
                 await ws.send_json(payload)
             except Exception:  # noqa: BLE001
+                log.exception("WS send failed; marking client as dead")
                 dead.append(ws)
         if dead:
             async with self._lock:
                 for ws in dead:
                     self._connections.discard(ws)
+            log.warning("WS removed dead clients count=%s active=%s", len(dead), len(self._connections))
+        log.debug("WS broadcast done payload_type=%s targets=%s", payload.get("type"), len(targets))
 
     async def event_pump(self, queue: asyncio.Queue[Any]) -> None:
+        log.info("WS event pump started")
         while True:
             event = await queue.get()
             payload = _event_to_payload(event)

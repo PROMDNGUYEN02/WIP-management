@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from wip_management.domain.models.tray import Tray, TrayId, TrayStatus
-from wip_management.domain.models.trolley import Column, Trolley, TrolleyId, TrolleyMode
+from wip_management.domain.models.trolley import (
+    Column,
+    Trolley,
+    TrolleyId,
+    TrolleyMode,
+    TrolleyState,
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -31,60 +37,77 @@ def build_trolley_projection(
     manual_assignments: Mapping[str, tuple[Column, str]] | None = None,
     max_per_trolley: int = 30,
     assembly_auto_trolley_count: int = 1,
+    auto_group_enabled: bool = True,
 ) -> TrolleyProjection:
     rows = sorted(trays, key=_tray_sort_key, reverse=True)
     assignments = manual_assignments or {}
+    tray_by_id = {str(tray.tray_id): tray for tray in rows}
 
-    manual_groups: dict[tuple[Column, str], list[Tray]] = defaultdict(list)
+    manual_groups: dict[str, list[Tray]] = defaultdict(list)
     manually_assigned: set[str] = set()
     for tray in rows:
         tray_key = str(tray.tray_id)
         assignment = assignments.get(tray_key)
         if assignment is None:
             continue
-        column, trolley_id = assignment
+        _, trolley_id = assignment
         if not trolley_id:
             continue
-        manual_groups[(column, trolley_id)].append(tray)
+        manual_groups[trolley_id].append(tray)
         manually_assigned.add(tray_key)
 
-    queue_auto: list[Tray] = []
-    precharge_auto: list[Tray] = []
-    assembly_auto_candidates: list[Tray] = []
+    queue_candidates: list[Tray] = []
+    precharge_candidates: list[Tray] = []
+    assembly_ungrouped: list[Tray] = []
 
     for tray in rows:
         if str(tray.tray_id) in manually_assigned:
             continue
+        if not auto_group_enabled:
+            assembly_ungrouped.append(tray)
+            continue
         column = choose_column(tray)
         if column is Column.QUEUE:
-            queue_auto.append(tray)
+            queue_candidates.append(tray)
             continue
         if column is Column.PRECHARGE:
-            precharge_auto.append(tray)
+            precharge_candidates.append(tray)
             continue
-        assembly_auto_candidates.append(tray)
+        assembly_ungrouped.append(tray)
 
-    queue_trolleys = [
-        *_manual_trolleys_for_column(Column.QUEUE, manual_groups),
-        *_chunk_to_auto_trolleys(Column.QUEUE, queue_auto, max_per_trolley=max_per_trolley),
-    ]
-    precharge_trolleys = [
-        *_manual_trolleys_for_column(Column.PRECHARGE, manual_groups),
-        *_chunk_to_auto_trolleys(Column.PRECHARGE, precharge_auto, max_per_trolley=max_per_trolley),
-    ]
-
-    assembly_capacity = max(assembly_auto_trolley_count, 0) * max_per_trolley
-    if assembly_capacity > 0:
-        assembly_auto = assembly_auto_candidates[:assembly_capacity]
-        assembly_ungrouped = assembly_auto_candidates[assembly_capacity:]
+    if auto_group_enabled:
+        assembly_trolleys, queue_auto_trolleys = _split_auto_queue_between_assembly_and_queue(
+            queue_candidates,
+            max_per_trolley=max_per_trolley,
+            assembly_auto_trolley_count=assembly_auto_trolley_count,
+        )
     else:
-        assembly_auto = []
-        assembly_ungrouped = assembly_auto_candidates
+        assembly_trolleys, queue_auto_trolleys = [], []
 
-    assembly_trolleys = [
-        *_manual_trolleys_for_column(Column.ASSEMBLY, manual_groups),
-        *_chunk_to_auto_trolleys(Column.ASSEMBLY, assembly_auto, max_per_trolley=max_per_trolley),
+    manual_queue_trolleys = _manual_trolleys(manual_groups, tray_by_id)
+    queue_trolleys, moved_to_precharge = _split_queue_and_precharge(
+        [*manual_queue_trolleys, *queue_auto_trolleys],
+        tray_by_id=tray_by_id,
+    )
+
+    precharge_auto = (
+        _chunk_to_auto_trolleys(
+            Column.PRECHARGE,
+            precharge_candidates,
+            max_per_trolley=max_per_trolley,
+            state=TrolleyState.WAITING,
+        )
+        if auto_group_enabled
+        else []
+    )
+    precharge_trolleys = [
+        *moved_to_precharge,
+        *[
+            _with_precharge_state(trolley, tray_by_id=tray_by_id)
+            for trolley in precharge_auto
+        ],
     ]
+
     return TrolleyProjection(
         assembly_trolleys=assembly_trolleys,
         queue_trolleys=queue_trolleys,
@@ -93,23 +116,21 @@ def build_trolley_projection(
     )
 
 
-def _manual_trolleys_for_column(
-    column: Column,
-    manual_groups: Mapping[tuple[Column, str], list[Tray]],
+def _manual_trolleys(
+    manual_groups: Mapping[str, list[Tray]],
+    tray_by_id: Mapping[str, Tray],
 ) -> list[Trolley]:
     out: list[Trolley] = []
-    keys = sorted(
-        [key for key in manual_groups if key[0] is column],
-        key=lambda key: key[1],
-    )
-    for _, trolley_id in keys:
-        trays = manual_groups[(column, trolley_id)]
+    for trolley_id in sorted(manual_groups.keys()):
+        trays = manual_groups[trolley_id]
         out.append(
-            Trolley(
-                trolley_id=TrolleyId(trolley_id),
-                column=column,
+            _build_trolley(
+                trolley_id=trolley_id,
+                column=Column.QUEUE,
                 tray_ids=[tray.tray_id for tray in trays],
+                tray_by_id=tray_by_id,
                 mode=TrolleyMode.MANUAL,
+                state=TrolleyState.AGING,
             )
         )
     return out
@@ -120,6 +141,7 @@ def _chunk_to_auto_trolleys(
     trays: list[Tray],
     *,
     max_per_trolley: int,
+    state: TrolleyState,
 ) -> list[Trolley]:
     if not trays:
         return []
@@ -134,10 +156,137 @@ def _chunk_to_auto_trolleys(
                 column=column,
                 tray_ids=[tray.tray_id for tray in chunk],
                 mode=TrolleyMode.AUTO,
+                state=state,
+                tray_quantity=len(chunk),
+                cell_quantity=sum(_tray_cell_quantity(tray) for tray in chunk),
             )
         )
         idx += 1
     return out
+
+
+def _split_auto_queue_between_assembly_and_queue(
+    queue_candidates: list[Tray],
+    *,
+    max_per_trolley: int,
+    assembly_auto_trolley_count: int,
+) -> tuple[list[Trolley], list[Trolley]]:
+    chunks: list[list[Tray]] = []
+    for i in range(0, len(queue_candidates), max_per_trolley):
+        chunks.append(queue_candidates[i : i + max_per_trolley])
+
+    assembly_trolleys: list[Trolley] = []
+    queue_trolleys: list[Trolley] = []
+    assembly_slots = max(assembly_auto_trolley_count, 0)
+    assembly_assigned = 0
+    asm_idx = 1
+    que_idx = 1
+
+    for chunk in chunks:
+        if len(chunk) < max_per_trolley and assembly_assigned < assembly_slots:
+            assembly_trolleys.append(
+                Trolley(
+                    trolley_id=TrolleyId(f"AUTO-ASM-{asm_idx}"),
+                    column=Column.ASSEMBLY,
+                    tray_ids=[tray.tray_id for tray in chunk],
+                    mode=TrolleyMode.AUTO,
+                    state=TrolleyState.STACKING,
+                    tray_quantity=len(chunk),
+                    cell_quantity=sum(_tray_cell_quantity(tray) for tray in chunk),
+                )
+            )
+            assembly_assigned += 1
+            asm_idx += 1
+            continue
+
+        queue_trolleys.append(
+            Trolley(
+                trolley_id=TrolleyId(f"AUTO-QUE-{que_idx}"),
+                column=Column.QUEUE,
+                tray_ids=[tray.tray_id for tray in chunk],
+                mode=TrolleyMode.AUTO,
+                state=TrolleyState.AGING,
+                tray_quantity=len(chunk),
+                cell_quantity=sum(_tray_cell_quantity(tray) for tray in chunk),
+            )
+        )
+        que_idx += 1
+
+    return assembly_trolleys, queue_trolleys
+
+
+def _split_queue_and_precharge(
+    queue_trolleys: list[Trolley],
+    *,
+    tray_by_id: Mapping[str, Tray],
+) -> tuple[list[Trolley], list[Trolley]]:
+    queue_out: list[Trolley] = []
+    precharge_out: list[Trolley] = []
+    for trolley in queue_trolleys:
+        trays = [tray_by_id.get(str(tray_id)) for tray_id in trolley.tray_ids]
+        trays = [tray for tray in trays if tray is not None]
+        if any(tray.has_ccu and tray.has_fpc for tray in trays):
+            moved = Trolley(
+                trolley_id=trolley.trolley_id,
+                column=Column.PRECHARGE,
+                tray_ids=trolley.tray_ids,
+                mode=trolley.mode,
+                state=TrolleyState.WAITING,
+                tray_quantity=trolley.tray_quantity,
+                cell_quantity=trolley.cell_quantity,
+            )
+            precharge_out.append(_with_precharge_state(moved, tray_by_id=tray_by_id))
+            continue
+        queue_out.append(trolley)
+    return queue_out, precharge_out
+
+
+def _with_precharge_state(trolley: Trolley, *, tray_by_id: Mapping[str, Tray]) -> Trolley:
+    trays = [tray_by_id.get(str(tray_id)) for tray_id in trolley.tray_ids]
+    trays = [tray for tray in trays if tray is not None]
+    completed = bool(trays) and all(tray.has_ccu and tray.has_fpc for tray in trays)
+    return Trolley(
+        trolley_id=trolley.trolley_id,
+        column=Column.PRECHARGE,
+        tray_ids=trolley.tray_ids,
+        mode=trolley.mode,
+        state=TrolleyState.COMPLETED if completed else TrolleyState.WAITING,
+        tray_quantity=trolley.tray_quantity,
+        cell_quantity=trolley.cell_quantity,
+    )
+
+
+def _build_trolley(
+    *,
+    trolley_id: str,
+    column: Column,
+    tray_ids: list[TrayId],
+    tray_by_id: Mapping[str, Tray],
+    mode: TrolleyMode,
+    state: TrolleyState,
+) -> Trolley:
+    trays = [tray_by_id.get(str(tray_id)) for tray_id in tray_ids]
+    trays = [tray for tray in trays if tray is not None]
+    return Trolley(
+        trolley_id=TrolleyId(trolley_id),
+        column=column,
+        tray_ids=tray_ids,
+        mode=mode,
+        state=state,
+        tray_quantity=len(tray_ids),
+        cell_quantity=sum(_tray_cell_quantity(tray) for tray in trays),
+    )
+
+
+def _tray_cell_quantity(tray: Tray) -> int:
+    payload = tray.ccu_payload or {}
+    raw = payload.get("quantity")
+    if isinstance(raw, int):
+        return max(raw, 0)
+    try:
+        return max(int(str(raw)), 0)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _column_prefix(column: Column) -> str:

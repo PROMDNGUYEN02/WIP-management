@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 from wip_management.application.state.reducers import apply_signal_to_tray, tray_desc_sort_key
 from wip_management.domain.models.tray import Tray, TrayId, TraySignal
 from wip_management.domain.state_machine import TrayStateMachine
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(slots=True, frozen=True)
@@ -50,35 +53,44 @@ class SingleWriterStateStore:
 
     async def start(self) -> None:
         if self._task is not None:
+            log.debug("State store start skipped because writer loop already exists")
             return
         self._task = asyncio.create_task(self._writer_loop(), name="wip-single-writer-loop")
+        log.info("State store writer loop started queue_size=%s", self._queue.maxsize)
 
     async def stop(self) -> None:
         if self._task is None:
+            log.debug("State store stop skipped because writer loop is None")
             return
+        log.info("State store stopping writer loop")
         await self._queue.put(_StopCommand())
         await self._task
         self._task = None
+        log.info("State store writer loop stopped")
 
     async def apply_signals(self, signals: list[TraySignal]) -> StoreApplyResult:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[StoreApplyResult] = loop.create_future()
+        log.debug("State store enqueue apply_signals count=%s", len(signals))
         await self._queue.put(_ApplySignalsCommand(signals=signals, future=fut))
         return await fut
 
     async def snapshot_desc(self, limit: int | None = None) -> list[Tray]:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[list[Tray]] = loop.create_future()
+        log.debug("State store enqueue snapshot_desc limit=%s", limit)
         await self._queue.put(_SnapshotCommand(limit=limit, future=fut))
         return await fut
 
     async def size(self) -> int:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[int] = loop.create_future()
+        log.debug("State store enqueue size")
         await self._queue.put(_SizeCommand(future=fut))
         return await fut
 
     async def _writer_loop(self) -> None:
+        log.debug("State store writer loop entered")
         while True:
             cmd = await self._queue.get()
             try:
@@ -92,8 +104,10 @@ class SingleWriterStateStore:
                     cmd.future.set_result(len(self._trays))
                     continue
                 if isinstance(cmd, _StopCommand):
+                    log.debug("State store writer loop received stop command")
                     break
             except Exception as exc:  # noqa: BLE001
+                log.exception("State store writer command failed")
                 if hasattr(cmd, "future") and not cmd.future.done():
                     cmd.future.set_exception(exc)
 
@@ -101,6 +115,7 @@ class SingleWriterStateStore:
             pending = self._queue.get_nowait()
             if hasattr(pending, "future") and not pending.future.done():
                 pending.future.set_exception(RuntimeError("State store stopped"))
+        log.debug("State store writer loop drained pending queue and exited")
 
     def _apply_signals(self, signals: list[TraySignal]) -> StoreApplyResult:
         changed: list[Tray] = []
@@ -121,6 +136,13 @@ class SingleWriterStateStore:
             else:
                 missing_ccu_ids.discard(tray_key)
 
+        log.debug(
+            "State store applied signals input=%s changed=%s total_trays=%s missing_ccu=%s",
+            len(signals),
+            len(changed),
+            len(self._trays),
+            len(missing_ccu_ids),
+        )
         return StoreApplyResult(changed=changed, missing_ccu_tray_ids=missing_ccu_ids)
 
     def _snapshot_desc(self, limit: int | None = None) -> list[Tray]:
@@ -128,5 +150,5 @@ class SingleWriterStateStore:
         rows.sort(key=tray_desc_sort_key, reverse=True)
         if limit is not None:
             rows = rows[:limit]
+        log.debug("State store snapshot built rows=%s limit=%s", len(rows), limit)
         return rows
-

@@ -35,6 +35,10 @@ Detailed sub-structure:
 2. Install deps:
    `pip install -e .`
 3. Configure `.env` (already present in this repo).
+   - `LOG_LEVEL=DEBUG` for detailed diagnostics
+   - `LOG_FILE=wip_management.log` (default)
+   - `SHARED_STATE_ENABLED=true` to share manual/auto grouping state across users
+   - `SHARED_STATE_DIR=...` shared folder path
 4. Start app:
    `python -m wip_management`
 

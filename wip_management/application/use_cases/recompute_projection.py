@@ -25,12 +25,14 @@ class RecomputeProjectionUseCase:
         manual_assignments: dict[str, tuple[Column, str]] | None = None,
         max_per_trolley: int = 30,
         assembly_auto_trolley_count: int = 1,
+        auto_group_enabled: bool = True,
     ) -> Projection:
         grouped = build_trolley_projection(
             trays,
             manual_assignments=manual_assignments,
             max_per_trolley=max_per_trolley,
             assembly_auto_trolley_count=assembly_auto_trolley_count,
+            auto_group_enabled=auto_group_enabled,
         )
         trolleys = [
             *grouped.assembly_trolleys,
