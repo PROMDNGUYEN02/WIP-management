@@ -1,3 +1,19 @@
+Metadata-Version: 2.4
+Name: wip-management
+Version: 0.1.0
+Summary: Real-time tray state pipeline for CCU/FPC from SQL Server to WebSocket UI
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: aioodbc>=0.5.0
+Requires-Dist: fastapi>=0.116.0
+Requires-Dist: PySide6>=6.8.0
+Requires-Dist: pydantic>=2.11.0
+Requires-Dist: pydantic-settings>=2.10.0
+Requires-Dist: uvicorn[standard]>=0.35.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.3.0; extra == "dev"
+Requires-Dist: ruff>=0.12.0; extra == "dev"
+
 # WIP-management
 
 Codebase is now structured as Event-Driven Clean Architecture + MVVM + Single-Writer Store in `wip_management/`.

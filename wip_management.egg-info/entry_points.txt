@@ -1,0 +1,2 @@
+[console_scripts]
+wip-management = wip_management.__main__:main

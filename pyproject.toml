@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wip-management"
+version = "0.1.0"
+description = "Real-time tray state pipeline for CCU/FPC from SQL Server to WebSocket UI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "aioodbc>=0.5.0",
+  "fastapi>=0.116.0",
+  "PySide6>=6.8.0",
+  "pydantic>=2.11.0",
+  "pydantic-settings>=2.10.0",
+  "uvicorn[standard]>=0.35.0",
+]
+
+[project.scripts]
+wip-management = "wip_management.__main__:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0",
+  "ruff>=0.12.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["wip_management*"]
+exclude = ["venv*", "wip_management.egg-info*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
