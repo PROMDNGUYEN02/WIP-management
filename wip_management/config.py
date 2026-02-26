@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     tray_detail_cache_max_entries: int = Field(default=128, ge=0, le=2000)
 
     max_parallel_workers: int = Field(default=8, ge=1, le=64)
-    max_fetch_batch: int = Field(default=5000, ge=100, le=100000)
+    max_fetch_batch: int = Field(default=20000, ge=100, le=100000)
     event_queue_size: int = Field(default=20000, ge=1000, le=500000)
     ui_snapshot_limit: int = Field(default=50000, ge=100, le=200000)
     ui_coalesce_window_ms: int = Field(default=40, ge=5, le=1000)

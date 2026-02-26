@@ -94,17 +94,18 @@ class CcuRepo:
 
     async def peek_latest_signal_time(self, end_time: datetime) -> datetime | None:
         query = (
-            "SELECT MAX(signal_time) AS latest_signal_time FROM ("
-            f" SELECT MAX({self._end_col}) AS signal_time"
-            f" FROM {self._table}"
-            f" WHERE {self._end_col} IS NOT NULL AND {self._end_col} <= ?"
-            " UNION ALL"
-            f" SELECT MAX({self._start_col}) AS signal_time"
-            f" FROM {self._table}"
-            f" WHERE {self._end_col} IS NULL AND {self._start_col} <= ?"
-            ") AS signal_rows"
+            "SELECT TOP 1 COALESCE("
+            f"{self._end_col}, {self._start_col}"
+            ") AS latest_signal_time "
+            f"FROM {self._table} "
+            "WHERE COALESCE("
+            f"{self._end_col}, {self._start_col}"
+            ") <= ? "
+            "ORDER BY COALESCE("
+            f"{self._end_col}, {self._start_col}"
+            ") DESC"
         )
-        rows = await self._conn.query_rows(query, [end_time, end_time])
+        rows = await self._conn.query_rows(query, [end_time])
         if not rows:
             log.debug("CCU peek latest returned empty rowset")
             return None
@@ -125,24 +126,18 @@ class CcuRepo:
         if not wanted:
             return []
         query = (
-            "SELECT TOP 5000 lot_no, start_time, end_time, record_json FROM ("
-            " SELECT "
+            "SELECT TOP 5000 "
             f"{self._lot_col} AS lot_no, "
             f"{self._start_col} AS start_time, "
             f"{self._end_col} AS end_time, "
             f"{self._record_col} AS record_json "
             f" FROM {self._table} "
-            f" WHERE {self._end_col} IS NOT NULL AND {self._end_col} >= ? AND {self._end_col} <= ? "
-            " UNION ALL "
-            " SELECT "
-            f"{self._lot_col} AS lot_no, "
-            f"{self._start_col} AS start_time, "
-            f"{self._end_col} AS end_time, "
-            f"{self._record_col} AS record_json "
-            f" FROM {self._table} "
-            f" WHERE {self._end_col} IS NULL AND {self._start_col} >= ? AND {self._start_col} <= ? "
-            ") AS source_rows "
-            "WHERE record_json LIKE ? "
+            "WHERE ("
+            f"({self._end_col} IS NOT NULL AND {self._end_col} >= ? AND {self._end_col} <= ?) "
+            "OR "
+            f"({self._end_col} IS NULL AND {self._start_col} >= ? AND {self._start_col} <= ?)"
+            ") "
+            "AND record_json LIKE ? "
             "ORDER BY COALESCE(end_time, start_time) ASC, lot_no ASC, start_time ASC, end_time ASC"
         )
         like_text = f"%{wanted}%"
@@ -204,24 +199,18 @@ class CcuRepo:
         if not wanted_cell:
             return None
         query = (
-            "SELECT TOP 400 lot_no, start_time, end_time, record_json FROM ("
-            " SELECT "
+            "SELECT TOP 400 "
             f"{self._lot_col} AS lot_no, "
             f"{self._start_col} AS start_time, "
             f"{self._end_col} AS end_time, "
             f"{self._record_col} AS record_json "
             f" FROM {self._table} "
-            f" WHERE {self._end_col} IS NOT NULL AND {self._end_col} >= ? AND {self._end_col} <= ? "
-            " UNION ALL "
-            " SELECT "
-            f"{self._lot_col} AS lot_no, "
-            f"{self._start_col} AS start_time, "
-            f"{self._end_col} AS end_time, "
-            f"{self._record_col} AS record_json "
-            f" FROM {self._table} "
-            f" WHERE {self._end_col} IS NULL AND {self._start_col} >= ? AND {self._start_col} <= ? "
-            ") AS source_rows "
-            "WHERE UPPER(CAST(lot_no AS NVARCHAR(128))) = ? "
+            "WHERE ("
+            f"({self._end_col} IS NOT NULL AND {self._end_col} >= ? AND {self._end_col} <= ?) "
+            "OR "
+            f"({self._end_col} IS NULL AND {self._start_col} >= ? AND {self._start_col} <= ?)"
+            ") "
+            "AND UPPER(CAST(lot_no AS NVARCHAR(128))) = ? "
             "ORDER BY COALESCE(end_time, start_time) DESC"
         )
         rows = await self._conn.query_rows(
@@ -298,23 +287,17 @@ class CcuRepo:
         offset: int,
     ) -> list[dict[str, Any]]:
         query = (
-            "SELECT lot_no, start_time, end_time, record_json FROM ("
-            " SELECT "
+            "SELECT "
             f"{self._lot_col} AS lot_no, "
             f"{self._start_col} AS start_time, "
             f"{self._end_col} AS end_time, "
             f"{self._record_col} AS record_json "
             f" FROM {self._table} "
-            f" WHERE {self._end_col} IS NOT NULL AND {self._end_col} >= ? AND {self._end_col} <= ? "
-            " UNION ALL "
-            " SELECT "
-            f"{self._lot_col} AS lot_no, "
-            f"{self._start_col} AS start_time, "
-            f"{self._end_col} AS end_time, "
-            f"{self._record_col} AS record_json "
-            f" FROM {self._table} "
-            f" WHERE {self._end_col} IS NULL AND {self._start_col} >= ? AND {self._start_col} <= ? "
-            ") AS source_rows "
+            "WHERE ("
+            f"({self._end_col} IS NOT NULL AND {self._end_col} >= ? AND {self._end_col} <= ?) "
+            "OR "
+            f"({self._end_col} IS NULL AND {self._start_col} >= ? AND {self._start_col} <= ?)"
+            ") "
             "ORDER BY COALESCE(end_time, start_time) ASC, lot_no ASC, start_time ASC, end_time ASC "
             "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
         )

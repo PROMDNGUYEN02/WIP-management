@@ -85,6 +85,7 @@ class OrchestratorService:
         self._tray_cells_cache_max_entries = max(0, int(settings.tray_detail_cache_max_entries))
         self._tray_cells_cache: dict[str, tuple[datetime, list[dict[str, str | None]]]] = {}
         self._tray_cells_inflight: dict[str, asyncio.Task[list[dict[str, str | None]]]] = {}
+        self._active_detail_queries = 0
 
     async def start(self) -> None:
         if self._running:
@@ -281,9 +282,11 @@ class OrchestratorService:
 
         task = asyncio.create_task(self._fetch_tray_cells_uncached(tray_key), name=f"tray-detail-{tray_key}")
         self._tray_cells_inflight[tray_key] = task
+        self._active_detail_queries += 1
         try:
             rows = await task
         finally:
+            self._active_detail_queries = max(0, self._active_detail_queries - 1)
             if self._tray_cells_inflight.get(tray_key) is task:
                 self._tray_cells_inflight.pop(tray_key, None)
 
@@ -536,6 +539,13 @@ class OrchestratorService:
     async def _refresh_once(self) -> bool:
         iteration = self._refresh_iteration
         started_at = time.perf_counter()
+        if self._active_detail_queries > 0:
+            log.debug(
+                "Refresh #%s skipped while tray detail query in progress count=%s",
+                iteration,
+                self._active_detail_queries,
+            )
+            return False
         watermark = await self._delta_tracker.get()
         if watermark is None:
             log.debug("Refresh #%s skipped because watermark is None", iteration)

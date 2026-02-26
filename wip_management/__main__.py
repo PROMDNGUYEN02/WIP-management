@@ -136,6 +136,7 @@ class _Runtime:
         self._orchestrator: OrchestratorService | None = None
         self._started = threading.Event()
         self._start_error: BaseException | None = None
+        self._tray_detail_submit_lock = threading.Lock()
 
     def start(self) -> None:
         log.info("Runtime start requested")
@@ -213,7 +214,12 @@ class _Runtime:
 
     def tray_cells(self, tray_id: str) -> list[dict[str, str | None]]:
         log.info("Tray detail requested tray_id=%s", tray_id)
-        return self._submit(self._tray_cells(tray_id=tray_id))
+        if not self._tray_detail_submit_lock.acquire(blocking=False):
+            raise RuntimeError("Tray detail is busy. Please wait for current request.")
+        try:
+            return self._submit(self._tray_cells(tray_id=tray_id))
+        finally:
+            self._tray_detail_submit_lock.release()
 
     def cell_owner(self, cell_id: str) -> dict[str, str | None] | None:
         log.info("Cell owner requested cell_id=%s", cell_id)
@@ -573,20 +579,26 @@ class _ColumnCard(QWidget):
                 | QAbstractItemView.EditTrigger.DoubleClicked
             )
             self.tray_table.verticalHeader().setVisible(False)
-            self.tray_table.verticalHeader().setDefaultSectionSize(34)
+            self.tray_table.verticalHeader().setDefaultSectionSize(30)
             header = self.tray_table.horizontalHeader()
             header.setSectionsClickable(True)
-            header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-            header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
             header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
             table_font = self.tray_table.font()
-            table_font.setPointSize(max(table_font.pointSize(), 11))
+            table_font.setPointSize(max(table_font.pointSize(), 10))
             self.tray_table.setFont(table_font)
             header.setFont(table_font)
-            self.tray_table.setColumnWidth(0, 52)
+            self.tray_table.setColumnWidth(0, 48)
+            self.tray_table.setColumnWidth(1, 52)
+            self.tray_table.setColumnWidth(3, 84)
+            self.tray_table.setColumnWidth(4, 170)
+            self.tray_table.setColumnWidth(5, 170)
+            self.tray_table.setColumnWidth(6, 115)
+            self.tray_table.setColumnWidth(7, 210)
+            self.tray_table.setColumnWidth(8, 100)
+            self.tray_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+            self.tray_table.setTextElideMode(Qt.TextElideMode.ElideNone)
             if on_tray_header_click is not None:
                 header.sectionClicked.connect(on_tray_header_click)
             self.tray_table.clicked.connect(self._on_tray_table_clicked)
@@ -622,7 +634,8 @@ class _ColumnCard(QWidget):
             if callable(set_checked):
                 set_checked(index.row(), True)
                 return
-        checked_now = model.data(index, Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
+        display_value = str(model.data(index, Qt.ItemDataRole.DisplayRole) or "").strip()
+        checked_now = display_value == "\u25cf"
         target = Qt.CheckState.Unchecked if checked_now else Qt.CheckState.Checked
         model.setData(index, target, Qt.ItemDataRole.CheckStateRole)
 
@@ -704,10 +717,13 @@ class _TrayDetailBridge(QObject):
 
 
 class _TrolleyDetailDialog(QDialog):
+    _worker_lock = threading.Lock()
+
     def __init__(self, runtime: _Runtime, trolley_id: str, tray_rows: list[dict[str, str]], parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._runtime = runtime
         self._bridge = _TrayDetailBridge()
+        self._closed = False
         self._active_tray_id = ""
         self._active_request_id = 0
         self._request_seq = 0
@@ -736,7 +752,9 @@ class _TrolleyDetailDialog(QDialog):
         self._summary_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._summary_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._summary_table.verticalHeader().setVisible(False)
-        self._summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        summary_header = self._summary_table.horizontalHeader()
+        summary_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        summary_header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
         root.addWidget(self._summary_table, 3)
 
         self._cell_label = QLabel("Cell Detail", self)
@@ -750,7 +768,9 @@ class _TrolleyDetailDialog(QDialog):
         self._cell_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._cell_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._cell_table.verticalHeader().setVisible(False)
-        self._cell_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        cell_header = self._cell_table.horizontalHeader()
+        cell_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        cell_header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
         root.addWidget(self._cell_table, 2)
 
         self._status = QLabel("", self)
@@ -765,14 +785,17 @@ class _TrolleyDetailDialog(QDialog):
         self._summary_table.setRowCount(len(tray_rows))
         for row_idx, row in enumerate(tray_rows):
             tray_item = QTableWidgetItem(row.get("tray_id", ""))
+            tray_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
             tray_item.setData(Qt.ItemDataRole.UserRole, row.get("tray_id", ""))
             self._summary_table.setItem(row_idx, 0, tray_item)
-            self._summary_table.setItem(row_idx, 1, QTableWidgetItem(row.get("start_time", "-")))
-            self._summary_table.setItem(row_idx, 2, QTableWidgetItem(row.get("end_time", "-")))
-            self._summary_table.setItem(row_idx, 3, QTableWidgetItem(row.get("aging_time", "-")))
-            self._summary_table.setItem(row_idx, 4, QTableWidgetItem(row.get("status", "-")))
+            self._summary_table.setItem(row_idx, 1, self._center_item(row.get("start_time", "-")))
+            self._summary_table.setItem(row_idx, 2, self._center_item(row.get("end_time", "-")))
+            self._summary_table.setItem(row_idx, 3, self._center_item(row.get("aging_time", "-")))
+            self._summary_table.setItem(row_idx, 4, self._center_item(row.get("status", "-")))
 
     def _on_summary_selection_changed(self) -> None:
+        if self._closed or not self.isVisible():
+            return
         selected = self._summary_table.selectedItems()
         if not selected:
             return
@@ -810,11 +833,21 @@ class _TrolleyDetailDialog(QDialog):
         self._cell_table.setRowCount(0)
 
         def _worker() -> None:
+            if not type(self)._worker_lock.acquire(blocking=False):
+                self._bridge.loaded.emit(
+                    tray_id,
+                    request_id,
+                    None,
+                    "Another tray detail request is running. Please wait.",
+                )
+                return
             try:
                 rows = self._runtime.tray_cells(tray_id)
                 self._bridge.loaded.emit(tray_id, request_id, rows, None)
             except Exception as exc:  # noqa: BLE001
                 self._bridge.loaded.emit(tray_id, request_id, None, str(exc))
+            finally:
+                type(self)._worker_lock.release()
 
         threading.Thread(
             target=_worker,
@@ -825,12 +858,20 @@ class _TrolleyDetailDialog(QDialog):
     def _render_cells(self, tray_id: str, rows: list[dict[str, str | None]]) -> None:
         self._cell_table.setRowCount(len(rows))
         for row_idx, row_data in enumerate(rows):
-            self._cell_table.setItem(row_idx, 0, QTableWidgetItem(str(row_data.get("cell_id", ""))))
-            self._cell_table.setItem(row_idx, 1, QTableWidgetItem(str(row_data.get("start_time") or "-")))
-            self._cell_table.setItem(row_idx, 2, QTableWidgetItem(str(row_data.get("end_time") or "-")))
+            self._cell_table.setItem(row_idx, 0, self._center_item(str(row_data.get("cell_id", ""))))
+            self._cell_table.setItem(row_idx, 1, self._center_item(str(row_data.get("start_time") or "-")))
+            self._cell_table.setItem(row_idx, 2, self._center_item(str(row_data.get("end_time") or "-")))
         self._status.setText(f"Loaded {len(rows)} cells for tray {tray_id}")
 
+    @staticmethod
+    def _center_item(text: str) -> QTableWidgetItem:
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+        return item
+
     def _on_cells_loaded(self, tray_id: str, request_id: int, rows: object, error: object) -> None:
+        if self._closed:
+            return
         if request_id != self._active_request_id:
             return
         self._loading = False
@@ -848,6 +889,10 @@ class _TrolleyDetailDialog(QDialog):
         self._pending_tray_id = None
         if pending and pending != tray_id:
             self._start_tray_cells_query(pending)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._closed = True
+        super().closeEvent(event)
 
 
 class _MainWindow(QMainWindow):

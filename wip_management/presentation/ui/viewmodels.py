@@ -206,8 +206,6 @@ class UngroupTrayTableModel(QAbstractTableModel):
         if col == 0:
             if role == Qt.ItemDataRole.DisplayRole:
                 return _SELECT_ON if item.tray_id in self._checked_tray_ids else _SELECT_OFF
-            if role == Qt.ItemDataRole.CheckStateRole:
-                return Qt.CheckState.Checked if item.tray_id in self._checked_tray_ids else Qt.CheckState.Unchecked
             if role == Qt.ItemDataRole.TextAlignmentRole:
                 return int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
             return None
