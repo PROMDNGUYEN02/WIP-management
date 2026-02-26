@@ -63,35 +63,27 @@ class FpcRepo:
         return signals
 
     async def peek_latest_signal_time(self, end_time: datetime) -> datetime | None:
-        query_end = (
-            f"SELECT TOP 1 {self._end_col} AS latest_signal_time "
-            f"FROM {self._table} "
-            f"WHERE {self._end_col} IS NOT NULL AND {self._end_col} <= ? "
-            f"ORDER BY {self._end_col} DESC"
+        query = (
+            "SELECT MAX(signal_time) AS latest_signal_time FROM ("
+            f" SELECT MAX({self._end_col}) AS signal_time"
+            f" FROM {self._table}"
+            f" WHERE {self._end_col} IS NOT NULL AND {self._end_col} <= ?"
+            " UNION ALL"
+            f" SELECT MAX({self._start_col}) AS signal_time"
+            f" FROM {self._table}"
+            f" WHERE {self._end_col} IS NULL AND {self._start_col} <= ?"
+            ") AS signal_rows"
         )
-        rows_end = await self._conn.query_rows(query_end, [end_time])
-        if rows_end:
-            latest_end = _coerce_datetime(rows_end[0].get("latest_signal_time"))
-            if latest_end is not None:
-                log.debug("FPC peek latest signal from end_time=%s", latest_end.isoformat())
-                return latest_end
-
-        query_start = (
-            f"SELECT TOP 1 {self._start_col} AS latest_signal_time "
-            f"FROM {self._table} "
-            f"WHERE {self._end_col} IS NULL AND {self._start_col} <= ? "
-            f"ORDER BY {self._start_col} DESC"
-        )
-        rows_start = await self._conn.query_rows(query_start, [end_time])
-        if not rows_start:
+        rows = await self._conn.query_rows(query, [end_time, end_time])
+        if not rows:
             log.debug("FPC peek latest returned empty rowset")
             return None
-        latest_start = _coerce_datetime(rows_start[0].get("latest_signal_time"))
-        if latest_start is None:
-            log.debug("FPC peek latest start_time was not parseable")
+        latest = _coerce_datetime(rows[0].get("latest_signal_time"))
+        if latest is None:
+            log.debug("FPC peek latest signal_time was not parseable")
             return None
-        log.debug("FPC peek latest signal from start_time=%s", latest_start.isoformat())
-        return latest_start
+        log.debug("FPC peek latest signal_time=%s", latest.isoformat())
+        return latest
 
     async def _fetch_range(self, start_time: datetime, end_time: datetime) -> list[dict[str, Any]]:
         all_rows: list[dict[str, Any]] = []

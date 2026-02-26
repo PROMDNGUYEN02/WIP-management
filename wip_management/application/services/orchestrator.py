@@ -19,6 +19,7 @@ from wip_management.application.state.state_store import SingleWriterStateStore
 from wip_management.application.use_cases.ingest_signals import IngestResult, IngestSignalsUseCase
 from wip_management.application.use_cases.manual_group import ManualGroupUseCase
 from wip_management.application.use_cases.recompute_projection import Projection, RecomputeProjectionUseCase
+from wip_management.config import settings
 from wip_management.domain.events import SnapshotReady, TrolleyUpdated, TrayUpdated
 from wip_management.domain.models.tray import TrayId, TraySignal, Watermark
 from wip_management.domain.models.trolley import Column
@@ -80,6 +81,10 @@ class OrchestratorService:
         self._bootstrap_event = asyncio.Event()
         self._bootstrap_in_progress = False
         self._bootstrap_error: Exception | None = None
+        self._tray_cells_cache_ttl = timedelta(seconds=max(0.0, settings.tray_detail_cache_ttl_seconds))
+        self._tray_cells_cache_max_entries = max(0, int(settings.tray_detail_cache_max_entries))
+        self._tray_cells_cache: dict[str, tuple[datetime, list[dict[str, str | None]]]] = {}
+        self._tray_cells_inflight: dict[str, asyncio.Task[list[dict[str, str | None]]]] = {}
 
     async def start(self) -> None:
         if self._running:
@@ -120,6 +125,12 @@ class OrchestratorService:
             else:
                 await self._refresh_task
             self._refresh_task = None
+        for task in list(self._tray_cells_inflight.values()):
+            task.cancel()
+        if self._tray_cells_inflight:
+            await asyncio.gather(*self._tray_cells_inflight.values(), return_exceptions=True)
+        self._tray_cells_inflight.clear()
+        self._tray_cells_cache.clear()
         self._executor.shutdown(wait=True, cancel_futures=False)
         await self._store.stop()
         await _maybe_close(self._ccu_repo)
@@ -249,6 +260,106 @@ class OrchestratorService:
         payload["changed"] = changed
         return payload
 
+    async def fetch_tray_cells(self, tray_id: str) -> list[dict[str, str | None]]:
+        tray_key = tray_id.strip()
+        if not tray_key:
+            return []
+        await self._ensure_bootstrap_ready_for_detail()
+        now = self._clock.now()
+        cached = self._tray_cells_cache.get(tray_key)
+        if cached is not None:
+            cached_at, cached_rows = cached
+            if self._tray_cells_cache_ttl.total_seconds() <= 0 or (now - cached_at) <= self._tray_cells_cache_ttl:
+                log.debug("Tray detail cache hit tray_id=%s rows=%s", tray_key, len(cached_rows))
+                return [dict(item) for item in cached_rows]
+
+        inflight = self._tray_cells_inflight.get(tray_key)
+        if inflight is not None:
+            log.debug("Tray detail join inflight request tray_id=%s", tray_key)
+            rows = await inflight
+            return [dict(item) for item in rows]
+
+        task = asyncio.create_task(self._fetch_tray_cells_uncached(tray_key), name=f"tray-detail-{tray_key}")
+        self._tray_cells_inflight[tray_key] = task
+        try:
+            rows = await task
+        finally:
+            if self._tray_cells_inflight.get(tray_key) is task:
+                self._tray_cells_inflight.pop(tray_key, None)
+
+        now = self._clock.now()
+        copied = [dict(item) for item in rows]
+        self._tray_cells_cache[tray_key] = (now, copied)
+        self._trim_tray_detail_cache()
+        return [dict(item) for item in copied]
+
+    async def fetch_cell_owner(self, cell_id: str) -> dict[str, str | None] | None:
+        cell_key = cell_id.strip()
+        if not cell_key:
+            return None
+        await self._ensure_bootstrap_ready_for_detail()
+        now = self._clock.now()
+        day_start = now.replace(
+            hour=self._initial_load_start_hour,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        started_at = time.perf_counter()
+        owner = await self._ccu_repo.fetch_cell_owner(
+            cell_id=cell_key,
+            start_time=day_start,
+            end_time=now,
+        )
+        log.info(
+            "Cell owner fetched cell_id=%s found=%s elapsed_ms=%s",
+            cell_key,
+            bool(owner),
+            int((time.perf_counter() - started_at) * 1000),
+        )
+        return owner
+
+    async def _fetch_tray_cells_uncached(self, tray_key: str) -> list[dict[str, str | None]]:
+        now = self._clock.now()
+        day_start = now.replace(
+            hour=self._initial_load_start_hour,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        started_at = time.perf_counter()
+        rows = await self._ccu_repo.fetch_tray_cells(
+            tray_id=tray_key,
+            start_time=day_start,
+            end_time=now,
+        )
+        log.info(
+            "Tray detail fetched tray_id=%s rows=%s elapsed_ms=%s",
+            tray_key,
+            len(rows),
+            int((time.perf_counter() - started_at) * 1000),
+        )
+        return rows
+
+    async def _ensure_bootstrap_ready_for_detail(self) -> None:
+        if self._bootstrap_in_progress:
+            raise RuntimeError("Initial load is in progress. Please retry tray detail in a few seconds.")
+        if not self._bootstrap_event.is_set():
+            await self._bootstrap_event.wait()
+        if self._bootstrap_error is not None:
+            raise RuntimeError("Initial load failed; tray detail is unavailable.") from self._bootstrap_error
+
+    def _trim_tray_detail_cache(self) -> None:
+        if self._tray_cells_cache_max_entries <= 0:
+            self._tray_cells_cache.clear()
+            return
+        overflow = len(self._tray_cells_cache) - self._tray_cells_cache_max_entries
+        if overflow <= 0:
+            return
+        oldest = sorted(self._tray_cells_cache.items(), key=lambda item: item[1][0])[:overflow]
+        for tray_id, _ in oldest:
+            self._tray_cells_cache.pop(tray_id, None)
+
     async def manual_refresh(self, *, full_scan: bool) -> dict[str, object]:
         log.info("Manual refresh begin full_scan=%s", full_scan)
         if self._bootstrap_in_progress:
@@ -268,11 +379,17 @@ class OrchestratorService:
 
         if full_scan:
             result = await self._run_full_window_scan(now)
-            changed = bool(result.store_result.changed)
+            backfill_changed = await self._maybe_backfill_ccu(result.store_result.missing_ccu_tray_ids)
+            changed = bool(result.store_result.changed or backfill_changed)
             projection = await self._compute_projection()
             await self._publish_trolley_updated(projection)
             await self._set_refresh_watermark(now)
-            log.info("Manual refresh full completed changed=%s merged=%s", changed, len(result.merged))
+            log.info(
+                "Manual refresh full completed changed=%s merged=%s backfill_changed=%s",
+                changed,
+                len(result.merged),
+                backfill_changed,
+            )
             return {"mode": "manual_full", "changed": changed, "merged": len(result.merged)}
 
         if not await self._has_new_data_since(watermark.collected_time, now):
@@ -305,26 +422,95 @@ class OrchestratorService:
     async def _initial_load(self) -> None:
         started_at = time.perf_counter()
         now = self._clock.now()
-        result = await self._run_full_window_scan(now)
+        start = now.replace(
+            hour=self._initial_load_start_hour,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        log.info(
+            "Initial load window start=%s end=%s order=ASC",
+            start.isoformat(),
+            now.isoformat(),
+        )
+        previous = await self._delta_tracker.get()
+        ccu_task = asyncio.create_task(
+            self._ccu_repo.fetch_initial(start_time=start, end_time=now),
+            name="initial-ccu-fetch",
+        )
+        fpc_task = asyncio.create_task(
+            self._fpc_repo.fetch_initial(start_time=start, end_time=now),
+            name="initial-fpc-fetch",
+        )
+
+        norm_ccu: list[TraySignal] = []
+        norm_fpc: list[TraySignal] = []
+        partial_source = "none"
+        try:
+            done, _ = await asyncio.wait({ccu_task, fpc_task}, return_when=asyncio.FIRST_COMPLETED)
+            first_task = next(iter(done))
+            if first_task is ccu_task:
+                partial_source = "ccu"
+                norm_ccu = await self._normalize_signals(ccu_task.result())
+                partial_result = await self._ingest.execute(norm_ccu, [], previous_watermark=previous)
+            else:
+                partial_source = "fpc"
+                norm_fpc = await self._normalize_signals(fpc_task.result())
+                partial_result = await self._ingest.execute([], norm_fpc, previous_watermark=previous)
+                await self._maybe_backfill_ccu(partial_result.store_result.missing_ccu_tray_ids)
+            partial_projection = await self._compute_projection()
+            await self._publish_snapshot_ready(partial_projection)
+            await self._save_projection_to_repo(partial_projection)
+            log.info(
+                "Initial load partial published source=%s merged=%s changed=%s trays=%s",
+                partial_source,
+                len(partial_result.merged),
+                len(partial_result.store_result.changed),
+                len(partial_projection.trays),
+            )
+        except Exception:
+            for task in (ccu_task, fpc_task):
+                if not task.done():
+                    task.cancel()
+            raise
+
+        if not ccu_task.done():
+            norm_ccu = await self._normalize_signals(await ccu_task)
+        elif not norm_ccu:
+            norm_ccu = await self._normalize_signals(ccu_task.result())
+        if not fpc_task.done():
+            norm_fpc = await self._normalize_signals(await fpc_task)
+        elif not norm_fpc:
+            norm_fpc = await self._normalize_signals(fpc_task.result())
+
+        ccu_tray_ids = {str(item.tray_id) for item in norm_ccu}
+        fpc_tray_ids = {str(item.tray_id) for item in norm_fpc}
+        raw_overlap = ccu_tray_ids & fpc_tray_ids
+        if ccu_tray_ids and fpc_tray_ids and not raw_overlap:
+            ccu_sample = sorted(ccu_tray_ids)[:3]
+            fpc_sample = sorted(fpc_tray_ids)[:3]
+            log.warning(
+                "Initial load no tray overlap between CCU/FPC ccu_sample=%s fpc_sample=%s",
+                ccu_sample,
+                fpc_sample,
+            )
+        result = await self._ingest.execute(norm_ccu, norm_fpc, previous_watermark=previous)
+        backfill_changed = await self._maybe_backfill_ccu(result.store_result.missing_ccu_tray_ids)
         await self._set_refresh_watermark(now)
         projection = await self._compute_projection()
-        await self._event_bus.publish(
-            SnapshotReady(
-                trays=projection.trays,
-                trolleys=projection.trolleys,
-                assembly_trolleys=projection.assembly_trolleys,
-                queue_trolleys=projection.queue_trolleys,
-                precharge_trolleys=projection.precharge_trolleys,
-                assembly_ungrouped=projection.assembly_ungrouped,
-            )
-        )
+        await self._publish_snapshot_ready(projection)
         await self._save_projection_to_repo(projection)
         log.info(
-            "Initial load completed elapsed_ms=%s merged=%s trays=%s watermark=%s",
+            "Initial load completed elapsed_ms=%s merged=%s trays=%s ccu=%s fpc=%s overlap=%s backfill_changed=%s watermark=%s partial_source=%s",
             int((time.perf_counter() - started_at) * 1000),
             len(result.merged),
             len(projection.trays),
+            len(norm_ccu),
+            len(norm_fpc),
+            len(raw_overlap),
+            backfill_changed,
             now.isoformat(),
+            partial_source,
         )
 
     async def _refresh_loop(self) -> None:
@@ -514,7 +700,8 @@ class OrchestratorService:
 
     async def _compute_projection(self) -> Projection:
         started_at = time.perf_counter()
-        snapshot = await self._store.snapshot_desc(limit=self._snapshot_limit)
+        # Always compute projection from full in-memory state to avoid truncating ungroup list.
+        snapshot = await self._store.snapshot_desc(limit=None)
         projection = self._recompute_projection.execute(
             snapshot,
             manual_assignments=self._manual_group.projection_assignments(),
@@ -550,6 +737,18 @@ class OrchestratorService:
             len(projection.queue_trolleys),
             len(projection.precharge_trolleys),
             len(projection.assembly_ungrouped),
+        )
+
+    async def _publish_snapshot_ready(self, projection: Projection) -> None:
+        await self._event_bus.publish(
+            SnapshotReady(
+                trays=projection.trays,
+                trolleys=projection.trolleys,
+                assembly_trolleys=projection.assembly_trolleys,
+                queue_trolleys=projection.queue_trolleys,
+                precharge_trolleys=projection.precharge_trolleys,
+                assembly_ungrouped=projection.assembly_ungrouped,
+            )
         )
 
     async def _sync_manual_assignments_from_repo(self, *, force: bool = False) -> bool:

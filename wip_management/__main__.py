@@ -2,34 +2,40 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import faulthandler
 import logging
 import logging.handlers
 import os
 from pathlib import Path
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt, Signal
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFrame,
     QFormLayout,
     QHeaderView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListView,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSpinBox,
     QTableView,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -45,7 +51,8 @@ from wip_management.infrastructure.sqlserver.ccu_repo import CcuRepo
 from wip_management.infrastructure.sqlserver.connection import SQLServerConnection
 from wip_management.infrastructure.sqlserver.delta_tracker import InMemoryDeltaTracker
 from wip_management.infrastructure.sqlserver.fpc_repo import FpcRepo
-from wip_management.presentation.ui.viewmodels import BoardViewModel
+from wip_management.presentation.ui.viewmodels import BoardViewModel, TrolleyListModel
+from wip_management.presentation.ui.mapper import parse_datetime
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +95,23 @@ def _configure_logging() -> None:
         settings.log_to_console,
         log_path or "<disabled>",
     )
+
+
+def _install_crash_hooks() -> None:
+    def _global_excepthook(exc_type, exc_value, exc_traceback) -> None:
+        log.critical("Unhandled exception on main thread", exc_info=(exc_type, exc_value, exc_traceback))
+
+    def _thread_excepthook(args) -> None:
+        log.critical(
+            "Unhandled exception on thread=%s",
+            args.thread.name if args.thread else "<unknown>",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _global_excepthook
+    threading.excepthook = _thread_excepthook
+    with contextlib.suppress(Exception):
+        faulthandler.enable(all_threads=True)
 
 
 class _SystemClock:
@@ -186,6 +210,14 @@ class _Runtime:
     def update_grouping_settings(self, *, max_trays_per_trolley: int) -> dict[str, object]:
         log.info("Update grouping settings requested max_trays_per_trolley=%s", max_trays_per_trolley)
         return self._submit(self._update_grouping_settings(max_trays_per_trolley=max_trays_per_trolley))
+
+    def tray_cells(self, tray_id: str) -> list[dict[str, str | None]]:
+        log.info("Tray detail requested tray_id=%s", tray_id)
+        return self._submit(self._tray_cells(tray_id=tray_id))
+
+    def cell_owner(self, cell_id: str) -> dict[str, str | None] | None:
+        log.info("Cell owner requested cell_id=%s", cell_id)
+        return self._submit(self._cell_owner(cell_id=cell_id))
 
     def _submit(self, coroutine: Any) -> Any:
         if self._loop is None:
@@ -440,6 +472,38 @@ class _Runtime:
         log.info("Update grouping settings completed result=%s", result)
         return result
 
+    async def _tray_cells(self, *, tray_id: str) -> list[dict[str, str | None]]:
+        if self._orchestrator is None:
+            raise RuntimeError("Runtime is not started")
+        rows = await self._orchestrator.fetch_tray_cells(tray_id=tray_id)
+        return rows
+
+    async def _cell_owner(self, *, cell_id: str) -> dict[str, str | None] | None:
+        if self._orchestrator is None:
+            raise RuntimeError("Runtime is not started")
+        row = await self._orchestrator.fetch_cell_owner(cell_id=cell_id)
+        return row
+
+
+class _MetricBox(QFrame):
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("metricBox")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(2)
+
+        self._title = QLabel(title, self)
+        self._title.setObjectName("metricTitle")
+        self._value = QLabel("0", self)
+        self._value.setObjectName("metricValue")
+
+        layout.addWidget(self._title)
+        layout.addWidget(self._value)
+
+    def set_value(self, value: int) -> None:
+        self._value.setText(str(value))
+
 
 class _ColumnCard(QWidget):
     def __init__(
@@ -450,8 +514,15 @@ class _ColumnCard(QWidget):
         tray_model=None,
         tray_title: str | None = None,
         tray_actions_widget: QWidget | None = None,
+        on_trolley_context: Callable[[QListView, QModelIndex], None] | None = None,
+        on_trolley_double_click: Callable[[QListView, QModelIndex], None] | None = None,
+        on_tray_header_click: Callable[[int], None] | None = None,
     ) -> None:
         super().__init__()
+        self.setObjectName("columnCard")
+        self.tray_table: QTableView | None = None
+        self.trolley_list = QListView(self)
+        self._on_trolley_context_cb = on_trolley_context
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(6)
@@ -465,10 +536,17 @@ class _ColumnCard(QWidget):
         self._stats.setStyleSheet("color: #666; font-size: 12px;")
         root.addWidget(self._stats)
 
-        trolley_list = QListView(self)
-        trolley_list.setModel(trolley_model)
-        trolley_list.setAlternatingRowColors(True)
-        root.addWidget(trolley_list, 3)
+        self.trolley_list.setModel(trolley_model)
+        self.trolley_list.setAlternatingRowColors(True)
+        self.trolley_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        root.addWidget(self.trolley_list, 3)
+        if on_trolley_context is not None:
+            self.trolley_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.trolley_list.customContextMenuRequested.connect(self._handle_trolley_context)
+        if on_trolley_double_click is not None:
+            self.trolley_list.doubleClicked.connect(
+                lambda idx: on_trolley_double_click(self.trolley_list, idx),
+            )
 
         if tray_model is not None:
             tray_header = QWidget(self)
@@ -484,20 +562,69 @@ class _ColumnCard(QWidget):
                 tray_header_layout.addWidget(tray_actions_widget)
             root.addWidget(tray_header)
 
-            tray_table = QTableView(self)
-            tray_table.setModel(tray_model)
-            tray_table.setAlternatingRowColors(True)
-            tray_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-            tray_table.verticalHeader().setVisible(False)
-            tray_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-            tray_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-            tray_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-            tray_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-            tray_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
-            root.addWidget(tray_table, 2)
+            self.tray_table = QTableView(self)
+            self.tray_table.setModel(tray_model)
+            self.tray_table.setAlternatingRowColors(True)
+            self.tray_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.tray_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+            self.tray_table.setEditTriggers(
+                QAbstractItemView.EditTrigger.CurrentChanged
+                | QAbstractItemView.EditTrigger.SelectedClicked
+                | QAbstractItemView.EditTrigger.DoubleClicked
+            )
+            self.tray_table.verticalHeader().setVisible(False)
+            self.tray_table.verticalHeader().setDefaultSectionSize(34)
+            header = self.tray_table.horizontalHeader()
+            header.setSectionsClickable(True)
+            header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+            header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+            table_font = self.tray_table.font()
+            table_font.setPointSize(max(table_font.pointSize(), 11))
+            self.tray_table.setFont(table_font)
+            header.setFont(table_font)
+            self.tray_table.setColumnWidth(0, 52)
+            if on_tray_header_click is not None:
+                header.sectionClicked.connect(on_tray_header_click)
+            self.tray_table.clicked.connect(self._on_tray_table_clicked)
+            self.tray_table.setShowGrid(False)
+            root.addWidget(self.tray_table, 2)
 
     def set_stats_text(self, text: str) -> None:
         self._stats.setText(text)
+
+    def _handle_trolley_context(self, pos: QPoint) -> None:
+        if self._on_trolley_context_cb is None:
+            return
+        index = self.trolley_list.indexAt(pos)
+        if not index.isValid():
+            return
+        self._on_trolley_context_cb(self.trolley_list, index)
+
+    def _on_tray_table_clicked(self, index: QModelIndex) -> None:
+        if self.tray_table is None or not index.isValid():
+            return
+        self.tray_table.selectRow(index.row())
+        model = self.tray_table.model()
+        if model is None:
+            return
+        # Click circle column toggles; click any other cell force-selects the row.
+        if index.column() == 0:
+            toggle_row = getattr(model, "toggle_row", None)
+            if callable(toggle_row):
+                toggle_row(index.row())
+                return
+        else:
+            set_checked = getattr(model, "set_row_checked", None)
+            if callable(set_checked):
+                set_checked(index.row(), True)
+                return
+        checked_now = model.data(index, Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
+        target = Qt.CheckState.Unchecked if checked_now else Qt.CheckState.Checked
+        model.setData(index, target, Qt.ItemDataRole.CheckStateRole)
 
 
 class _SettingsDialog(QDialog):
@@ -572,6 +699,157 @@ class _SettingsDialog(QDialog):
         }
 
 
+class _TrayDetailBridge(QObject):
+    loaded = Signal(str, int, object, object)
+
+
+class _TrolleyDetailDialog(QDialog):
+    def __init__(self, runtime: _Runtime, trolley_id: str, tray_rows: list[dict[str, str]], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._runtime = runtime
+        self._bridge = _TrayDetailBridge()
+        self._active_tray_id = ""
+        self._active_request_id = 0
+        self._request_seq = 0
+        self._loading = False
+        self._pending_tray_id: str | None = None
+        self._tray_cells_cache: dict[str, list[dict[str, str | None]]] = {}
+        self._bridge.loaded.connect(self._on_cells_loaded)
+
+        self.setWindowTitle(f"Trolley Detail - {trolley_id}")
+        self.resize(920, 620)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        self._summary_label = QLabel(f"Trolley: {trolley_id}", self)
+        self._summary_label.setStyleSheet("font-weight: 600;")
+        root.addWidget(self._summary_label)
+
+        self._summary_table = QTableWidget(self)
+        self._summary_table.setColumnCount(5)
+        self._summary_table.setHorizontalHeaderLabels(
+            ["Tray_ID", "Start_Time", "End_Time", "Aging_Time", "Status"],
+        )
+        self._summary_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._summary_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._summary_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._summary_table.verticalHeader().setVisible(False)
+        self._summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        root.addWidget(self._summary_table, 3)
+
+        self._cell_label = QLabel("Cell Detail", self)
+        self._cell_label.setStyleSheet("font-weight: 600;")
+        root.addWidget(self._cell_label)
+
+        self._cell_table = QTableWidget(self)
+        self._cell_table.setColumnCount(3)
+        self._cell_table.setHorizontalHeaderLabels(["Cell_ID", "Start_Time", "End_Time"])
+        self._cell_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._cell_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._cell_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._cell_table.verticalHeader().setVisible(False)
+        self._cell_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        root.addWidget(self._cell_table, 2)
+
+        self._status = QLabel("", self)
+        root.addWidget(self._status)
+
+        self._fill_summary(tray_rows)
+        self._summary_table.itemSelectionChanged.connect(self._on_summary_selection_changed)
+        if self._summary_table.rowCount() > 0:
+            self._summary_table.selectRow(0)
+
+    def _fill_summary(self, tray_rows: list[dict[str, str]]) -> None:
+        self._summary_table.setRowCount(len(tray_rows))
+        for row_idx, row in enumerate(tray_rows):
+            tray_item = QTableWidgetItem(row.get("tray_id", ""))
+            tray_item.setData(Qt.ItemDataRole.UserRole, row.get("tray_id", ""))
+            self._summary_table.setItem(row_idx, 0, tray_item)
+            self._summary_table.setItem(row_idx, 1, QTableWidgetItem(row.get("start_time", "-")))
+            self._summary_table.setItem(row_idx, 2, QTableWidgetItem(row.get("end_time", "-")))
+            self._summary_table.setItem(row_idx, 3, QTableWidgetItem(row.get("aging_time", "-")))
+            self._summary_table.setItem(row_idx, 4, QTableWidgetItem(row.get("status", "-")))
+
+    def _on_summary_selection_changed(self) -> None:
+        selected = self._summary_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        item = self._summary_table.item(row, 0)
+        if item is None:
+            return
+        tray_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not tray_id:
+            return
+        if self._loading and tray_id == self._active_tray_id:
+            return
+        if self._pending_tray_id == tray_id:
+            return
+        cached = self._tray_cells_cache.get(tray_id)
+        if cached is not None:
+            self._active_tray_id = tray_id
+            self._render_cells(tray_id, cached)
+            self._status.setText(f"Loaded {len(cached)} cells for tray {tray_id} (cache)")
+            return
+        if self._loading:
+            self._pending_tray_id = tray_id
+            self._status.setText(f"Queued cell detail for tray {tray_id} ...")
+            return
+        self._start_tray_cells_query(tray_id)
+
+    def _start_tray_cells_query(self, tray_id: str) -> None:
+        self._request_seq += 1
+        request_id = self._request_seq
+        self._active_request_id = request_id
+        self._active_tray_id = tray_id
+        self._loading = True
+        self._pending_tray_id = None
+        self._status.setText(f"Loading cell detail for tray {tray_id} ...")
+        self._cell_table.setRowCount(0)
+
+        def _worker() -> None:
+            try:
+                rows = self._runtime.tray_cells(tray_id)
+                self._bridge.loaded.emit(tray_id, request_id, rows, None)
+            except Exception as exc:  # noqa: BLE001
+                self._bridge.loaded.emit(tray_id, request_id, None, str(exc))
+
+        threading.Thread(
+            target=_worker,
+            name=f"ui-tray-detail-{tray_id}-{request_id}",
+            daemon=True,
+        ).start()
+
+    def _render_cells(self, tray_id: str, rows: list[dict[str, str | None]]) -> None:
+        self._cell_table.setRowCount(len(rows))
+        for row_idx, row_data in enumerate(rows):
+            self._cell_table.setItem(row_idx, 0, QTableWidgetItem(str(row_data.get("cell_id", ""))))
+            self._cell_table.setItem(row_idx, 1, QTableWidgetItem(str(row_data.get("start_time") or "-")))
+            self._cell_table.setItem(row_idx, 2, QTableWidgetItem(str(row_data.get("end_time") or "-")))
+        self._status.setText(f"Loaded {len(rows)} cells for tray {tray_id}")
+
+    def _on_cells_loaded(self, tray_id: str, request_id: int, rows: object, error: object) -> None:
+        if request_id != self._active_request_id:
+            return
+        self._loading = False
+        if error:
+            self._status.setText(f"Detail load failed: {error}")
+            pending = self._pending_tray_id
+            self._pending_tray_id = None
+            if pending and pending != tray_id:
+                self._start_tray_cells_query(pending)
+            return
+        values = list(rows or [])
+        self._tray_cells_cache[tray_id] = [dict(item) for item in values]
+        self._render_cells(tray_id, self._tray_cells_cache[tray_id])
+        pending = self._pending_tray_id
+        self._pending_tray_id = None
+        if pending and pending != tray_id:
+            self._start_tray_cells_query(pending)
+
+
 class _MainWindow(QMainWindow):
     def __init__(self, vm: BoardViewModel, runtime: _Runtime) -> None:
         super().__init__()
@@ -580,17 +858,42 @@ class _MainWindow(QMainWindow):
         self._action_bridge = _UiActionBridge()
         self._action_inflight = False
         self._pending_db_restart_notice = False
+        self._event_filter_installed = False
         self.setWindowTitle("WIP Management - Clean Architecture")
         self.resize(1400, 820)
+        self._apply_styles()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+            self._event_filter_installed = True
 
         root = QWidget(self)
         layout = QVBoxLayout(root)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setSpacing(12)
 
-        self._summary = QLabel("Loading...", self)
-        self._summary.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        layout.addWidget(self._summary)
+        summary_row = QWidget(self)
+        summary_layout = QHBoxLayout(summary_row)
+        summary_layout.setContentsMargins(0, 0, 0, 0)
+        summary_layout.setSpacing(8)
+        self._metric_boxes = {
+            "tray_count": _MetricBox("Total Tray", self),
+            "group_count": _MetricBox("Group", self),
+            "assembly_ungroup_count": _MetricBox("Ungroup", self),
+            "assembly_trolley_count": _MetricBox("Assembly Trolley", self),
+            "queue_trolley_count": _MetricBox("Queue Trolley", self),
+            "precharge_trolley_count": _MetricBox("Precharge Trolley", self),
+        }
+        for key in (
+            "tray_count",
+            "group_count",
+            "assembly_ungroup_count",
+            "assembly_trolley_count",
+            "queue_trolley_count",
+            "precharge_trolley_count",
+        ):
+            summary_layout.addWidget(self._metric_boxes[key], 1)
+        layout.addWidget(summary_row)
 
         controls = QWidget(self)
         controls_layout = QHBoxLayout(controls)
@@ -602,38 +905,28 @@ class _MainWindow(QMainWindow):
         self._auto_group_checkbox = QCheckBox("Auto Group", self)
         self._auto_group_checkbox.setChecked(settings.auto_group_default_enabled)
         self._settings_btn = QPushButton("Settings", self)
-        self._status = QLabel("", self)
-
+        self._search_input = QLineEdit(self)
+        self._search_input.setPlaceholderText("Find Tray_ID / Cell_ID")
+        self._search_input.setMinimumWidth(220)
+        self._search_btn = QPushButton("Search", self)
+        self._search_result = QLabel("-", self)
+        self._search_result.setWordWrap(True)
+        self._search_result.setStyleSheet("color: #334155;")
+        self._pending_search_query = ""
+        controls_layout.addWidget(self._search_input, 2)
+        controls_layout.addWidget(self._search_btn)
+        controls_layout.addWidget(self._search_result, 3)
+        controls_layout.addStretch(1)
         controls_layout.addWidget(self._quick_refresh_btn)
         controls_layout.addWidget(self._full_refresh_btn)
         controls_layout.addWidget(self._auto_group_checkbox)
         controls_layout.addWidget(self._settings_btn)
-        controls_layout.addWidget(self._status, 1)
         layout.addWidget(controls)
 
-        trolley_controls = QWidget(self)
-        trolley_controls_layout = QHBoxLayout(trolley_controls)
-        trolley_controls_layout.setContentsMargins(0, 0, 0, 0)
-        trolley_controls_layout.setSpacing(8)
-        trolley_controls_layout.addWidget(QLabel("Trolley", self))
-        self._trolley_selector = QComboBox(self)
-        self._trolley_selector.setEditable(True)
-        self._trolley_selector.setMinimumWidth(220)
-        self._new_trolley_input = QLineEdit(self)
-        self._new_trolley_input.setPlaceholderText("New Trolley ID")
-        self._edit_trolley_btn = QPushButton("Edit Trolley", self)
-        self._clear_trolley_btn = QPushButton("Clear Trolley", self)
-        self._delete_trolley_btn = QPushButton("Delete Trolley", self)
-        trolley_controls_layout.addWidget(self._trolley_selector)
-        trolley_controls_layout.addWidget(self._new_trolley_input)
-        trolley_controls_layout.addWidget(self._edit_trolley_btn)
-        trolley_controls_layout.addWidget(self._clear_trolley_btn)
-        trolley_controls_layout.addWidget(self._delete_trolley_btn)
-        trolley_controls_layout.addStretch(1)
-        layout.addWidget(trolley_controls)
+        self._status = QLabel("", self)
+        self._status.setObjectName("statusBar")
+        layout.addWidget(self._status)
 
-        self._select_all_btn = QPushButton("Select All", self)
-        self._unselect_all_btn = QPushButton("Unselect All", self)
         self._add_trolley_input = QLineEdit(self)
         self._add_trolley_input.setPlaceholderText("Trolley ID")
         self._add_trolley_btn = QPushButton("Add Trolley", self)
@@ -641,8 +934,6 @@ class _MainWindow(QMainWindow):
         ungroup_actions_layout = QHBoxLayout(ungroup_actions)
         ungroup_actions_layout.setContentsMargins(0, 0, 0, 0)
         ungroup_actions_layout.setSpacing(6)
-        ungroup_actions_layout.addWidget(self._select_all_btn)
-        ungroup_actions_layout.addWidget(self._unselect_all_btn)
         ungroup_actions_layout.addStretch(1)
         ungroup_actions_layout.addWidget(self._add_trolley_input)
         ungroup_actions_layout.addWidget(self._add_trolley_btn)
@@ -658,9 +949,22 @@ class _MainWindow(QMainWindow):
             tray_model=vm.assembly_ungrouped_model,
             tray_title="Ungroup Trays",
             tray_actions_widget=ungroup_actions,
+            on_trolley_context=self._on_trolley_item_context,
+            on_trolley_double_click=self._on_trolley_item_double_click,
+            on_tray_header_click=self._on_ungroup_header_clicked,
         )
-        self._queue_card = _ColumnCard("Queue", vm.queue_trolley_model)
-        self._precharge_card = _ColumnCard("Precharge", vm.precharge_trolley_model)
+        self._queue_card = _ColumnCard(
+            "Queue",
+            vm.queue_trolley_model,
+            on_trolley_context=self._on_trolley_item_context,
+            on_trolley_double_click=self._on_trolley_item_double_click,
+        )
+        self._precharge_card = _ColumnCard(
+            "Precharge",
+            vm.precharge_trolley_model,
+            on_trolley_context=self._on_trolley_item_context,
+            on_trolley_double_click=self._on_trolley_item_double_click,
+        )
         board_layout.addWidget(self._assembly_card, 1)
         board_layout.addWidget(self._queue_card, 1)
         board_layout.addWidget(self._precharge_card, 1)
@@ -670,24 +974,16 @@ class _MainWindow(QMainWindow):
         vm.updated.connect(self._on_updated)
         self._quick_refresh_btn.clicked.connect(self._on_quick_refresh)
         self._full_refresh_btn.clicked.connect(self._on_full_refresh)
-        self._select_all_btn.clicked.connect(self._on_select_all)
-        self._unselect_all_btn.clicked.connect(self._on_unselect_all)
         self._add_trolley_btn.clicked.connect(self._on_add_trolley)
-        self._edit_trolley_btn.clicked.connect(self._on_edit_trolley)
-        self._clear_trolley_btn.clicked.connect(self._on_clear_trolley)
-        self._delete_trolley_btn.clicked.connect(self._on_delete_trolley)
+        self._search_btn.clicked.connect(self._on_search)
+        self._search_input.returnPressed.connect(self._on_search)
         self._settings_btn.clicked.connect(self._on_settings)
         self._auto_group_checkbox.toggled.connect(self._on_auto_group_toggled)
         self._action_bridge.action_done.connect(self._on_action_done)
 
     def _on_updated(self, payload: dict[str, int]) -> None:
-        self._summary.setText(
-            "Tray={tray_count} | Group={group_count} | Assembly trolley={assembly_trolley_count} "
-            "| Queue trolley={queue_trolley_count} | Precharge trolley={precharge_trolley_count} "
-            "| Assembly ungroup={assembly_ungroup_count}".format(
-                **payload
-            )
-        )
+        for key, box in self._metric_boxes.items():
+            box.set_value(int(payload.get(key, 0)))
         self._assembly_card.set_stats_text(
             "Trolley={assembly_trolley_count} | Tray={assembly_tray_count} | Cell={assembly_cell_count} | Ungroup={assembly_ungroup_count}".format(
                 **payload
@@ -703,7 +999,6 @@ class _MainWindow(QMainWindow):
                 **payload
             )
         )
-        self._populate_trolley_selector()
 
     def _on_quick_refresh(self) -> None:
         self._run_action(
@@ -717,14 +1012,83 @@ class _MainWindow(QMainWindow):
             action=lambda: self._runtime.manual_refresh(full_scan=True),
         )
 
-    def _on_select_all(self) -> None:
-        self._vm.assembly_ungrouped_model.set_all_checked(True)
+    def _on_search(self) -> None:
+        raw = self._search_input.text().strip()
+        if not raw:
+            self._search_result.setText("-")
+            self._status.setText("Search input is empty.")
+            return
+        lookup = raw.upper()
+        tray_payload = self._vm.tray_payload_by_id(lookup)
+        if tray_payload is not None:
+            self._search_result.setText(self._format_tray_search_result(lookup, tray_payload))
+            self._status.setText(f"Found tray {lookup}.")
+            return
+        self._pending_search_query = lookup
+        self._search_result.setText(f"Searching {lookup} ...")
+        self._run_action(
+            action_name="Search",
+            action=lambda: self._runtime.cell_owner(lookup),
+        )
 
-    def _on_unselect_all(self) -> None:
-        self._vm.assembly_ungrouped_model.set_all_checked(False)
+    def _format_tray_search_result(self, tray_id: str, tray_payload: dict[str, Any]) -> str:
+        location, trolley_id = self._find_tray_location(tray_id)
+        ccu_payload = tray_payload.get("ccu_payload") or {}
+        fpc_payload = tray_payload.get("fpc_payload") or {}
+        start_dt = parse_datetime(ccu_payload.get("start_time")) or parse_datetime(fpc_payload.get("precharge_start_time"))
+        end_dt = parse_datetime(ccu_payload.get("end_time")) or parse_datetime(fpc_payload.get("precharge_end_time"))
+        qty_raw = ccu_payload.get("quantity") if ccu_payload else 0
+        try:
+            qty = int(str(qty_raw).strip()) if qty_raw is not None else 0
+        except Exception:  # noqa: BLE001
+            qty = 0
+        aging_text = "-"
+        if end_dt is not None:
+            ref_dt = datetime.now()
+            precharge_start_dt = parse_datetime(fpc_payload.get("precharge_start_time"))
+            if ccu_payload and fpc_payload and precharge_start_dt is not None:
+                ref_dt = precharge_start_dt
+            aging_text = _format_timedelta(ref_dt - end_dt)
+        start_text = start_dt.isoformat(sep=" ", timespec="seconds") if start_dt else "-"
+        end_text = end_dt.isoformat(sep=" ", timespec="seconds") if end_dt else "-"
+        trolley_text = trolley_id if trolley_id else "-"
+        return (
+            f"Tray_ID {tray_id} | Trolley {trolley_text} | {location} | "
+            f"Qty {qty} | Start {start_text} | End {end_text} | Aging {aging_text}"
+        )
+
+    def _format_cell_search_result(self, cell_id: str, payload: dict[str, str | None]) -> str:
+        tray_id = str(payload.get("tray_id") or "").strip()
+        if not tray_id:
+            return f"Cell {cell_id} not found."
+        location, trolley_id = self._find_tray_location(tray_id)
+        trolley_text = trolley_id if trolley_id else "-"
+        start_text = str(payload.get("start_time") or "-")
+        end_text = str(payload.get("end_time") or "-")
+        return (
+            f"Cell_ID {cell_id} | Tray_ID {tray_id} | Trolley {trolley_text} | "
+            f"{location} | Start {start_text} | End {end_text}"
+        )
+
+    def _find_tray_location(self, tray_id: str) -> tuple[str, str]:
+        tray_key = tray_id.strip()
+        if not tray_key:
+            return "Unknown", ""
+        precharge_row = self._vm.precharge_trolley_model.find_by_tray_id(tray_key)
+        if precharge_row is not None:
+            return "Precharge", precharge_row.trolley_id
+        queue_row = self._vm.queue_trolley_model.find_by_tray_id(tray_key)
+        if queue_row is not None:
+            return "Queue", queue_row.trolley_id
+        assembly_row = self._vm.assembly_trolley_model.find_by_tray_id(tray_key)
+        if assembly_row is not None:
+            return "Assembly", assembly_row.trolley_id
+        if self._vm.assembly_ungrouped_model.has_tray(tray_key):
+            return "Assembly", ""
+        return "Unknown", ""
 
     def _on_add_trolley(self) -> None:
-        tray_ids = self._vm.assembly_ungrouped_model.checked_tray_ids()
+        tray_ids = self._selected_ungroup_tray_ids()
         if not tray_ids:
             self._status.setText("Please check at least one tray in Ungroup list.")
             return
@@ -741,42 +1105,192 @@ class _MainWindow(QMainWindow):
             ),
         )
 
-    def _on_edit_trolley(self) -> None:
-        old_trolley_id = self._current_trolley_id()
-        if not old_trolley_id:
-            self._status.setText("Please choose trolley ID to edit.")
+    def _on_ungroup_header_clicked(self, section: int) -> None:
+        if section != 0:
             return
-        new_trolley_id = self._new_trolley_input.text().strip()
-        if not new_trolley_id:
-            self._status.setText("Please input new trolley ID.")
-            return
-        self._run_action(
-            action_name="Edit trolley",
-            action=lambda: self._runtime.rename_trolley(
-                old_trolley_id=old_trolley_id,
-                new_trolley_id=new_trolley_id,
-            ),
-        )
+        self._vm.assembly_ungrouped_model.toggle_all_checked()
 
-    def _on_clear_trolley(self) -> None:
-        trolley_id = self._current_trolley_id()
-        if not trolley_id:
-            self._status.setText("Please choose trolley ID to clear.")
-            return
-        self._run_action(
-            action_name="Clear trolley",
-            action=lambda: self._runtime.clear_trolley(trolley_id=trolley_id),
-        )
+    def _selected_ungroup_tray_ids(self) -> list[str]:
+        tray_ids = self._vm.assembly_ungrouped_model.checked_tray_ids()
+        if tray_ids:
+            return tray_ids
+        tray_table = self._assembly_card.tray_table
+        if tray_table is None or tray_table.selectionModel() is None:
+            return []
+        selected_rows = {index.row() for index in tray_table.selectionModel().selectedIndexes()}
+        out: list[str] = []
+        for row in sorted(selected_rows):
+            tray_index = self._vm.assembly_ungrouped_model.index(row, 2)
+            tray_id = str(self._vm.assembly_ungrouped_model.data(tray_index, Qt.ItemDataRole.DisplayRole) or "").strip()
+            if tray_id:
+                out.append(tray_id)
+        return out
 
-    def _on_delete_trolley(self) -> None:
-        trolley_id = self._current_trolley_id()
-        if not trolley_id:
-            self._status.setText("Please choose trolley ID to delete.")
+    def _on_trolley_item_context(self, list_view: QListView, index: QModelIndex) -> None:
+        payload = self._trolley_payload_from_index(index)
+        if payload is None:
             return
-        self._run_action(
-            action_name="Delete trolley",
-            action=lambda: self._runtime.delete_trolley(trolley_id=trolley_id),
+        global_pos = list_view.viewport().mapToGlobal(list_view.visualRect(index).bottomRight())
+        self._show_trolley_menu(payload, global_pos)
+
+    def _on_trolley_item_double_click(self, _: QListView, index: QModelIndex) -> None:
+        payload = self._trolley_payload_from_index(index)
+        if payload is None:
+            return
+        self._show_trolley_detail_dialog(payload)
+
+    def _trolley_payload_from_index(self, index: QModelIndex) -> dict[str, Any] | None:
+        if not index.isValid():
+            return None
+        model = index.model()
+        if model is None:
+            return None
+        trolley_role = getattr(model, "TrolleyIdRole", TrolleyListModel.TrolleyIdRole)
+        tray_ids_role = getattr(model, "TrayIdsRole", TrolleyListModel.TrayIdsRole)
+        mode_role = getattr(model, "ModeRole", TrolleyListModel.ModeRole)
+        column_role = getattr(model, "ColumnRole", TrolleyListModel.ColumnRole)
+        state_role = getattr(model, "StateRole", TrolleyListModel.StateRole)
+        trolley_id = str(index.data(trolley_role) or "").strip()
+        if not trolley_id:
+            return None
+        return {
+            "trolley_id": trolley_id,
+            "tray_ids": list(index.data(tray_ids_role) or []),
+            "mode": str(index.data(mode_role) or ""),
+            "column": str(index.data(column_role) or ""),
+            "state": str(index.data(state_role) or ""),
+        }
+
+    def _show_trolley_menu(self, trolley: dict[str, Any], global_pos: QPoint) -> None:
+        trolley_id = str(trolley.get("trolley_id", "")).strip()
+        if not trolley_id:
+            return
+        mode = str(trolley.get("mode", "")).strip().lower()
+        is_manual = mode == "manual"
+        tray_ids = [str(item).strip() for item in trolley.get("tray_ids", []) if str(item).strip()]
+
+        menu = QMenu(self)
+        add_action = menu.addAction("Edit Trolley: Add Selected Trays")
+        remove_action = menu.addAction("Edit Trolley: Delete Tray...")
+        menu.addSeparator()
+        clear_action = menu.addAction("Clear Trolley")
+        delete_action = menu.addAction("Delete Trolley")
+
+        if not is_manual:
+            add_action.setEnabled(False)
+            remove_action.setEnabled(False)
+            clear_action.setEnabled(False)
+            delete_action.setEnabled(False)
+
+        chosen = menu.exec(global_pos)
+        if chosen is None:
+            return
+        if not is_manual:
+            self._status.setText("Auto trolley cannot be edited. Please use manual group trolley.")
+            return
+        if chosen == add_action:
+            tray_ids_to_add = self._selected_ungroup_tray_ids()
+            if not tray_ids_to_add:
+                self._status.setText("Please select trays in Ungroup list first.")
+                return
+            self._run_action(
+                action_name="Edit trolley add trays",
+                action=lambda: self._runtime.manual_group_many(
+                    tray_ids=tray_ids_to_add,
+                    trolley_id=trolley_id,
+                    column=Column.QUEUE,
+                ),
+            )
+            return
+        if chosen == remove_action:
+            if not tray_ids:
+                self._status.setText("No tray available in trolley to remove.")
+                return
+            tray_id, ok = QInputDialog.getItem(
+                self,
+                "Edit Trolley",
+                "Select tray to remove",
+                tray_ids,
+                0,
+                False,
+            )
+            if not ok or not tray_id:
+                return
+            selected_tray = str(tray_id).strip()
+            self._run_action(
+                action_name="Edit trolley delete tray",
+                action=lambda: self._runtime.manual_ungroup(tray_id=selected_tray),
+            )
+            return
+        if chosen == clear_action:
+            self._run_action(
+                action_name="Clear trolley",
+                action=lambda: self._runtime.clear_trolley(trolley_id=trolley_id),
+            )
+            return
+        if chosen == delete_action:
+            self._run_action(
+                action_name="Delete trolley",
+                action=lambda: self._runtime.delete_trolley(trolley_id=trolley_id),
+            )
+            return
+
+    def _show_trolley_detail_dialog(self, trolley: dict[str, Any]) -> None:
+        tray_ids = [str(item).strip() for item in trolley.get("tray_ids", []) if str(item).strip()]
+        if not tray_ids:
+            self._status.setText("Trolley has no tray data to show detail.")
+            return
+        tray_payloads = self._vm.tray_payloads(tray_ids)
+        rows = self._build_tray_summary_rows(tray_payloads)
+        if not rows:
+            self._status.setText("No tray summary available for selected trolley.")
+            return
+        dialog = _TrolleyDetailDialog(
+            runtime=self._runtime,
+            trolley_id=str(trolley.get("trolley_id", "")),
+            tray_rows=rows,
+            parent=self,
         )
+        dialog.exec()
+
+    def _build_tray_summary_rows(self, tray_payloads: list[dict[str, Any]]) -> list[dict[str, str]]:
+        now = datetime.now()
+        out: list[dict[str, str]] = []
+        for row in tray_payloads:
+            tray_id = str(row.get("tray_id", "")).strip()
+            if not tray_id:
+                continue
+            ccu_payload = row.get("ccu_payload") or {}
+            fpc_payload = row.get("fpc_payload") or {}
+            start_dt = parse_datetime(ccu_payload.get("start_time"))
+            end_dt = parse_datetime(ccu_payload.get("end_time"))
+            precharge_start_dt = parse_datetime(fpc_payload.get("precharge_start_time"))
+            if fpc_payload:
+                status_text = "Precharged"
+                if end_dt is None:
+                    aging_text = "-"
+                else:
+                    ref_time = precharge_start_dt or now
+                    aging_text = _format_timedelta(ref_time - end_dt)
+            else:
+                if end_dt is None:
+                    aging_text = "-"
+                    status_text = "-"
+                else:
+                    aging_delta = now - end_dt
+                    aging_text = _format_timedelta(aging_delta)
+                    status_text = _aging_status_text(aging_delta)
+            out.append(
+                {
+                    "tray_id": tray_id,
+                    "start_time": start_dt.isoformat(sep=" ", timespec="seconds") if start_dt else "-",
+                    "end_time": end_dt.isoformat(sep=" ", timespec="seconds") if end_dt else "-",
+                    "aging_time": aging_text,
+                    "status": status_text,
+                }
+            )
+        out.sort(key=lambda item: (item.get("end_time", ""), item.get("tray_id", "")), reverse=True)
+        return out
 
     def _on_auto_group_toggled(self, checked: bool) -> None:
         self._run_action(
@@ -832,27 +1346,6 @@ class _MainWindow(QMainWindow):
             ),
         )
 
-    def _populate_trolley_selector(self) -> None:
-        current_text = self._trolley_selector.currentText().strip()
-        trolley_ids = sorted(
-            {
-                *self._vm.assembly_trolley_model.trolley_ids(),
-                *self._vm.queue_trolley_model.trolley_ids(),
-                *self._vm.precharge_trolley_model.trolley_ids(),
-            }
-        )
-        self._trolley_selector.blockSignals(True)
-        self._trolley_selector.clear()
-        self._trolley_selector.addItems(trolley_ids)
-        if current_text:
-            self._trolley_selector.setEditText(current_text)
-        elif trolley_ids:
-            self._trolley_selector.setCurrentIndex(0)
-        self._trolley_selector.blockSignals(False)
-
-    def _current_trolley_id(self) -> str:
-        return self._trolley_selector.currentText().strip()
-
     def _run_action(self, *, action_name: str, action: Callable[[], Any]) -> None:
         if self._action_inflight:
             self._status.setText("Another action is running. Please wait.")
@@ -878,6 +1371,24 @@ class _MainWindow(QMainWindow):
     def _on_action_done(self, action_name: str, result: object, error: object) -> None:
         self._action_inflight = False
         self._set_controls_enabled(True)
+        if action_name == "Search":
+            query = self._pending_search_query
+            self._pending_search_query = ""
+            if error:
+                self._search_result.setText(f"Search failed: {error}")
+                self._status.setText("Search failed.")
+                log.error("UI action failed action=%s error=%s", action_name, error)
+                return
+            owner = dict(result) if isinstance(result, dict) else None
+            if owner is None:
+                self._search_result.setText(f"No data for {query}.")
+                self._status.setText("Search completed.")
+                log.info("UI action completed action=%s", action_name)
+                return
+            self._search_result.setText(self._format_cell_search_result(query, owner))
+            self._status.setText("Search completed.")
+            log.info("UI action completed action=%s", action_name)
+            return
         if error:
             message = f"{action_name} failed: {error}"
             self._status.setText(message)
@@ -889,7 +1400,7 @@ class _MainWindow(QMainWindow):
             message = f"{action_name} completed."
         else:
             message = f"{action_name} completed: {result}"
-        if action_name == "Add trolley":
+        if action_name in {"Add trolley", "Edit trolley add trays"}:
             self._vm.assembly_ungrouped_model.clear_checked()
             self._add_trolley_input.clear()
         if action_name == "Apply settings" and self._pending_db_restart_notice:
@@ -903,15 +1414,114 @@ class _MainWindow(QMainWindow):
         self._full_refresh_btn.setEnabled(enabled)
         self._auto_group_checkbox.setEnabled(enabled)
         self._settings_btn.setEnabled(enabled)
-        self._select_all_btn.setEnabled(enabled)
-        self._unselect_all_btn.setEnabled(enabled)
+        self._search_input.setEnabled(enabled)
+        self._search_btn.setEnabled(enabled)
         self._add_trolley_input.setEnabled(enabled)
         self._add_trolley_btn.setEnabled(enabled)
-        self._trolley_selector.setEnabled(enabled)
-        self._new_trolley_input.setEnabled(enabled)
-        self._edit_trolley_btn.setEnabled(enabled)
-        self._clear_trolley_btn.setEnabled(enabled)
-        self._delete_trolley_btn.setEnabled(enabled)
+        self._assembly_card.trolley_list.setEnabled(enabled)
+        self._queue_card.trolley_list.setEnabled(enabled)
+        self._precharge_card.trolley_list.setEnabled(enabled)
+        if self._assembly_card.tray_table is not None:
+            self._assembly_card.tray_table.setEnabled(enabled)
+
+    def _clear_ungroup_selection(self) -> None:
+        tray_table = self._assembly_card.tray_table
+        if tray_table is None:
+            return
+        if tray_table.selectionModel() is not None:
+            tray_table.clearSelection()
+        self._vm.assembly_ungrouped_model.clear_checked()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.MouseButtonPress:
+            tray_table = self._assembly_card.tray_table
+            if tray_table is not None and tray_table.isVisible():
+                global_position_fn = getattr(event, "globalPosition", None)
+                if callable(global_position_fn):
+                    global_point = global_position_fn().toPoint()
+                    target_widget = QApplication.widgetAt(global_point)
+                    keep_widgets = {
+                        self._add_trolley_btn,
+                        self._add_trolley_input,
+                        self._search_btn,
+                        self._search_input,
+                        self._quick_refresh_btn,
+                        self._full_refresh_btn,
+                        self._auto_group_checkbox,
+                        self._settings_btn,
+                    }
+                    keep_selection = bool(
+                        target_widget is not None
+                        and any(
+                            target_widget is keep_widget or keep_widget.isAncestorOf(target_widget)
+                            for keep_widget in keep_widgets
+                        )
+                    )
+                    inside_table = bool(
+                        target_widget is not None
+                        and (target_widget is tray_table or tray_table.isAncestorOf(target_widget))
+                    )
+                    if not inside_table and not keep_selection:
+                        self._clear_ungroup_selection()
+        return super().eventFilter(watched, event)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        app = QApplication.instance()
+        if self._event_filter_installed and app is not None:
+            app.removeEventFilter(self)
+            self._event_filter_installed = False
+        super().closeEvent(event)
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow {
+                background: #f3f5fb;
+            }
+            QFrame#metricBox {
+                background: #ffffff;
+                border: 1px solid #d8dfec;
+                border-radius: 12px;
+            }
+            QLabel#metricTitle {
+                color: #64748b;
+                font-size: 12px;
+            }
+            QLabel#metricValue {
+                color: #0f172a;
+                font-size: 22px;
+                font-weight: 700;
+            }
+            QWidget#columnCard {
+                background: #ffffff;
+                border: 1px solid #d8dfec;
+                border-radius: 12px;
+                padding: 8px;
+            }
+            QPushButton {
+                background: #1d4ed8;
+                color: #ffffff;
+                border: none;
+                border-radius: 8px;
+                padding: 6px 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: #1e40af;
+            }
+            QLineEdit {
+                background: #ffffff;
+                border: 1px solid #c9d3e6;
+                border-radius: 8px;
+                padding: 6px 8px;
+            }
+            QLabel#statusBar {
+                color: #334155;
+                font-size: 12px;
+                padding-left: 2px;
+            }
+            """
+        )
 
 
 def _upsert_env_values(path: Path, values: dict[str, str]) -> None:
@@ -942,8 +1552,31 @@ def _upsert_env_values(path: Path, values: dict[str, str]) -> None:
     path.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
 
 
+def _format_timedelta(delta: timedelta) -> str:
+    total_seconds = int(delta.total_seconds())
+    sign = "-" if total_seconds < 0 else ""
+    total_seconds = abs(total_seconds)
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _aging_status_text(delta: timedelta) -> str:
+    age_hours = max(delta.total_seconds(), 0.0) / 3600.0
+    target = max(float(settings.target_aging_hours), 0.0)
+    tolerance = max(float(settings.target_aging_tolerance_hours), 0.0)
+    min_target = max(target - tolerance, 0.0)
+    max_target = target + tolerance
+    if age_hours < min_target:
+        return "Waiting to send to Precharge"
+    if age_hours <= max_target:
+        return "Ready to send to Precharge"
+    return "Exceed Aging Time"
+
+
 def main() -> int:
     _configure_logging()
+    _install_crash_hooks()
     log.info("Application starting pid=%s python=%s", os.getpid(), sys.version.split()[0])
     app = QApplication(sys.argv)
 

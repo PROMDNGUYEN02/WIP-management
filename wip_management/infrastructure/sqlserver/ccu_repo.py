@@ -93,35 +93,185 @@ class CcuRepo:
         return out
 
     async def peek_latest_signal_time(self, end_time: datetime) -> datetime | None:
-        query_end = (
-            f"SELECT TOP 1 {self._end_col} AS latest_signal_time "
-            f"FROM {self._table} "
-            f"WHERE {self._end_col} IS NOT NULL AND {self._end_col} <= ? "
-            f"ORDER BY {self._end_col} DESC"
+        query = (
+            "SELECT MAX(signal_time) AS latest_signal_time FROM ("
+            f" SELECT MAX({self._end_col}) AS signal_time"
+            f" FROM {self._table}"
+            f" WHERE {self._end_col} IS NOT NULL AND {self._end_col} <= ?"
+            " UNION ALL"
+            f" SELECT MAX({self._start_col}) AS signal_time"
+            f" FROM {self._table}"
+            f" WHERE {self._end_col} IS NULL AND {self._start_col} <= ?"
+            ") AS signal_rows"
         )
-        rows_end = await self._conn.query_rows(query_end, [end_time])
-        if rows_end:
-            latest_end = _coerce_datetime(rows_end[0].get("latest_signal_time"))
-            if latest_end is not None:
-                log.debug("CCU peek latest signal from end_time=%s", latest_end.isoformat())
-                return latest_end
-
-        query_start = (
-            f"SELECT TOP 1 {self._start_col} AS latest_signal_time "
-            f"FROM {self._table} "
-            f"WHERE {self._end_col} IS NULL AND {self._start_col} <= ? "
-            f"ORDER BY {self._start_col} DESC"
-        )
-        rows_start = await self._conn.query_rows(query_start, [end_time])
-        if not rows_start:
+        rows = await self._conn.query_rows(query, [end_time, end_time])
+        if not rows:
             log.debug("CCU peek latest returned empty rowset")
             return None
-        latest_start = _coerce_datetime(rows_start[0].get("latest_signal_time"))
-        if latest_start is None:
-            log.debug("CCU peek latest start_time was not parseable")
+        latest = _coerce_datetime(rows[0].get("latest_signal_time"))
+        if latest is None:
+            log.debug("CCU peek latest signal_time was not parseable")
             return None
-        log.debug("CCU peek latest signal from start_time=%s", latest_start.isoformat())
-        return latest_start
+        log.debug("CCU peek latest signal_time=%s", latest.isoformat())
+        return latest
+
+    async def fetch_tray_cells(
+        self,
+        tray_id: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, str | None]]:
+        wanted = _normalize_tray_id(tray_id)
+        if not wanted:
+            return []
+        query = (
+            "SELECT TOP 5000 lot_no, start_time, end_time, record_json FROM ("
+            " SELECT "
+            f"{self._lot_col} AS lot_no, "
+            f"{self._start_col} AS start_time, "
+            f"{self._end_col} AS end_time, "
+            f"{self._record_col} AS record_json "
+            f" FROM {self._table} "
+            f" WHERE {self._end_col} IS NOT NULL AND {self._end_col} >= ? AND {self._end_col} <= ? "
+            " UNION ALL "
+            " SELECT "
+            f"{self._lot_col} AS lot_no, "
+            f"{self._start_col} AS start_time, "
+            f"{self._end_col} AS end_time, "
+            f"{self._record_col} AS record_json "
+            f" FROM {self._table} "
+            f" WHERE {self._end_col} IS NULL AND {self._start_col} >= ? AND {self._start_col} <= ? "
+            ") AS source_rows "
+            "WHERE record_json LIKE ? "
+            "ORDER BY COALESCE(end_time, start_time) ASC, lot_no ASC, start_time ASC, end_time ASC"
+        )
+        like_text = f"%{wanted}%"
+        rows = await self._conn.query_rows(
+            query,
+            [start_time, end_time, start_time, end_time, like_text],
+        )
+
+        out: list[dict[str, str | None]] = []
+        seen: set[tuple[str, str | None, str | None]] = set()
+        for row in rows:
+            raw_json = row.get("record_json")
+            parsed_json = _parse_json(raw_json)
+            raw_text = _stringify_record_json(raw_json, parsed_json)
+            tray_key, _ = _extract_tray_id_key(
+                parsed_json=parsed_json,
+                raw_text=raw_text,
+                primary_key=self._tray_key,
+                fallback_keys=("TRAY_ID", "TRAYBARCODE", "TRAY_BARCODE"),
+            )
+            if tray_key != wanted:
+                continue
+            lot_value = row.get("lot_no")
+            cell_id = str(lot_value).strip() if lot_value is not None else ""
+            start_dt = _coerce_datetime(row.get("start_time"))
+            end_dt = _coerce_datetime(row.get("end_time"))
+            start_iso = start_dt.isoformat(sep=" ", timespec="seconds") if start_dt else None
+            end_iso = end_dt.isoformat(sep=" ", timespec="seconds") if end_dt else None
+            dedup_key = (cell_id, start_iso, end_iso)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            out.append(
+                {
+                    "cell_id": cell_id,
+                    "start_time": start_iso,
+                    "end_time": end_iso,
+                }
+            )
+
+        out.sort(key=lambda item: (item.get("start_time") or "", item.get("cell_id") or ""))
+        log.info(
+            "CCU tray detail fetch tray_id=%s cells=%s raw_rows=%s start_time=%s end_time=%s",
+            wanted,
+            len(out),
+            len(rows),
+            start_time.isoformat(),
+            end_time.isoformat(),
+        )
+        return out
+
+    async def fetch_cell_owner(
+        self,
+        cell_id: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> dict[str, str | None] | None:
+        wanted_cell = str(cell_id).strip().upper()
+        if not wanted_cell:
+            return None
+        query = (
+            "SELECT TOP 400 lot_no, start_time, end_time, record_json FROM ("
+            " SELECT "
+            f"{self._lot_col} AS lot_no, "
+            f"{self._start_col} AS start_time, "
+            f"{self._end_col} AS end_time, "
+            f"{self._record_col} AS record_json "
+            f" FROM {self._table} "
+            f" WHERE {self._end_col} IS NOT NULL AND {self._end_col} >= ? AND {self._end_col} <= ? "
+            " UNION ALL "
+            " SELECT "
+            f"{self._lot_col} AS lot_no, "
+            f"{self._start_col} AS start_time, "
+            f"{self._end_col} AS end_time, "
+            f"{self._record_col} AS record_json "
+            f" FROM {self._table} "
+            f" WHERE {self._end_col} IS NULL AND {self._start_col} >= ? AND {self._start_col} <= ? "
+            ") AS source_rows "
+            "WHERE UPPER(CAST(lot_no AS NVARCHAR(128))) = ? "
+            "ORDER BY COALESCE(end_time, start_time) DESC"
+        )
+        rows = await self._conn.query_rows(
+            query,
+            [start_time, end_time, start_time, end_time, wanted_cell],
+        )
+        if not rows:
+            log.info(
+                "CCU cell owner lookup empty cell_id=%s start_time=%s end_time=%s",
+                wanted_cell,
+                start_time.isoformat(),
+                end_time.isoformat(),
+            )
+            return None
+
+        for row in rows:
+            raw_json = row.get("record_json")
+            parsed_json = _parse_json(raw_json)
+            raw_text = _stringify_record_json(raw_json, parsed_json)
+            tray_key, _ = _extract_tray_id_key(
+                parsed_json=parsed_json,
+                raw_text=raw_text,
+                primary_key=self._tray_key,
+                fallback_keys=("TRAY_ID", "TRAYBARCODE", "TRAY_BARCODE"),
+            )
+            if not tray_key:
+                continue
+            start_dt = _coerce_datetime(row.get("start_time"))
+            end_dt = _coerce_datetime(row.get("end_time"))
+            result = {
+                "cell_id": wanted_cell,
+                "tray_id": tray_key,
+                "start_time": start_dt.isoformat(sep=" ", timespec="seconds") if start_dt else None,
+                "end_time": end_dt.isoformat(sep=" ", timespec="seconds") if end_dt else None,
+            }
+            log.info(
+                "CCU cell owner lookup hit cell_id=%s tray_id=%s start_time=%s end_time=%s",
+                wanted_cell,
+                tray_key,
+                result["start_time"],
+                result["end_time"],
+            )
+            return result
+
+        log.info(
+            "CCU cell owner lookup unresolved tray_id cell_id=%s scanned_rows=%s",
+            wanted_cell,
+            len(rows),
+        )
+        return None
 
     async def _fetch_range(self, start_time: datetime, end_time: datetime) -> list[dict[str, Any]]:
         all_rows: list[dict[str, Any]] = []

@@ -31,6 +31,20 @@ class SignalRepoPort(Protocol):
 class CcuRepoPort(SignalRepoPort, Protocol):
     async def fetch_by_tray_ids(self, tray_ids: Iterable[str], end_time: datetime) -> list[TraySignal]: ...
 
+    async def fetch_tray_cells(
+        self,
+        tray_id: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, str | None]]: ...
+
+    async def fetch_cell_owner(
+        self,
+        cell_id: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> dict[str, str | None] | None: ...
+
 
 class FpcRepoPort(SignalRepoPort, Protocol):
     pass

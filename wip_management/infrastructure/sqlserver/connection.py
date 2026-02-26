@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -17,6 +18,7 @@ _VALID_SQL_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 class SQLServerConnection:
     def __init__(self) -> None:
         self._pool: aioodbc.pool.Pool | None = None
+        self._query_semaphore: asyncio.Semaphore | None = None
 
     async def start(self) -> None:
         if self._pool is not None:
@@ -36,12 +38,24 @@ class SQLServerConnection:
             tried.append(driver)
             try:
                 log.debug("Trying SQL driver=%s", driver)
+                concurrency_limit = max(1, int(settings.sql_max_concurrent_queries))
+                # Legacy "SQL Server" driver is not stable under high concurrency.
+                if driver.strip().lower() == "sql server":
+                    if concurrency_limit != 1:
+                        log.warning(
+                            "Forcing SQL max concurrent queries to 1 for legacy driver '%s' (configured=%s)",
+                            driver,
+                            concurrency_limit,
+                        )
+                    concurrency_limit = 1
+                pool_size = max(1, min(8, concurrency_limit))
                 self._pool = await aioodbc.create_pool(
                     dsn=settings.build_odbc_dsn(driver=driver),
                     autocommit=True,
                     minsize=1,
-                    maxsize=16,
+                    maxsize=pool_size,
                 )
+                self._query_semaphore = asyncio.Semaphore(concurrency_limit)
                 if driver != settings.sql_driver:
                     log.warning(
                         "Configured SQL_DRIVER='%s' not usable, fallback to '%s'",
@@ -50,6 +64,11 @@ class SQLServerConnection:
                     )
                 else:
                     log.info("SQL ODBC driver in use: %s", driver)
+                log.info(
+                    "SQL query concurrency configured limit=%s pool_maxsize=%s",
+                    concurrency_limit,
+                    pool_size,
+                )
                 return
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
@@ -71,30 +90,34 @@ class SQLServerConnection:
         self._pool.close()
         await self._pool.wait_closed()
         self._pool = None
+        self._query_semaphore = None
         log.info("SQL pool closed")
 
     async def query_rows(self, query: str, params: list[Any]) -> list[dict[str, Any]]:
         if self._pool is None:
             raise RuntimeError("SQL connection has not started")
+        if self._query_semaphore is None:
+            raise RuntimeError("SQL query semaphore is not initialized")
         query_preview = _compact_sql(query, max_chars=settings.log_sql_preview_chars)
         started_at = time.perf_counter()
         log.debug("SQL query start params=%s sql=%s", len(params), query_preview)
-        async with self._pool.acquire() as conn:
-            try:
-                async with conn.cursor() as cur:
-                    cur.timeout = settings.sql_query_timeout_seconds
-                    await cur.execute(query, params)
-                    rows = await cur.fetchall()
-                    cols = [col[0] for col in cur.description]
-            except Exception:  # noqa: BLE001
-                elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-                log.exception(
-                    "SQL query failed elapsed_ms=%s params=%s sql=%s",
-                    elapsed_ms,
-                    len(params),
-                    query_preview,
-                )
-                raise
+        async with self._query_semaphore:
+            async with self._pool.acquire() as conn:
+                try:
+                    async with conn.cursor() as cur:
+                        cur.timeout = settings.sql_query_timeout_seconds
+                        await cur.execute(query, params)
+                        rows = await cur.fetchall()
+                        cols = [col[0] for col in cur.description]
+                except Exception:  # noqa: BLE001
+                    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+                    log.exception(
+                        "SQL query failed elapsed_ms=%s params=%s sql=%s",
+                        elapsed_ms,
+                        len(params),
+                        query_preview,
+                    )
+                    raise
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
         row_count = len(rows)
         if elapsed_ms >= 2000:
