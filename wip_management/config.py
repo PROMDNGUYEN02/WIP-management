@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     ui_snapshot_limit: int = Field(default=50000, ge=100, le=200000)
     ui_coalesce_window_ms: int = Field(default=40, ge=5, le=1000)
     ui_coalesce_max_batch: int = Field(default=300, ge=10, le=5000)
-    trolley_max_trays: int = Field(default=30, ge=5, le=200)
+    trolley_max_trays: int = Field(default=6, ge=1, le=200)
     target_aging_hours: float = Field(default=4.0, ge=0.1, le=72.0)
     target_aging_tolerance_hours: float = Field(default=1.0, ge=0.0, le=24.0)
     assembly_auto_trolley_count: int = Field(default=1, ge=1, le=20)

@@ -891,6 +891,7 @@ class _MainWindow(QMainWindow):
             message = f"{action_name} completed: {result}"
         if action_name == "Add trolley":
             self._vm.assembly_ungrouped_model.clear_checked()
+            self._add_trolley_input.clear()
         if action_name == "Apply settings" and self._pending_db_restart_notice:
             message = f"{message} Restart app to apply DB host/user/password."
             self._pending_db_restart_notice = False

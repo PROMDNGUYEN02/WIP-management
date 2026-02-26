@@ -189,6 +189,10 @@ class OrchestratorService:
         log.info("Manual clear trolley apply trolley_id=%s", normalized_trolley_id)
         await self._sync_manual_assignments_from_repo(force=True)
         removed = self._manual_group.clear_trolley(normalized_trolley_id)
+        if removed == 0:
+            raise ValueError(
+                f"No manual tray assignments found for trolley_id={normalized_trolley_id}",
+            )
         await self._persist_manual_assignments_to_repo()
         projection = await self._compute_projection()
         await self._publish_trolley_updated(projection)
@@ -211,6 +215,8 @@ class OrchestratorService:
         log.info("Manual rename trolley apply old=%s new=%s", old_id, new_id)
         await self._sync_manual_assignments_from_repo(force=True)
         changed = self._manual_group.rename_trolley(old_id, new_id)
+        if changed == 0:
+            raise ValueError(f"No manual tray assignments found for trolley_id={old_id}")
         await self._persist_manual_assignments_to_repo()
         projection = await self._compute_projection()
         await self._publish_trolley_updated(projection)

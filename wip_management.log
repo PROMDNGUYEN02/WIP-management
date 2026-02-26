@@ -579,3 +579,30 @@
 2026-02-26 06:45:09,913 INFO __main__ [wip-runtime] Runtime thread main exited
 2026-02-26 06:45:09,913 INFO __main__ [MainThread] Runtime thread stopped
 2026-02-26 06:45:09,914 INFO __main__ [MainThread] Application stopped
+2026-02-26 07:01:27,023 INFO __main__ [MainThread] Logging configured level=INFO console=True file=wip_management.log
+2026-02-26 07:01:27,023 INFO __main__ [MainThread] Application starting pid=14540 python=3.11.9
+2026-02-26 07:01:27,042 INFO __main__ [MainThread] Runtime start requested
+2026-02-26 07:01:27,042 INFO __main__ [wip-runtime] Runtime thread main started
+2026-02-26 07:01:27,043 INFO __main__ [wip-runtime] Runtime async bootstrap started
+2026-02-26 07:01:27,043 INFO __main__ [wip-runtime] Shared grouping state enabled path=C:\Users\PROMDNGUYEN02\OneDrive - Techtronic Industries Co. Ltd\AES_Mass production - WIP Management\grouping_state.json
+2026-02-26 07:01:27,043 INFO wip_management.infrastructure.messaging.event_bus [wip-runtime] Event bus subscribe subscribers=1 queue_size=20000
+2026-02-26 07:01:27,044 INFO __main__ [wip-runtime] Runtime subscribed to event bus queue_size=20000
+2026-02-26 07:01:27,044 INFO __main__ [wip-runtime] Runtime bootstrap signal emitted to UI thread
+2026-02-26 07:01:27,044 INFO __main__ [MainThread] Runtime thread bootstrapped successfully
+2026-02-26 07:01:27,044 INFO __main__ [wip-runtime] Starting orchestrator service
+2026-02-26 07:01:27,046 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator start begin
+2026-02-26 07:01:27,171 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] Starting SQL pool with 1 driver candidate(s): ['SQL Server']
+2026-02-26 07:01:27,367 INFO __main__ [wip-runtime] UI event coalescer loop started
+2026-02-26 07:01:27,466 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL ODBC driver in use: SQL Server
+2026-02-26 07:01:27,466 INFO wip_management.application.state.state_store [wip-runtime] State store writer loop started queue_size=20000
+2026-02-26 07:01:27,476 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU initial fetch start start_time=2026-02-26T00:00:00 end_time=2026-02-26T07:01:27.476652
+2026-02-26 07:01:27,477 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial fetch start start_time=2026-02-26T00:00:00 end_time=2026-02-26T07:01:27.476652
+2026-02-26 07:01:41,119 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow elapsed_ms=13641 rows=5000 params=6 sql=SELECT lot_no, start_time, end_time, record_json FROM ( SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE [END_TIME]...
+2026-02-26 07:01:41,192 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow elapsed_ms=13715 rows=5000 params=6 sql=SELECT lot_no, start_time, end_time, record_json FROM ( SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE [END_TIME]...
+2026-02-26 07:01:46,614 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow elapsed_ms=5419 rows=2632 params=6 sql=SELECT lot_no, start_time, end_time, record_json FROM ( SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE [END_TIME]...
+2026-02-26 07:01:48,871 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU initial fetch done elapsed_ms=21394 raw_rows=7632 signals=21
+2026-02-26 07:01:51,473 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow elapsed_ms=10364 rows=5000 params=6 sql=SELECT lot_no, start_time, end_time, record_json FROM ( SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE [END_TIME]...
+2026-02-26 07:01:56,723 INFO __main__ [MainThread] UI action started action=Apply settings
+2026-02-26 07:01:56,723 INFO __main__ [ui-action-apply-settings] Update grouping settings requested max_trays_per_trolley=6
+2026-02-26 07:01:56,723 INFO __main__ [wip-runtime] Update grouping settings completed result={'max_trays_per_trolley': 6, 'changed': False}
+2026-02-26 07:01:56,723 INFO __main__ [MainThread] UI action completed action=Apply settings
