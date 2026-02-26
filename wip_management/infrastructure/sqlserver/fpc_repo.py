@@ -76,6 +76,7 @@ class FpcRepo:
                 start_time=start_time,
                 end_time=end_time,
                 offset=offset,
+                query_name="fpc.initial_stream_batch",
             )
             if not batch:
                 break
@@ -131,7 +132,11 @@ class FpcRepo:
             f"{self._end_col}, {self._start_col}"
             ") DESC"
         )
-        rows = await self._conn.query_rows(query, [end_time])
+        rows = await self._conn.query_rows(
+            query,
+            [end_time],
+            query_name="fpc.peek_latest_signal_time",
+        )
         if not rows:
             log.debug("FPC peek latest returned empty rowset")
             return None
@@ -154,7 +159,12 @@ class FpcRepo:
         offset = 0
         page = 0
         while True:
-            batch = await self._fetch_batch(start_time=start_time, end_time=end_time, offset=offset)
+            batch = await self._fetch_batch(
+                start_time=start_time,
+                end_time=end_time,
+                offset=offset,
+                query_name="fpc.window_fetch_batch",
+            )
             if not batch:
                 log.debug("FPC fetch range page=%s offset=%s returned empty", page, offset)
                 break
@@ -172,6 +182,7 @@ class FpcRepo:
         start_time: datetime,
         end_time: datetime,
         offset: int,
+        query_name: str = "fpc.fetch_batch",
     ) -> list[dict[str, Any]]:
         query = (
             "SELECT "
@@ -196,7 +207,7 @@ class FpcRepo:
             offset,
             settings.max_fetch_batch,
         ]
-        return await self._conn.query_rows(query, params)
+        return await self._conn.query_rows(query, params, query_name=query_name)
 
     def _rows_to_signals(self, rows: list[dict[str, Any]]) -> list[TraySignal]:
         per_tray: dict[str, dict[str, Any]] = {}

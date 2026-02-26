@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +36,13 @@ class _FpcInitialStreamResult:
     chunks: int
     partial_published: bool
     stream_failed: bool = False
+    pending_missing_ccu_tray_ids: set[str] = field(default_factory=set)
+
+
+@dataclass(slots=True, frozen=True)
+class _HasNewDataResult:
+    has_new_data: bool
+    was_fresh: bool
 
 
 class OrchestratorService:
@@ -97,6 +105,8 @@ class OrchestratorService:
         self._tray_cells_inflight: dict[str, asyncio.Task[list[dict[str, str | None]]]] = {}
         self._active_detail_queries = 0
         self._initial_publish_lock = asyncio.Lock()
+        self._peek_latest_cache_ttl = timedelta(seconds=max(0.0, settings.peek_latest_cache_ttl_seconds))
+        self._peek_latest_cache: dict[str, tuple[datetime, datetime, datetime | None]] = {}
 
     async def start(self) -> None:
         if self._running:
@@ -107,6 +117,7 @@ class OrchestratorService:
         await _maybe_start(self._fpc_repo)
         await self._store.start()
         await self._sync_manual_assignments_from_repo(force=True)
+        self._peek_latest_cache.clear()
         self._running = True
         self._stop_event.clear()
         self._bootstrap_in_progress = True
@@ -143,6 +154,7 @@ class OrchestratorService:
             await asyncio.gather(*self._tray_cells_inflight.values(), return_exceptions=True)
         self._tray_cells_inflight.clear()
         self._tray_cells_cache.clear()
+        self._peek_latest_cache.clear()
         self._executor.shutdown(wait=True, cancel_futures=False)
         await self._store.stop()
         await _maybe_close(self._ccu_repo)
@@ -406,13 +418,17 @@ class OrchestratorService:
             )
             return {"mode": "manual_full", "changed": changed, "merged": len(result.merged)}
 
-        if not await self._has_new_data_since(watermark.collected_time, now):
+        has_new_data = await self._has_new_data_since(watermark.collected_time, now)
+        if not has_new_data.has_new_data:
             synced_changed = await self._sync_manual_assignments_from_repo()
             if synced_changed:
                 projection = await self._compute_projection()
                 await self._publish_trolley_updated(projection)
-            await self._set_refresh_watermark(now)
-            log.info("Manual refresh quick no-new-data")
+            if has_new_data.was_fresh:
+                await self._set_refresh_watermark(now)
+                log.info("Manual refresh quick no-new-data")
+            else:
+                log.info("Manual refresh quick no-new-data (peek cached, watermark preserved)")
             return {"mode": "manual_quick", "changed": synced_changed, "merged": 0}
 
         result = await self._run_delta_scan(watermark=watermark, end_time=now)
@@ -581,6 +597,10 @@ class OrchestratorService:
         else:
             fpc_result = fpc_out
 
+        deferred_backfill_changed = False
+        if (not ccu_failed) and fpc_result.pending_missing_ccu_tray_ids:
+            deferred_backfill_changed = await self._maybe_backfill_ccu(fpc_result.pending_missing_ccu_tray_ids)
+
         ccu_tray_ids = {str(item.tray_id) for item in norm_ccu}
         fpc_tray_ids = {str(item.tray_id) for item in fpc_result.norm_signals}
         raw_overlap = ccu_tray_ids & fpc_tray_ids
@@ -601,7 +621,7 @@ class OrchestratorService:
             changed=0,
         )
         log.info(
-            "Initial load completed elapsed_ms=%s merged=%s trays=%s ccu=%s fpc=%s overlap=%s fpc_chunks=%s fpc_raw_rows=%s fpc_stream_failed=%s watermark=%s partial_source=%s",
+            "Initial load completed elapsed_ms=%s merged=%s trays=%s ccu=%s fpc=%s overlap=%s fpc_chunks=%s fpc_raw_rows=%s fpc_stream_failed=%s deferred_missing_ccu=%s deferred_backfill_changed=%s watermark=%s partial_source=%s",
             int((time.perf_counter() - started_at) * 1000),
             merged_count,
             len(projection.trays),
@@ -611,6 +631,8 @@ class OrchestratorService:
             fpc_result.chunks,
             fpc_result.raw_rows,
             fpc_result.stream_failed,
+            len(fpc_result.pending_missing_ccu_tray_ids),
+            deferred_backfill_changed,
             end.isoformat(),
             "ccu+fpc-stream",
         )
@@ -647,8 +669,7 @@ class OrchestratorService:
                 rows = await self._fpc_repo.fetch_initial(start_time=start_time, end_time=end_time)
                 norm_fpc = await self._normalize_signals(rows)
                 result = await self._ingest.execute([], norm_fpc, previous_watermark=previous)
-                backfill_changed = await self._maybe_backfill_ccu(result.store_result.missing_ccu_tray_ids)
-                changed = len(result.store_result.changed) + (1 if backfill_changed else 0)
+                changed = len(result.store_result.changed)
                 await self._publish_initial_partial_snapshot(
                     source="fpc",
                     merged=len(result.merged),
@@ -669,6 +690,7 @@ class OrchestratorService:
                 chunks=1 if rows else 0,
                 partial_published=True,
                 stream_failed=False,
+                pending_missing_ccu_tray_ids=set(result.store_result.missing_ccu_tray_ids),
             )
 
         all_norm_fpc: list[TraySignal] = []
@@ -680,6 +702,7 @@ class OrchestratorService:
         publish_interval_seconds = max(0.1, float(settings.initial_partial_publish_max_interval_seconds))
         min_changed_to_publish = max(1, int(settings.initial_partial_publish_min_changed))
         pending_changed = 0
+        pending_missing_ccu_tray_ids: set[str] = set()
 
         try:
             async for chunk in stream_method(start_time=start_time, end_time=end_time):
@@ -695,8 +718,8 @@ class OrchestratorService:
                 if norm_chunk:
                     all_norm_fpc.extend(norm_chunk)
                 result = await self._ingest.execute([], norm_chunk, previous_watermark=previous)
-                backfill_changed = await self._maybe_backfill_ccu(result.store_result.missing_ccu_tray_ids)
-                changed = len(result.store_result.changed) + (1 if backfill_changed else 0)
+                pending_missing_ccu_tray_ids.update(result.store_result.missing_ccu_tray_ids)
+                changed = len(result.store_result.changed)
                 pending_changed += changed
 
                 now_perf = time.perf_counter()
@@ -713,13 +736,14 @@ class OrchestratorService:
                     pending_changed = 0
                     last_publish_at = now_perf
                 log.info(
-                    "Initial load FPC stream chunk=%s raw_rows=%s signals=%s merged=%s changed=%s pending_changed=%s total_signals=%s",
+                    "Initial load FPC stream chunk=%s raw_rows=%s signals=%s merged=%s changed=%s pending_changed=%s pending_missing_ccu=%s total_signals=%s",
                     chunk_count,
                     raw_rows,
                     len(norm_chunk),
                     len(result.merged),
                     changed,
                     pending_changed,
+                    len(pending_missing_ccu_tray_ids),
                     len(all_norm_fpc),
                 )
         except Exception:  # noqa: BLE001
@@ -740,6 +764,7 @@ class OrchestratorService:
             chunks=chunk_count,
             partial_published=partial_published,
             stream_failed=stream_failed,
+            pending_missing_ccu_tray_ids=pending_missing_ccu_tray_ids,
         )
 
     async def _publish_initial_partial_snapshot(
@@ -764,7 +789,17 @@ class OrchestratorService:
 
     async def _refresh_loop(self) -> None:
         log.info("Refresh loop started interval_seconds=%s", self._delta_poll_interval_seconds)
+        first_wait = max(0.1, self._delta_poll_interval_seconds)
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=first_wait)
+            log.info("Refresh loop stopped before first tick")
+            return
+        except asyncio.TimeoutError:
+            pass
+
         while self._running:
+            if self._stop_event.is_set():
+                break
             self._refresh_iteration += 1
             had_change = False
             try:
@@ -785,6 +820,9 @@ class OrchestratorService:
     async def _refresh_once(self) -> bool:
         iteration = self._refresh_iteration
         started_at = time.perf_counter()
+        if self._stop_event.is_set() or (not self._running):
+            log.debug("Refresh #%s skipped because stop was requested", iteration)
+            return False
         if self._active_detail_queries > 0:
             log.debug(
                 "Refresh #%s skipped while tray detail query in progress count=%s",
@@ -797,13 +835,17 @@ class OrchestratorService:
             log.debug("Refresh #%s skipped because watermark is None", iteration)
             return False
         now = self._clock.now()
-        if not await self._has_new_data_since(watermark.collected_time, now):
+        has_new_data = await self._has_new_data_since(watermark.collected_time, now)
+        if not has_new_data.has_new_data:
             synced_changed = await self._sync_manual_assignments_from_repo()
             if synced_changed:
                 projection = await self._compute_projection()
                 await self._publish_trolley_updated(projection)
-            await self._set_refresh_watermark(now)
-            log.debug("Refresh #%s no new data", iteration)
+            if has_new_data.was_fresh:
+                await self._set_refresh_watermark(now)
+                log.debug("Refresh #%s no new data", iteration)
+            else:
+                log.debug("Refresh #%s no new data (peek cached, watermark preserved)", iteration)
             return synced_changed
 
         ingest_result = await self._run_delta_scan(watermark=watermark, end_time=now)
@@ -905,22 +947,58 @@ class OrchestratorService:
         )
         return result
 
-    async def _has_new_data_since(self, since: datetime, end_time: datetime) -> bool:
-        ccu_latest, fpc_latest = await asyncio.gather(
-            self._ccu_repo.peek_latest_signal_time(end_time=end_time),
-            self._fpc_repo.peek_latest_signal_time(end_time=end_time),
+    async def _has_new_data_since(self, since: datetime, end_time: datetime) -> _HasNewDataResult:
+        (ccu_latest, ccu_fresh), (fpc_latest, fpc_fresh) = await asyncio.gather(
+            self._peek_latest_signal_time_cached(
+                cache_key="ccu",
+                end_time=end_time,
+                fetcher=self._ccu_repo.peek_latest_signal_time,
+            ),
+            self._peek_latest_signal_time_cached(
+                cache_key="fpc",
+                end_time=end_time,
+                fetcher=self._fpc_repo.peek_latest_signal_time,
+            ),
         )
+        was_fresh = ccu_fresh and fpc_fresh
         log.debug(
-            "Has-new-data check since=%s ccu_latest=%s fpc_latest=%s",
+            "Has-new-data check since=%s ccu_latest=%s fpc_latest=%s fresh=%s",
             since.isoformat(),
             ccu_latest.isoformat() if ccu_latest else None,
             fpc_latest.isoformat() if fpc_latest else None,
+            was_fresh,
         )
         if ccu_latest is not None and ccu_latest > since:
-            return True
+            return _HasNewDataResult(has_new_data=True, was_fresh=was_fresh)
         if fpc_latest is not None and fpc_latest > since:
-            return True
-        return False
+            return _HasNewDataResult(has_new_data=True, was_fresh=was_fresh)
+        return _HasNewDataResult(has_new_data=False, was_fresh=was_fresh)
+
+    async def _peek_latest_signal_time_cached(
+        self,
+        *,
+        cache_key: str,
+        end_time: datetime,
+        fetcher: Callable[[datetime], Awaitable[datetime | None]],
+    ) -> tuple[datetime | None, bool]:
+        now = self._clock.now()
+        if self._peek_latest_cache_ttl.total_seconds() > 0:
+            cached = self._peek_latest_cache.get(cache_key)
+            if cached is not None:
+                cached_at, cached_end_time, cached_latest = cached
+                age = now - cached_at
+                if age <= self._peek_latest_cache_ttl and end_time >= cached_end_time:
+                    log.debug(
+                        "Peek latest cache hit source=%s age_ms=%s",
+                        cache_key,
+                        int(age.total_seconds() * 1000),
+                    )
+                    return cached_latest, False
+
+        latest = await fetcher(end_time=end_time)
+        fetched_at = self._clock.now()
+        self._peek_latest_cache[cache_key] = (fetched_at, end_time, latest)
+        return latest, True
 
     async def _maybe_backfill_ccu(self, tray_ids: set[str]) -> bool:
         if not tray_ids:

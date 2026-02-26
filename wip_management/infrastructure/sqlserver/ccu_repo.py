@@ -118,7 +118,11 @@ class CcuRepo:
             f"{self._end_col}, {self._start_col}"
             ") DESC"
         )
-        rows = await self._conn.query_rows(query, [end_time])
+        rows = await self._conn.query_rows(
+            query,
+            [end_time],
+            query_name="ccu.peek_latest_signal_time",
+        )
         if not rows:
             log.debug("CCU peek latest returned empty rowset")
             return None
@@ -171,6 +175,7 @@ class CcuRepo:
         rows = await self._conn.query_rows(
             query,
             [start_time, end_time, start_time, end_time, like_text],
+            query_name="ccu.fetch_tray_cells",
         )
 
         out: list[dict[str, str | None]] = []
@@ -255,6 +260,7 @@ class CcuRepo:
         rows = await self._conn.query_rows(
             query,
             [start_time, end_time, start_time, end_time, wanted_cell],
+            query_name="ccu.fetch_cell_owner",
         )
         if not rows:
             log.info(
@@ -319,7 +325,12 @@ class CcuRepo:
         offset = 0
         page = 0
         while True:
-            batch = await self._fetch_batch(start_time=start_time, end_time=end_time, offset=offset)
+            batch = await self._fetch_batch(
+                start_time=start_time,
+                end_time=end_time,
+                offset=offset,
+                query_name="ccu.window_fetch_batch",
+            )
             if not batch:
                 log.debug("CCU fetch range page=%s offset=%s returned empty", page, offset)
                 break
@@ -337,6 +348,7 @@ class CcuRepo:
         start_time: datetime,
         end_time: datetime,
         offset: int,
+        query_name: str = "ccu.fetch_batch",
     ) -> list[dict[str, Any]]:
         query = (
             "SELECT "
@@ -361,7 +373,7 @@ class CcuRepo:
             offset,
             settings.max_fetch_batch,
         ]
-        return await self._conn.query_rows(query, params)
+        return await self._conn.query_rows(query, params, query_name=query_name)
 
     def _rows_to_signals(self, rows: list[dict[str, Any]]) -> list[TraySignal]:
         per_tray: dict[str, dict[str, Any]] = {}

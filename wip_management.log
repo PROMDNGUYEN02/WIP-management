@@ -1335,3 +1335,421 @@ pyodbc.ProgrammingError: The cursor's connection has been closed.
 2026-02-26 16:44:04,203 INFO __main__ [wip-runtime] Runtime thread main exited
 2026-02-26 16:44:04,203 INFO __main__ [MainThread] Runtime thread stopped
 2026-02-26 16:44:04,204 INFO __main__ [MainThread] Application stopped
+2026-02-26 17:25:35,440 INFO __main__ [MainThread] Logging configured level=INFO console=True file=wip_management.log
+2026-02-26 17:25:35,440 INFO __main__ [MainThread] Application starting pid=17528 python=3.11.9
+2026-02-26 17:25:35,694 INFO __main__ [MainThread] Runtime start requested
+2026-02-26 17:25:35,694 INFO __main__ [wip-runtime] Runtime thread main started
+2026-02-26 17:25:35,694 INFO __main__ [wip-runtime] Runtime async bootstrap started
+2026-02-26 17:25:35,699 INFO __main__ [wip-runtime] Shared grouping state enabled path=C:\Users\PROMDNGUYEN02\OneDrive - Techtronic Industries Co. Ltd\AES_Mass production - WIP Management\grouping_state.json
+2026-02-26 17:25:35,699 INFO wip_management.infrastructure.messaging.event_bus [wip-runtime] Event bus subscribe subscribers=1 queue_size=20000
+2026-02-26 17:25:35,699 INFO __main__ [wip-runtime] Runtime subscribed to event bus queue_size=20000
+2026-02-26 17:25:35,700 INFO __main__ [wip-runtime] Runtime bootstrap signal emitted to UI thread
+2026-02-26 17:25:35,700 INFO __main__ [MainThread] Runtime thread bootstrapped successfully
+2026-02-26 17:25:35,700 INFO __main__ [wip-runtime] Starting orchestrator service
+2026-02-26 17:25:35,703 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator start begin
+2026-02-26 17:25:35,711 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] Starting SQL pool with 1 driver candidate(s): ['SQL Server']
+2026-02-26 17:25:35,711 INFO __main__ [wip-runtime] UI event coalescer loop started
+2026-02-26 17:25:36,024 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL ODBC driver in use: SQL Server
+2026-02-26 17:25:36,024 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query concurrency configured limit=1 pool_maxsize=1
+2026-02-26 17:25:36,024 INFO wip_management.application.state.state_store [wip-runtime] State store writer loop started queue_size=20000
+2026-02-26 17:25:36,024 INFO wip_management.application.services.orchestrator [wip-runtime] Manual assignments synced from shared repo count=66
+2026-02-26 17:25:36,034 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load window start=2026-02-26T00:00:00 end=2026-02-26T17:25:36.034548 order=ASC
+2026-02-26 17:25:36,034 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load using FPC stream mode
+2026-02-26 17:25:36,035 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU initial fetch start start_time=2026-02-26T00:00:00 end_time=2026-02-26T17:25:36.034548
+2026-02-26 17:25:36,035 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream start start_time=2026-02-26T00:00:00 end_time=2026-02-26T17:25:36.034548 batch_size=20000
+2026-02-26 17:25:41,028 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.window_fetch_batch total_ms=4991 queue_wait_ms=0 db_exec_ms=4990 execute_ms=2504 fetch_ms=2486 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:26:27,331 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=51298 queue_wait_ms=5015 db_exec_ms=46282 execute_ms=44055 fetch_ms=2227 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:26:33,793 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=1 raw_rows=20000 signals=14 offset=0
+2026-02-26 17:26:33,793 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=14 changed=14 missing_ccu=14 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=14 next_wm=2026-02-26T05:19:03
+2026-02-26 17:26:33,793 INFO __main__ [wip-runtime] UI snapshot event trays=14 assembly=0 queue=4 precharge=0
+2026-02-26 17:26:33,793 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=14
+2026-02-26 17:26:33,825 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#1 merged=14 changed=14 trays=14
+2026-02-26 17:26:33,825 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=1 raw_rows=20000 signals=14 merged=14 changed=14 pending_changed=0 pending_missing_ccu=14 total_signals=14
+2026-02-26 17:26:39,219 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.window_fetch_batch total_ms=58169 queue_wait_ms=52752 db_exec_ms=5416 execute_ms=3019 fetch_ms=2397 rows=19815 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:26:51,798 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU initial fetch done elapsed_ms=75762 raw_rows=39815 signals=104
+2026-02-26 17:26:51,799 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=104 changed=104 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-02-26T17:23:01
+2026-02-26 17:26:51,799 INFO __main__ [wip-runtime] UI snapshot event trays=104 assembly=0 queue=8 precharge=4
+2026-02-26 17:26:51,815 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=104
+2026-02-26 17:26:51,825 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=ccu merged=104 changed=104 trays=104
+2026-02-26 17:27:00,043 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=26214 queue_wait_ms=17975 db_exec_ms=8238 execute_ms=6237 fetch_ms=2001 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:27:06,427 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=2 raw_rows=20000 signals=14 offset=20000
+2026-02-26 17:27:06,427 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=14 changed=14 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=14 next_wm=2026-02-26T08:38:05
+2026-02-26 17:27:06,427 INFO __main__ [wip-runtime] UI snapshot event trays=104 assembly=0 queue=5 precharge=7
+2026-02-26 17:27:06,439 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=104
+2026-02-26 17:27:06,468 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#2 merged=14 changed=14 trays=104
+2026-02-26 17:27:06,469 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=2 raw_rows=20000 signals=14 merged=14 changed=14 pending_changed=0 pending_missing_ccu=14 total_signals=28
+2026-02-26 17:27:17,226 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=10755 queue_wait_ms=0 db_exec_ms=10755 execute_ms=8587 fetch_ms=2168 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:27:23,687 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=3 raw_rows=20000 signals=14 offset=40000
+2026-02-26 17:27:23,687 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=14 changed=14 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=14 next_wm=2026-02-26T09:12:46
+2026-02-26 17:27:23,687 INFO __main__ [wip-runtime] UI snapshot event trays=104 assembly=0 queue=3 precharge=9
+2026-02-26 17:27:23,720 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=104
+2026-02-26 17:27:23,720 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#3 merged=14 changed=14 trays=104
+2026-02-26 17:27:23,720 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=3 raw_rows=20000 signals=14 merged=14 changed=14 pending_changed=0 pending_missing_ccu=14 total_signals=42
+2026-02-26 17:27:35,641 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=11923 queue_wait_ms=0 db_exec_ms=11923 execute_ms=7859 fetch_ms=4064 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:27:42,038 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=4 raw_rows=20000 signals=13 offset=60000
+2026-02-26 17:27:42,038 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=13 changed=13 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=13 next_wm=2026-02-26T10:08:42
+2026-02-26 17:27:42,038 INFO __main__ [wip-runtime] UI snapshot event trays=104 assembly=0 queue=2 precharge=10
+2026-02-26 17:27:42,058 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=104
+2026-02-26 17:27:42,067 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#4 merged=13 changed=13 trays=104
+2026-02-26 17:27:42,067 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=4 raw_rows=20000 signals=13 merged=13 changed=13 pending_changed=0 pending_missing_ccu=14 total_signals=55
+2026-02-26 17:27:53,238 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=11168 queue_wait_ms=0 db_exec_ms=11168 execute_ms=9192 fetch_ms=1976 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:27:59,677 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=5 raw_rows=20000 signals=14 offset=80000
+2026-02-26 17:27:59,677 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=14 changed=14 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=14 next_wm=2026-02-26T11:20:08
+2026-02-26 17:27:59,688 INFO __main__ [wip-runtime] UI snapshot event trays=104 assembly=0 queue=0 precharge=12
+2026-02-26 17:27:59,699 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=104
+2026-02-26 17:27:59,717 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#5 merged=14 changed=14 trays=104
+2026-02-26 17:27:59,717 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=5 raw_rows=20000 signals=14 merged=14 changed=14 pending_changed=0 pending_missing_ccu=14 total_signals=69
+2026-02-26 17:28:09,513 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=9794 queue_wait_ms=0 db_exec_ms=9794 execute_ms=6746 fetch_ms=3048 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:28:15,971 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=6 raw_rows=20000 signals=15 offset=100000
+2026-02-26 17:28:15,971 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=15 changed=15 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=15 next_wm=2026-02-26T15:38:47
+2026-02-26 17:28:15,971 INFO __main__ [wip-runtime] UI snapshot event trays=104 assembly=0 queue=0 precharge=12
+2026-02-26 17:28:15,981 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=104
+2026-02-26 17:28:16,005 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#6 merged=15 changed=15 trays=104
+2026-02-26 17:28:16,005 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=6 raw_rows=20000 signals=15 merged=15 changed=15 pending_changed=0 pending_missing_ccu=14 total_signals=84
+2026-02-26 17:29:11,380 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=55367 queue_wait_ms=0 db_exec_ms=55367 execute_ms=52895 fetch_ms=2472 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:29:17,703 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=7 raw_rows=20000 signals=14 offset=120000
+2026-02-26 17:29:17,703 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=14 changed=14 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=14 next_wm=2026-02-26T17:23:30
+2026-02-26 17:29:17,703 INFO __main__ [wip-runtime] UI snapshot event trays=104 assembly=0 queue=0 precharge=12
+2026-02-26 17:29:17,719 INFO __main__ [ui-tray-detail-VB050004065-1] Tray detail requested tray_id=VB050004065
+2026-02-26 17:29:17,729 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#7 merged=14 changed=14 trays=104
+2026-02-26 17:29:17,730 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=7 raw_rows=20000 signals=14 merged=14 changed=14 pending_changed=0 pending_missing_ccu=14 total_signals=98
+2026-02-26 17:29:17,735 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=104
+2026-02-26 17:29:22,772 INFO __main__ [ui-tray-detail-VB050004081-2] Tray detail requested tray_id=VB050004081
+2026-02-26 17:29:24,188 INFO __main__ [ui-tray-detail-VB050004065-3] Tray detail requested tray_id=VB050004065
+2026-02-26 17:29:28,266 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=10531 queue_wait_ms=0 db_exec_ms=10530 execute_ms=10322 fetch_ms=208 rows=1659 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:29:28,789 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=8 raw_rows=1659 signals=2 offset=140000
+2026-02-26 17:29:28,789 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=2 changed=2 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=2 next_wm=2026-02-26T17:24:22
+2026-02-26 17:29:28,789 INFO __main__ [wip-runtime] UI snapshot event trays=104 assembly=0 queue=0 precharge=12
+2026-02-26 17:29:28,812 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=104
+2026-02-26 17:29:28,814 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#8 merged=2 changed=2 trays=104
+2026-02-26 17:29:28,815 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=8 raw_rows=1659 signals=2 merged=2 changed=2 pending_changed=0 pending_missing_ccu=14 total_signals=100
+2026-02-26 17:29:28,815 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream done elapsed_ms=232780 raw_rows=141659 signals=100 chunks=8
+2026-02-26 17:29:28,816 INFO wip_management.application.services.orchestrator [wip-runtime] CCU backfill fetch tray_ids=14
+2026-02-26 17:29:28,817 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU backfill fetch start tray_count=14 end_time=2026-02-26T17:29:28.816967
+2026-02-26 17:29:30,931 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.window_fetch_batch total_ms=2120 queue_wait_ms=0 db_exec_ms=2119 execute_ms=2029 fetch_ms=90 rows=400 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:29:37,501 INFO __main__ [ui-tray-detail-VB040006712-4] Tray detail requested tray_id=VB040006712
+2026-02-26 17:29:43,131 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU backfill fetch done elapsed_ms=14320 raw_rows=40215 matched_trays=14 signals=14
+2026-02-26 17:29:43,131 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=14 changed=0 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-02-26T04:50:16
+2026-02-26 17:29:43,131 INFO wip_management.application.services.orchestrator [wip-runtime] CCU backfill ingest produced no changes
+2026-02-26 17:29:43,144 INFO __main__ [wip-runtime] UI snapshot event trays=104 assembly=0 queue=0 precharge=12
+2026-02-26 17:29:43,156 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=final merged=204 changed=0 trays=104
+2026-02-26 17:29:43,157 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load completed elapsed_ms=247123 merged=204 trays=104 ccu=104 fpc=100 overlap=93 fpc_chunks=8 fpc_raw_rows=141659 fpc_stream_failed=False deferred_missing_ccu=14 deferred_backfill_changed=False watermark=2026-02-26T17:25:36.034548 partial_source=ccu+fpc-stream
+2026-02-26 17:29:43,157 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator start completed
+2026-02-26 17:29:43,159 INFO __main__ [wip-runtime] Orchestrator started successfully, entering wait state
+2026-02-26 17:29:43,159 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh loop started interval_seconds=1.0
+2026-02-26 17:29:43,164 INFO __main__ [ui-tray-detail-VB050000929-5] Tray detail requested tray_id=VB050000929
+2026-02-26 17:29:43,166 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU tray detail fetch tray_id=VB050000929 cells=400 source=memory-cache
+2026-02-26 17:29:43,171 INFO wip_management.application.services.orchestrator [wip-runtime] Tray detail fetched tray_id=VB050000929 rows=400 elapsed_ms=3
+2026-02-26 17:29:43,173 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=104
+2026-02-26 17:29:45,062 INFO __main__ [ui-tray-detail-VB050004081-6] Tray detail requested tray_id=VB050004081
+2026-02-26 17:29:45,062 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU tray detail fetch tray_id=VB050004081 cells=159 source=memory-cache
+2026-02-26 17:29:45,072 INFO wip_management.application.services.orchestrator [wip-runtime] Tray detail fetched tray_id=VB050004081 rows=159 elapsed_ms=0
+2026-02-26 17:29:46,067 INFO __main__ [ui-tray-detail-VB050004065-7] Tray detail requested tray_id=VB050004065
+2026-02-26 17:29:46,067 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU tray detail fetch tray_id=VB050004065 cells=400 source=memory-cache
+2026-02-26 17:29:46,072 INFO wip_management.application.services.orchestrator [wip-runtime] Tray detail fetched tray_id=VB050004065 rows=400 elapsed_ms=1
+2026-02-26 17:29:46,253 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2086 queue_wait_ms=0 db_exec_ms=2086 execute_ms=2086 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:29:47,106 INFO __main__ [ui-tray-detail-VB040006712-8] Tray detail requested tray_id=VB040006712
+2026-02-26 17:29:47,106 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU tray detail fetch tray_id=VB040006712 cells=400 source=memory-cache
+2026-02-26 17:29:47,106 INFO wip_management.application.services.orchestrator [wip-runtime] Tray detail fetched tray_id=VB040006712 rows=400 elapsed_ms=0
+2026-02-26 17:29:53,478 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=9301 queue_wait_ms=2091 db_exec_ms=7209 execute_ms=7209 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:29:55,525 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.window_fetch_batch total_ms=2040 queue_wait_ms=0 db_exec_ms=2039 execute_ms=1971 fetch_ms=68 rows=400 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:30:06,668 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.window_fetch_batch total_ms=13186 queue_wait_ms=2196 db_exec_ms=10989 execute_ms=10989 fetch_ms=0 rows=0 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:30:06,677 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=1 changed=1 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-02-26T17:28:02
+2026-02-26 17:30:06,690 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=12 ungrouped=39
+2026-02-26 17:30:06,699 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #1 completed elapsed_ms=22530 merged=1 changed=1 backfill_changed=False
+2026-02-26 17:30:13,585 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=5876 queue_wait_ms=0 db_exec_ms=5876 execute_ms=5876 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:30:20,379 INFO __main__ [MainThread] UI action started action=Delete trolley
+2026-02-26 17:30:20,379 INFO __main__ [ui-action-delete-trolley] Delete trolley requested trolley_id=10
+2026-02-26 17:30:20,379 INFO wip_management.application.services.orchestrator [wip-runtime] Manual delete trolley apply trolley_id=10
+2026-02-26 17:30:20,379 INFO wip_management.application.services.orchestrator [wip-runtime] Manual clear trolley apply trolley_id=10
+2026-02-26 17:30:20,397 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=11 ungrouped=51
+2026-02-26 17:30:20,418 INFO __main__ [wip-runtime] Delete trolley completed trolley_id=10 result={'trolley_id': '10', 'removed': 12, 'deleted': True}
+2026-02-26 17:30:20,438 INFO __main__ [MainThread] UI action completed action=Delete trolley
+2026-02-26 17:30:58,097 INFO __main__ [MainThread] UI action started action=Add trolley
+2026-02-26 17:30:58,097 INFO __main__ [ui-action-add-trolley] Manual group many requested tray_count=6 trolley_id=10 column=Queue
+2026-02-26 17:30:58,097 INFO wip_management.application.services.orchestrator [wip-runtime] Manual group apply tray_count=6 trolley_id=10 column=Queue
+2026-02-26 17:30:58,119 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=12 ungrouped=45
+2026-02-26 17:30:58,129 INFO __main__ [wip-runtime] Manual group many completed tray_count=6 trolley_id=10 column=Queue result={'grouped': 6, 'trolley_id': '10', 'column': 'Queue'}
+2026-02-26 17:30:58,158 INFO __main__ [MainThread] UI action completed action=Add trolley
+2026-02-26 17:31:03,700 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=56000 queue_wait_ms=5885 db_exec_ms=50114 execute_ms=50114 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:31:20,876 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2146 queue_wait_ms=0 db_exec_ms=2145 execute_ms=2145 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:31:54,281 INFO __main__ [MainThread] UI action started action=Add trolley
+2026-02-26 17:31:54,281 INFO __main__ [ui-action-add-trolley] Manual group many requested tray_count=3 trolley_id=13 column=Queue
+2026-02-26 17:31:54,281 INFO wip_management.application.services.orchestrator [wip-runtime] Manual group apply tray_count=3 trolley_id=13 column=Queue
+2026-02-26 17:31:54,281 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=13 ungrouped=42
+2026-02-26 17:31:54,307 INFO __main__ [wip-runtime] Manual group many completed tray_count=3 trolley_id=13 column=Queue result={'grouped': 3, 'trolley_id': '13', 'column': 'Queue'}
+2026-02-26 17:31:54,334 INFO __main__ [MainThread] UI action completed action=Add trolley
+2026-02-26 17:31:58,836 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=40109 queue_wait_ms=2155 db_exec_ms=37954 execute_ms=37954 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:32:06,957 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.window_fetch_batch total_ms=8110 queue_wait_ms=1980 db_exec_ms=6129 execute_ms=5953 fetch_ms=176 rows=1602 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:32:07,148 INFO __main__ [MainThread] UI action started action=Add trolley
+2026-02-26 17:32:07,199 INFO __main__ [ui-action-add-trolley] Manual group many requested tray_count=3 trolley_id=14 column=Queue
+2026-02-26 17:32:07,474 INFO wip_management.application.services.orchestrator [wip-runtime] Manual group apply tray_count=3 trolley_id=14 column=Queue
+2026-02-26 17:32:07,474 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=2 changed=2 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=2 next_wm=2026-02-26T17:31:13
+2026-02-26 17:32:07,490 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=14 ungrouped=39
+2026-02-26 17:32:07,495 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #3 completed elapsed_ms=48769 merged=2 changed=2 backfill_changed=False
+2026-02-26 17:32:07,602 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=14 ungrouped=39
+2026-02-26 17:32:07,607 INFO __main__ [wip-runtime] Manual group many completed tray_count=3 trolley_id=14 column=Queue result={'grouped': 3, 'trolley_id': '14', 'column': 'Queue'}
+2026-02-26 17:32:07,622 INFO __main__ [MainThread] UI action completed action=Add trolley
+2026-02-26 17:32:10,580 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2086 queue_wait_ms=0 db_exec_ms=2085 execute_ms=2085 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:32:18,276 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=9773 queue_wait_ms=2090 db_exec_ms=7681 execute_ms=7681 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:32:32,977 INFO __main__ [MainThread] UI action started action=Add trolley
+2026-02-26 17:32:32,977 INFO __main__ [ui-action-add-trolley] Manual group many requested tray_count=5 trolley_id=15 column=Queue
+2026-02-26 17:32:32,977 INFO wip_management.application.services.orchestrator [wip-runtime] Manual group apply tray_count=5 trolley_id=15 column=Queue
+2026-02-26 17:32:32,996 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=15 ungrouped=34
+2026-02-26 17:32:32,999 INFO __main__ [wip-runtime] Manual group many completed tray_count=5 trolley_id=15 column=Queue result={'grouped': 5, 'trolley_id': '15', 'column': 'Queue'}
+2026-02-26 17:32:33,023 INFO __main__ [MainThread] UI action completed action=Add trolley
+2026-02-26 17:32:35,391 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2081 queue_wait_ms=0 db_exec_ms=2081 execute_ms=2081 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:32:43,276 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=9969 queue_wait_ms=2086 db_exec_ms=7882 execute_ms=7882 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:32:52,546 INFO __main__ [MainThread] UI action started action=Add trolley
+2026-02-26 17:32:52,546 INFO __main__ [ui-action-add-trolley] Manual group many requested tray_count=5 trolley_id=16 column=Queue
+2026-02-26 17:32:52,546 INFO wip_management.application.services.orchestrator [wip-runtime] Manual group apply tray_count=5 trolley_id=16 column=Queue
+2026-02-26 17:32:52,561 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=16 ungrouped=29
+2026-02-26 17:32:52,572 INFO __main__ [wip-runtime] Manual group many completed tray_count=5 trolley_id=16 column=Queue result={'grouped': 5, 'trolley_id': '16', 'column': 'Queue'}
+2026-02-26 17:32:52,583 INFO __main__ [MainThread] UI action completed action=Add trolley
+2026-02-26 17:33:00,811 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2517 queue_wait_ms=0 db_exec_ms=2516 execute_ms=2516 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:33:07,453 INFO __main__ [MainThread] UI action started action=Add trolley
+2026-02-26 17:33:07,453 INFO __main__ [ui-action-add-trolley] Manual group many requested tray_count=3 trolley_id=17 column=Queue
+2026-02-26 17:33:07,469 INFO wip_management.application.services.orchestrator [wip-runtime] Manual group apply tray_count=3 trolley_id=17 column=Queue
+2026-02-26 17:33:07,479 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=17 ungrouped=26
+2026-02-26 17:33:07,495 INFO __main__ [wip-runtime] Manual group many completed tray_count=3 trolley_id=17 column=Queue result={'grouped': 3, 'trolley_id': '17', 'column': 'Queue'}
+2026-02-26 17:33:07,514 INFO __main__ [MainThread] UI action completed action=Add trolley
+2026-02-26 17:33:08,249 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=9950 queue_wait_ms=2524 db_exec_ms=7425 execute_ms=7425 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:33:25,304 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2052 queue_wait_ms=0 db_exec_ms=2051 execute_ms=2051 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:33:33,035 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=9787 queue_wait_ms=2059 db_exec_ms=7727 execute_ms=7727 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:33:37,448 INFO __main__ [MainThread] UI action started action=Add trolley
+2026-02-26 17:33:37,448 INFO __main__ [ui-action-add-trolley] Manual group many requested tray_count=6 trolley_id=18 column=Queue
+2026-02-26 17:33:37,448 INFO wip_management.application.services.orchestrator [wip-runtime] Manual group apply tray_count=6 trolley_id=18 column=Queue
+2026-02-26 17:33:37,464 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=18 ungrouped=20
+2026-02-26 17:33:37,481 INFO __main__ [wip-runtime] Manual group many completed tray_count=6 trolley_id=18 column=Queue result={'grouped': 6, 'trolley_id': '18', 'column': 'Queue'}
+2026-02-26 17:33:37,498 INFO __main__ [MainThread] UI action completed action=Add trolley
+2026-02-26 17:33:46,244 INFO __main__ [MainThread] UI action started action=Add trolley
+2026-02-26 17:33:46,244 INFO __main__ [ui-action-add-trolley] Manual group many requested tray_count=6 trolley_id=19 column=Queue
+2026-02-26 17:33:46,244 INFO wip_management.application.services.orchestrator [wip-runtime] Manual group apply tray_count=6 trolley_id=19 column=Queue
+2026-02-26 17:33:46,266 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=19 ungrouped=14
+2026-02-26 17:33:46,278 INFO __main__ [wip-runtime] Manual group many completed tray_count=6 trolley_id=19 column=Queue result={'grouped': 6, 'trolley_id': '19', 'column': 'Queue'}
+2026-02-26 17:33:46,287 INFO __main__ [MainThread] UI action completed action=Add trolley
+2026-02-26 17:33:54,062 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=5992 queue_wait_ms=0 db_exec_ms=5992 execute_ms=5992 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:33:59,716 INFO __main__ [MainThread] UI action started action=Add trolley
+2026-02-26 17:33:59,716 INFO __main__ [ui-action-add-trolley] Manual group many requested tray_count=4 trolley_id=20 column=Queue
+2026-02-26 17:33:59,716 INFO wip_management.application.services.orchestrator [wip-runtime] Manual group apply tray_count=4 trolley_id=20 column=Queue
+2026-02-26 17:33:59,744 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=20 ungrouped=10
+2026-02-26 17:33:59,754 INFO __main__ [wip-runtime] Manual group many completed tray_count=4 trolley_id=20 column=Queue result={'grouped': 4, 'trolley_id': '20', 'column': 'Queue'}
+2026-02-26 17:33:59,774 INFO __main__ [MainThread] UI action completed action=Add trolley
+2026-02-26 17:34:09,363 INFO __main__ [MainThread] UI action started action=Add trolley
+2026-02-26 17:34:09,363 INFO __main__ [ui-action-add-trolley] Manual group many requested tray_count=2 trolley_id=21 column=Queue
+2026-02-26 17:34:09,373 INFO wip_management.application.services.orchestrator [wip-runtime] Manual group apply tray_count=2 trolley_id=21 column=Queue
+2026-02-26 17:34:09,383 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=21 ungrouped=8
+2026-02-26 17:34:09,401 INFO __main__ [wip-runtime] Manual group many completed tray_count=2 trolley_id=21 column=Queue result={'grouped': 2, 'trolley_id': '21', 'column': 'Queue'}
+2026-02-26 17:34:09,412 INFO __main__ [MainThread] UI action completed action=Add trolley
+2026-02-26 17:34:19,698 INFO __main__ [MainThread] UI action started action=Add trolley
+2026-02-26 17:34:19,698 INFO __main__ [ui-action-add-trolley] Manual group many requested tray_count=6 trolley_id=22 column=Queue
+2026-02-26 17:34:19,698 INFO wip_management.application.services.orchestrator [wip-runtime] Manual group apply tray_count=6 trolley_id=22 column=Queue
+2026-02-26 17:34:19,724 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=22 ungrouped=2
+2026-02-26 17:34:19,734 INFO __main__ [wip-runtime] Manual group many completed tray_count=6 trolley_id=22 column=Queue result={'grouped': 6, 'trolley_id': '22', 'column': 'Queue'}
+2026-02-26 17:34:19,739 INFO __main__ [MainThread] UI action completed action=Add trolley
+2026-02-26 17:34:24,074 INFO __main__ [MainThread] UI action started action=Add trolley
+2026-02-26 17:34:24,074 INFO __main__ [ui-action-add-trolley] Manual group many requested tray_count=2 trolley_id=23 column=Queue
+2026-02-26 17:34:24,074 INFO wip_management.application.services.orchestrator [wip-runtime] Manual group apply tray_count=2 trolley_id=23 column=Queue
+2026-02-26 17:34:24,080 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=1 precharge=22 ungrouped=0
+2026-02-26 17:34:24,100 INFO __main__ [wip-runtime] Manual group many completed tray_count=2 trolley_id=23 column=Queue result={'grouped': 2, 'trolley_id': '23', 'column': 'Queue'}
+2026-02-26 17:34:24,101 INFO __main__ [MainThread] UI action completed action=Add trolley
+2026-02-26 17:34:33,629 INFO __main__ [MainThread] UI action started action=Delete trolley
+2026-02-26 17:34:33,629 INFO __main__ [ui-action-delete-trolley] Delete trolley requested trolley_id=23
+2026-02-26 17:34:33,629 INFO wip_management.application.services.orchestrator [wip-runtime] Manual delete trolley apply trolley_id=23
+2026-02-26 17:34:33,634 INFO wip_management.application.services.orchestrator [wip-runtime] Manual clear trolley apply trolley_id=23
+2026-02-26 17:34:33,634 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=22 ungrouped=2
+2026-02-26 17:34:33,660 INFO __main__ [wip-runtime] Delete trolley completed trolley_id=23 result={'trolley_id': '23', 'removed': 2, 'deleted': True}
+2026-02-26 17:34:33,661 INFO __main__ [MainThread] UI action completed action=Delete trolley
+2026-02-26 17:34:34,575 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=46497 queue_wait_ms=5998 db_exec_ms=40499 execute_ms=40499 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:34:34,667 INFO __main__ [MainThread] UI action started action=Auto group
+2026-02-26 17:34:34,667 INFO __main__ [ui-action-auto-group] Set auto group requested enabled=True
+2026-02-26 17:34:34,667 INFO __main__ [wip-runtime] UI projection event assembly=1 queue=0 precharge=22 ungrouped=0
+2026-02-26 17:34:34,682 INFO wip_management.application.services.orchestrator [wip-runtime] Auto group mode changed enabled=True
+2026-02-26 17:34:34,682 INFO __main__ [wip-runtime] Set auto group completed enabled=True result={'changed': True, 'auto_group_enabled': True}
+2026-02-26 17:34:34,690 INFO __main__ [MainThread] UI action completed action=Auto group
+2026-02-26 17:34:53,825 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=4250 queue_wait_ms=0 db_exec_ms=4250 execute_ms=4250 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:35:03,148 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=13567 queue_wait_ms=4256 db_exec_ms=9311 execute_ms=9311 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:35:20,263 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2072 queue_wait_ms=0 db_exec_ms=2072 execute_ms=2072 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:35:26,524 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=8331 queue_wait_ms=2076 db_exec_ms=6255 execute_ms=6255 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:35:44,394 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2853 queue_wait_ms=0 db_exec_ms=2853 execute_ms=2853 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:35:57,478 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=15939 queue_wait_ms=2860 db_exec_ms=13078 execute_ms=13078 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:36:15,227 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2734 queue_wait_ms=0 db_exec_ms=2733 execute_ms=2733 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:36:21,991 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=9497 queue_wait_ms=2739 db_exec_ms=6757 execute_ms=6757 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:36:39,563 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2556 queue_wait_ms=0 db_exec_ms=2555 execute_ms=2555 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:36:45,844 INFO __main__ [MainThread] Logging configured level=INFO console=True file=wip_management.log
+2026-02-26 17:36:45,845 INFO __main__ [MainThread] Application starting pid=26172 python=3.11.9
+2026-02-26 17:36:46,202 INFO __main__ [MainThread] Runtime start requested
+2026-02-26 17:36:46,203 INFO __main__ [wip-runtime] Runtime thread main started
+2026-02-26 17:36:46,204 INFO __main__ [wip-runtime] Runtime async bootstrap started
+2026-02-26 17:36:46,205 INFO __main__ [wip-runtime] Shared grouping state enabled path=C:\Users\PROMDNGUYEN02\OneDrive - Techtronic Industries Co. Ltd\AES_Mass production - WIP Management\grouping_state.json
+2026-02-26 17:36:46,205 INFO wip_management.infrastructure.messaging.event_bus [wip-runtime] Event bus subscribe subscribers=1 queue_size=20000
+2026-02-26 17:36:46,205 INFO __main__ [wip-runtime] Runtime subscribed to event bus queue_size=20000
+2026-02-26 17:36:46,205 INFO __main__ [wip-runtime] Runtime bootstrap signal emitted to UI thread
+2026-02-26 17:36:46,205 INFO __main__ [wip-runtime] Starting orchestrator service
+2026-02-26 17:36:46,205 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator start begin
+2026-02-26 17:36:46,205 INFO __main__ [MainThread] Runtime thread bootstrapped successfully
+2026-02-26 17:36:46,209 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] Starting SQL pool with 1 driver candidate(s): ['SQL Server']
+2026-02-26 17:36:46,287 INFO __main__ [wip-runtime] UI event coalescer loop started
+2026-02-26 17:36:46,638 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL ODBC driver in use: SQL Server
+2026-02-26 17:36:46,638 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query concurrency configured limit=1 pool_maxsize=1
+2026-02-26 17:36:46,638 INFO wip_management.application.state.state_store [wip-runtime] State store writer loop started queue_size=20000
+2026-02-26 17:36:46,639 INFO wip_management.application.services.orchestrator [wip-runtime] Manual assignments synced from shared repo count=103
+2026-02-26 17:36:46,639 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load window start=2026-02-26T00:00:00 end=2026-02-26T17:36:46.639753 order=ASC
+2026-02-26 17:36:46,639 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load using FPC stream mode
+2026-02-26 17:36:46,639 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU initial fetch start start_time=2026-02-26T00:00:00 end_time=2026-02-26T17:36:46.639753
+2026-02-26 17:36:46,639 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream start start_time=2026-02-26T00:00:00 end_time=2026-02-26T17:36:46.639753 batch_size=20000
+2026-02-26 17:37:05,469 INFO __main__ [MainThread] Qt event loop exited code=0
+2026-02-26 17:37:05,469 INFO __main__ [MainThread] Runtime stop requested
+2026-02-26 17:37:05,469 INFO __main__ [wip-runtime] Stop event received
+2026-02-26 17:37:05,470 INFO __main__ [wip-runtime] Runtime shutdown sequence started
+2026-02-26 17:37:05,470 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator stop begin
+2026-02-26 17:37:15,257 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.window_fetch_batch total_ms=28612 queue_wait_ms=0 db_exec_ms=28611 execute_ms=4728 fetch_ms=23883 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:37:17,022 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=40015 queue_wait_ms=2562 db_exec_ms=37452 execute_ms=37452 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:37:17,024 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh loop stopped
+2026-02-26 17:37:17,024 INFO wip_management.application.state.state_store [wip-runtime] State store stopping writer loop
+2026-02-26 17:37:17,025 INFO wip_management.application.state.state_store [wip-runtime] State store writer loop stopped
+2026-02-26 17:37:17,025 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] Closing SQL pool
+2026-02-26 17:37:17,026 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL pool closed
+2026-02-26 17:37:17,026 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator stop completed
+2026-02-26 17:37:17,026 INFO wip_management.infrastructure.messaging.event_bus [wip-runtime] Event bus unsubscribe subscribers=0
+2026-02-26 17:37:17,026 INFO __main__ [wip-runtime] Runtime shutdown sequence completed
+2026-02-26 17:37:17,038 INFO __main__ [wip-runtime] Runtime thread main exited
+2026-02-26 17:37:17,038 INFO __main__ [MainThread] Runtime thread stopped
+2026-02-26 17:37:17,038 INFO __main__ [MainThread] Application stopped
+2026-02-26 17:37:24,683 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=38037 queue_wait_ms=28635 db_exec_ms=9401 execute_ms=7452 fetch_ms=1949 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:37:31,016 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=1 raw_rows=20000 signals=14 offset=0
+2026-02-26 17:37:31,018 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=14 changed=14 missing_ccu=14 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=14 next_wm=2026-02-26T05:19:03
+2026-02-26 17:37:31,018 INFO __main__ [wip-runtime] UI snapshot event trays=14 assembly=0 queue=4 precharge=0
+2026-02-26 17:37:31,020 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=14
+2026-02-26 17:37:31,023 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#1 merged=14 changed=14 trays=14
+2026-02-26 17:37:31,023 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=1 raw_rows=20000 signals=14 merged=14 changed=14 pending_changed=0 pending_missing_ccu=14 total_signals=14
+2026-02-26 17:37:38,300 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.window_fetch_batch total_ms=23019 queue_wait_ms=15740 db_exec_ms=7277 execute_ms=3020 fetch_ms=4257 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:37:47,053 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=16024 queue_wait_ms=7285 db_exec_ms=8738 execute_ms=5829 fetch_ms=2909 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:37:53,572 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=2 raw_rows=20000 signals=14 offset=20000
+2026-02-26 17:37:53,572 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=14 changed=14 missing_ccu=14 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=14 next_wm=2026-02-26T08:38:05
+2026-02-26 17:37:53,572 INFO __main__ [wip-runtime] UI snapshot event trays=27 assembly=0 queue=7 precharge=0
+2026-02-26 17:37:53,572 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=27
+2026-02-26 17:37:53,599 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#2 merged=14 changed=14 trays=27
+2026-02-26 17:37:53,600 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=2 raw_rows=20000 signals=14 merged=14 changed=14 pending_changed=0 pending_missing_ccu=27 total_signals=28
+2026-02-26 17:37:57,073 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.window_fetch_batch total_ms=18759 queue_wait_ms=15264 db_exec_ms=3494 execute_ms=3301 fetch_ms=193 rows=995 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:38:10,091 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU initial fetch done elapsed_ms=83451 raw_rows=40995 signals=107
+2026-02-26 17:38:10,098 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=107 changed=107 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-02-26T17:36:15
+2026-02-26 17:38:10,098 INFO __main__ [wip-runtime] UI snapshot event trays=107 assembly=0 queue=15 precharge=7
+2026-02-26 17:38:10,101 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=107
+2026-02-26 17:38:10,113 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=ccu merged=107 changed=107 trays=107
+2026-02-26 17:38:18,144 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=24540 queue_wait_ms=16496 db_exec_ms=8043 execute_ms=5546 fetch_ms=2497 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:38:24,628 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=3 raw_rows=20000 signals=14 offset=40000
+2026-02-26 17:38:24,630 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=14 changed=14 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=14 next_wm=2026-02-26T09:12:46
+2026-02-26 17:38:24,630 INFO __main__ [wip-runtime] UI snapshot event trays=107 assembly=0 queue=13 precharge=9
+2026-02-26 17:38:24,633 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=107
+2026-02-26 17:38:24,653 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#3 merged=14 changed=14 trays=107
+2026-02-26 17:38:24,653 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=3 raw_rows=20000 signals=14 merged=14 changed=14 pending_changed=0 pending_missing_ccu=27 total_signals=42
+2026-02-26 17:38:32,672 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=8009 queue_wait_ms=0 db_exec_ms=8008 execute_ms=5516 fetch_ms=2492 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:38:39,194 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=4 raw_rows=20000 signals=13 offset=60000
+2026-02-26 17:38:39,196 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=13 changed=13 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=13 next_wm=2026-02-26T10:08:42
+2026-02-26 17:38:39,196 INFO __main__ [wip-runtime] UI snapshot event trays=107 assembly=0 queue=11 precharge=11
+2026-02-26 17:38:39,199 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=107
+2026-02-26 17:38:39,223 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#4 merged=13 changed=13 trays=107
+2026-02-26 17:38:39,223 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=4 raw_rows=20000 signals=13 merged=13 changed=13 pending_changed=0 pending_missing_ccu=27 total_signals=55
+2026-02-26 17:38:47,847 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=8619 queue_wait_ms=0 db_exec_ms=8618 execute_ms=6150 fetch_ms=2468 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:38:54,445 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=5 raw_rows=20000 signals=14 offset=80000
+2026-02-26 17:38:54,445 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=14 changed=14 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=14 next_wm=2026-02-26T11:20:08
+2026-02-26 17:38:54,445 INFO __main__ [wip-runtime] UI snapshot event trays=107 assembly=0 queue=8 precharge=14
+2026-02-26 17:38:54,459 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=107
+2026-02-26 17:38:54,478 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#5 merged=14 changed=14 trays=107
+2026-02-26 17:38:54,478 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=5 raw_rows=20000 signals=14 merged=14 changed=14 pending_changed=0 pending_missing_ccu=27 total_signals=69
+2026-02-26 17:39:04,085 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=9588 queue_wait_ms=0 db_exec_ms=9588 execute_ms=5576 fetch_ms=4012 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:39:10,576 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=6 raw_rows=20000 signals=15 offset=100000
+2026-02-26 17:39:10,576 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=15 changed=15 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=15 next_wm=2026-02-26T15:38:47
+2026-02-26 17:39:10,577 INFO __main__ [wip-runtime] UI snapshot event trays=107 assembly=0 queue=5 precharge=17
+2026-02-26 17:39:10,579 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=107
+2026-02-26 17:39:10,607 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#6 merged=15 changed=15 trays=107
+2026-02-26 17:39:10,607 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=6 raw_rows=20000 signals=15 merged=15 changed=15 pending_changed=0 pending_missing_ccu=27 total_signals=84
+2026-02-26 17:39:46,666 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=36054 queue_wait_ms=0 db_exec_ms=36053 execute_ms=33904 fetch_ms=2149 rows=20000 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:39:53,240 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=7 raw_rows=20000 signals=14 offset=120000
+2026-02-26 17:39:53,240 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=14 changed=14 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=14 next_wm=2026-02-26T17:23:30
+2026-02-26 17:39:53,240 INFO __main__ [wip-runtime] UI snapshot event trays=107 assembly=0 queue=2 precharge=20
+2026-02-26 17:39:53,240 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=107
+2026-02-26 17:39:53,266 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#7 merged=14 changed=14 trays=107
+2026-02-26 17:39:53,266 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=7 raw_rows=20000 signals=14 merged=14 changed=14 pending_changed=0 pending_missing_ccu=27 total_signals=98
+2026-02-26 17:40:00,534 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.initial_stream_batch total_ms=7265 queue_wait_ms=0 db_exec_ms=7265 execute_ms=6485 fetch_ms=780 rows=6859 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:40:02,923 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream chunk=8 raw_rows=6859 signals=6 offset=140000
+2026-02-26 17:40:02,924 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=6 changed=6 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=6 next_wm=2026-02-26T17:36:18
+2026-02-26 17:40:02,925 INFO __main__ [wip-runtime] UI snapshot event trays=107 assembly=0 queue=0 precharge=22
+2026-02-26 17:40:02,927 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=107
+2026-02-26 17:40:02,947 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=fpc-stream#8 merged=6 changed=6 trays=107
+2026-02-26 17:40:02,947 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load FPC stream chunk=8 raw_rows=6859 signals=6 merged=6 changed=6 pending_changed=0 pending_missing_ccu=27 total_signals=104
+2026-02-26 17:40:02,947 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream done elapsed_ms=196309 raw_rows=146859 signals=104 chunks=8
+2026-02-26 17:40:02,947 INFO wip_management.application.services.orchestrator [wip-runtime] CCU backfill fetch tray_ids=27
+2026-02-26 17:40:02,953 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU backfill fetch start tray_count=27 end_time=2026-02-26T17:40:02.947463
+2026-02-26 17:40:18,056 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU backfill fetch done elapsed_ms=15103 raw_rows=40995 matched_trays=27 signals=27
+2026-02-26 17:40:18,061 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=27 changed=0 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-02-26T07:50:52
+2026-02-26 17:40:18,061 INFO wip_management.application.services.orchestrator [wip-runtime] CCU backfill ingest produced no changes
+2026-02-26 17:40:18,063 INFO __main__ [wip-runtime] UI snapshot event trays=107 assembly=0 queue=0 precharge=22
+2026-02-26 17:40:18,066 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=107
+2026-02-26 17:40:18,083 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=final merged=211 changed=0 trays=107
+2026-02-26 17:40:18,083 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load completed elapsed_ms=211447 merged=211 trays=107 ccu=107 fpc=104 overlap=97 fpc_chunks=8 fpc_raw_rows=146859 fpc_stream_failed=False deferred_missing_ccu=27 deferred_backfill_changed=False watermark=2026-02-26T17:36:46.639753 partial_source=ccu+fpc-stream
+2026-02-26 17:40:18,083 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator start completed
+2026-02-26 17:40:18,083 INFO __main__ [wip-runtime] Orchestrator started successfully, entering wait state
+2026-02-26 17:40:18,083 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh loop started interval_seconds=1.0
+2026-02-26 17:40:21,262 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2166 queue_wait_ms=0 db_exec_ms=2166 execute_ms=2166 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:40:28,745 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=9655 queue_wait_ms=2173 db_exec_ms=7481 execute_ms=7481 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:40:30,861 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.window_fetch_batch total_ms=2110 queue_wait_ms=0 db_exec_ms=2110 execute_ms=2110 fetch_ms=0 rows=0 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:40:36,813 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.window_fetch_batch total_ms=8060 queue_wait_ms=2144 db_exec_ms=5915 execute_ms=5715 fetch_ms=200 rows=1163 params=6 sql=SELECT [LOT_NO] AS lot_no, [START_TIME] AS start_time, [END_TIME] AS end_time, [RECORD_JSON] AS record_json FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE (([END_TIME] IS NOT NULL AND [END_TIME] >= ? AND [END_TIME] <= ?) ...
+2026-02-26 17:40:37,383 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=2 changed=2 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=2 next_wm=2026-02-26T17:38:04
+2026-02-26 17:40:37,406 INFO __main__ [wip-runtime] UI projection event assembly=0 queue=0 precharge=22 ungrouped=4
+2026-02-26 17:40:37,412 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #1 completed elapsed_ms=18323 merged=2 changed=2 backfill_changed=False
+2026-02-26 17:40:38,073 INFO __main__ [MainThread] UI action started action=Auto group
+2026-02-26 17:40:38,073 INFO __main__ [ui-action-auto-group] Set auto group requested enabled=True
+2026-02-26 17:40:38,073 INFO __main__ [wip-runtime] UI projection event assembly=1 queue=0 precharge=22 ungrouped=0
+2026-02-26 17:40:38,100 INFO wip_management.application.services.orchestrator [wip-runtime] Auto group mode changed enabled=True
+2026-02-26 17:40:38,100 INFO __main__ [wip-runtime] Set auto group completed enabled=True result={'changed': True, 'auto_group_enabled': True}
+2026-02-26 17:40:38,113 INFO __main__ [MainThread] UI action completed action=Auto group
+2026-02-26 17:40:40,521 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2094 queue_wait_ms=0 db_exec_ms=2094 execute_ms=2094 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:40:47,439 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=9012 queue_wait_ms=2098 db_exec_ms=6913 execute_ms=6913 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:41:05,038 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2579 queue_wait_ms=0 db_exec_ms=2578 execute_ms=2578 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:41:12,467 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=10005 queue_wait_ms=2584 db_exec_ms=7420 execute_ms=7420 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:41:29,552 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2063 queue_wait_ms=0 db_exec_ms=2062 execute_ms=2062 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:41:36,129 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=8640 queue_wait_ms=2067 db_exec_ms=6572 execute_ms=6572 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:41:53,227 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2085 queue_wait_ms=0 db_exec_ms=2085 execute_ms=2085 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:41:59,922 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=8779 queue_wait_ms=2090 db_exec_ms=6688 execute_ms=6688 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:42:17,020 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=ccu.peek_latest_signal_time total_ms=2082 queue_wait_ms=0 db_exec_ms=2082 execute_ms=2082 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_CCU] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:42:22,848 INFO __main__ [MainThread] Qt event loop exited code=0
+2026-02-26 17:42:22,848 INFO __main__ [MainThread] Runtime stop requested
+2026-02-26 17:42:22,849 INFO __main__ [wip-runtime] Stop event received
+2026-02-26 17:42:22,849 INFO __main__ [wip-runtime] Runtime shutdown sequence started
+2026-02-26 17:42:22,850 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator stop begin
+2026-02-26 17:42:24,201 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query slow name=fpc.peek_latest_signal_time total_ms=9260 queue_wait_ms=2086 db_exec_ms=7174 execute_ms=7174 fetch_ms=0 rows=1 params=1 sql=SELECT TOP 1 COALESCE([END_TIME], [START_TIME]) AS latest_signal_time FROM [dbo].[TT_WO_RPARAM_RECORD_FPC] WHERE COALESCE([END_TIME], [START_TIME]) <= ? ORDER BY COALESCE([END_TIME], [START_TIME]) DESC
+2026-02-26 17:42:24,203 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh loop stopped
+2026-02-26 17:42:24,203 INFO wip_management.application.state.state_store [wip-runtime] State store stopping writer loop
+2026-02-26 17:42:24,204 INFO wip_management.application.state.state_store [wip-runtime] State store writer loop stopped
+2026-02-26 17:42:24,204 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] Closing SQL pool
+2026-02-26 17:42:24,204 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL pool closed
+2026-02-26 17:42:24,205 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator stop completed
+2026-02-26 17:42:24,205 INFO wip_management.infrastructure.messaging.event_bus [wip-runtime] Event bus unsubscribe subscribers=0
+2026-02-26 17:42:24,205 INFO __main__ [wip-runtime] Runtime shutdown sequence completed
+2026-02-26 17:42:24,220 INFO __main__ [wip-runtime] Runtime thread main exited
+2026-02-26 17:42:24,220 INFO __main__ [MainThread] Runtime thread stopped
+2026-02-26 17:42:24,221 INFO __main__ [MainThread] Application stopped
+2026-02-26 17:52:48,226 INFO __main__ [MainThread] Logging configured level=INFO console=True file=wip_management.log
+2026-02-26 17:52:48,226 INFO __main__ [MainThread] Application starting pid=11560 python=3.11.9
+2026-02-26 17:52:48,241 INFO __main__ [MainThread] Runtime start requested
+2026-02-26 17:52:48,241 INFO __main__ [wip-runtime] Runtime thread main started
+2026-02-26 17:52:48,241 INFO __main__ [wip-runtime] Runtime async bootstrap started
+2026-02-26 17:52:48,241 INFO __main__ [wip-runtime] Shared grouping state enabled path=C:\Users\PROMDNGUYEN02\OneDrive - Techtronic Industries Co. Ltd\AES_Mass production - WIP Management\grouping_state.json
+2026-02-26 17:52:48,241 INFO wip_management.infrastructure.messaging.event_bus [wip-runtime] Event bus subscribe subscribers=1 queue_size=20000
+2026-02-26 17:52:48,241 INFO __main__ [wip-runtime] Runtime subscribed to event bus queue_size=20000
+2026-02-26 17:52:48,241 INFO __main__ [wip-runtime] Runtime bootstrap signal emitted to UI thread
+2026-02-26 17:52:48,241 INFO __main__ [MainThread] Runtime thread bootstrapped successfully
+2026-02-26 17:52:48,241 INFO __main__ [wip-runtime] Starting orchestrator service
+2026-02-26 17:52:48,241 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator start begin
+2026-02-26 17:52:48,263 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] Starting SQL pool with 1 driver candidate(s): ['SQL Server']
+2026-02-26 17:52:48,276 INFO __main__ [wip-runtime] UI event coalescer loop started
+2026-02-26 17:52:48,430 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL ODBC driver in use: SQL Server
+2026-02-26 17:52:48,430 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query concurrency configured limit=1 pool_maxsize=1
+2026-02-26 17:52:48,431 INFO wip_management.application.state.state_store [wip-runtime] State store writer loop started queue_size=20000
+2026-02-26 17:52:48,431 INFO wip_management.application.services.orchestrator [wip-runtime] Manual assignments synced from shared repo count=108
+2026-02-26 17:52:48,431 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load window start=2026-02-26T00:00:00 end=2026-02-26T17:52:48.431111 order=ASC
+2026-02-26 17:52:48,431 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load using FPC stream mode
+2026-02-26 17:52:48,431 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU initial fetch start start_time=2026-02-26T00:00:00 end_time=2026-02-26T17:52:48.431111
+2026-02-26 17:52:48,431 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial stream start start_time=2026-02-26T00:00:00 end_time=2026-02-26T17:52:48.431111 batch_size=20000

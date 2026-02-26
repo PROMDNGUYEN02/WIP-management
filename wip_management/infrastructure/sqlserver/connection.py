@@ -93,45 +93,89 @@ class SQLServerConnection:
         self._query_semaphore = None
         log.info("SQL pool closed")
 
-    async def query_rows(self, query: str, params: list[Any]) -> list[dict[str, Any]]:
+    async def query_rows(
+        self,
+        query: str,
+        params: list[Any],
+        *,
+        query_name: str | None = None,
+    ) -> list[dict[str, Any]]:
         if self._pool is None:
             raise RuntimeError("SQL connection has not started")
         if self._query_semaphore is None:
             raise RuntimeError("SQL query semaphore is not initialized")
         query_preview = _compact_sql(query, max_chars=settings.log_sql_preview_chars)
+        query_label = (query_name or "sql.query").strip() or "sql.query"
         started_at = time.perf_counter()
-        log.debug("SQL query start params=%s sql=%s", len(params), query_preview)
+        exec_started_at = started_at
+        execute_done_at = started_at
+        fetch_done_at = started_at
+        queue_wait_ms = 0
+        execute_ms = 0
+        fetch_ms = 0
+        db_exec_ms = 0
+        log.debug("SQL query start name=%s params=%s sql=%s", query_label, len(params), query_preview)
         async with self._query_semaphore:
+            exec_started_at = time.perf_counter()
+            queue_wait_ms = int((exec_started_at - started_at) * 1000)
             async with self._pool.acquire() as conn:
                 try:
                     async with conn.cursor() as cur:
                         cur.timeout = settings.sql_query_timeout_seconds
                         await cur.execute(query, params)
+                        execute_done_at = time.perf_counter()
                         rows = await cur.fetchall()
+                        fetch_done_at = time.perf_counter()
                         cols = [col[0] for col in cur.description]
                 except Exception:  # noqa: BLE001
-                    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+                    failure_at = time.perf_counter()
+                    if execute_done_at < exec_started_at:
+                        execute_done_at = failure_at
+                    if fetch_done_at < execute_done_at:
+                        fetch_done_at = failure_at
+                    execute_ms = int((execute_done_at - exec_started_at) * 1000)
+                    fetch_ms = int((fetch_done_at - execute_done_at) * 1000)
+                    db_exec_ms = execute_ms + fetch_ms
+                    elapsed_ms = int((failure_at - started_at) * 1000)
                     log.exception(
-                        "SQL query failed elapsed_ms=%s params=%s sql=%s",
+                        "SQL query failed name=%s total_ms=%s queue_wait_ms=%s db_exec_ms=%s execute_ms=%s fetch_ms=%s params=%s sql=%s",
+                        query_label,
                         elapsed_ms,
+                        queue_wait_ms,
+                        db_exec_ms,
+                        execute_ms,
+                        fetch_ms,
                         len(params),
                         query_preview,
                     )
                     raise
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        execute_ms = int((execute_done_at - exec_started_at) * 1000)
+        fetch_ms = int((fetch_done_at - execute_done_at) * 1000)
+        db_exec_ms = execute_ms + fetch_ms
+        elapsed_ms = int((fetch_done_at - started_at) * 1000)
         row_count = len(rows)
         if elapsed_ms >= 2000:
             log.warning(
-                "SQL query slow elapsed_ms=%s rows=%s params=%s sql=%s",
+                "SQL query slow name=%s total_ms=%s queue_wait_ms=%s db_exec_ms=%s execute_ms=%s fetch_ms=%s rows=%s params=%s sql=%s",
+                query_label,
                 elapsed_ms,
+                queue_wait_ms,
+                db_exec_ms,
+                execute_ms,
+                fetch_ms,
                 row_count,
                 len(params),
                 query_preview,
             )
         else:
             log.debug(
-                "SQL query done elapsed_ms=%s rows=%s params=%s",
+                "SQL query done name=%s total_ms=%s queue_wait_ms=%s db_exec_ms=%s execute_ms=%s fetch_ms=%s rows=%s params=%s",
+                query_label,
                 elapsed_ms,
+                queue_wait_ms,
+                db_exec_ms,
+                execute_ms,
+                fetch_ms,
                 row_count,
                 len(params),
             )
