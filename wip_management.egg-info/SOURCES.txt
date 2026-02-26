@@ -43,6 +43,7 @@ wip_management/infrastructure/sqlserver/ccu_repo.py
 wip_management/infrastructure/sqlserver/connection.py
 wip_management/infrastructure/sqlserver/delta_tracker.py
 wip_management/infrastructure/sqlserver/fpc_repo.py
+wip_management/infrastructure/sqlserver/window_cache.py
 wip_management/presentation/__init__.py
 wip_management/presentation/api/__init__.py
 wip_management/presentation/api/http.py

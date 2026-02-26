@@ -545,7 +545,7 @@ class _ColumnCard(QWidget):
         self.trolley_list.setModel(trolley_model)
         self.trolley_list.setAlternatingRowColors(True)
         self.trolley_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        root.addWidget(self.trolley_list, 3)
+        root.addWidget(self.trolley_list, 1)
         if on_trolley_context is not None:
             self.trolley_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self.trolley_list.customContextMenuRequested.connect(self._handle_trolley_context)
@@ -570,6 +570,7 @@ class _ColumnCard(QWidget):
 
             self.tray_table = QTableView(self)
             self.tray_table.setModel(tray_model)
+            tray_model.modelReset.connect(self._resize_tray_columns)
             self.tray_table.setAlternatingRowColors(True)
             self.tray_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self.tray_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -582,28 +583,20 @@ class _ColumnCard(QWidget):
             self.tray_table.verticalHeader().setDefaultSectionSize(30)
             header = self.tray_table.horizontalHeader()
             header.setSectionsClickable(True)
-            header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
             header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
             table_font = self.tray_table.font()
             table_font.setPointSize(max(table_font.pointSize(), 10))
             self.tray_table.setFont(table_font)
             header.setFont(table_font)
-            self.tray_table.setColumnWidth(0, 48)
-            self.tray_table.setColumnWidth(1, 52)
-            self.tray_table.setColumnWidth(3, 84)
-            self.tray_table.setColumnWidth(4, 170)
-            self.tray_table.setColumnWidth(5, 170)
-            self.tray_table.setColumnWidth(6, 115)
-            self.tray_table.setColumnWidth(7, 210)
-            self.tray_table.setColumnWidth(8, 100)
             self.tray_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
             self.tray_table.setTextElideMode(Qt.TextElideMode.ElideNone)
             if on_tray_header_click is not None:
                 header.sectionClicked.connect(on_tray_header_click)
             self.tray_table.clicked.connect(self._on_tray_table_clicked)
             self.tray_table.setShowGrid(False)
-            root.addWidget(self.tray_table, 2)
+            self._resize_tray_columns()
+            root.addWidget(self.tray_table, 1)
 
     def set_stats_text(self, text: str) -> None:
         self._stats.setText(text)
@@ -619,7 +612,6 @@ class _ColumnCard(QWidget):
     def _on_tray_table_clicked(self, index: QModelIndex) -> None:
         if self.tray_table is None or not index.isValid():
             return
-        self.tray_table.selectRow(index.row())
         model = self.tray_table.model()
         if model is None:
             return
@@ -638,6 +630,11 @@ class _ColumnCard(QWidget):
         checked_now = display_value == "\u25cf"
         target = Qt.CheckState.Unchecked if checked_now else Qt.CheckState.Checked
         model.setData(index, target, Qt.ItemDataRole.CheckStateRole)
+
+    def _resize_tray_columns(self, *_args) -> None:
+        if self.tray_table is None:
+            return
+        self.tray_table.resizeColumnsToContents()
 
 
 class _SettingsDialog(QDialog):
@@ -785,7 +782,7 @@ class _TrolleyDetailDialog(QDialog):
         self._summary_table.setRowCount(len(tray_rows))
         for row_idx, row in enumerate(tray_rows):
             tray_item = QTableWidgetItem(row.get("tray_id", ""))
-            tray_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+            tray_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
             tray_item.setData(Qt.ItemDataRole.UserRole, row.get("tray_id", ""))
             self._summary_table.setItem(row_idx, 0, tray_item)
             self._summary_table.setItem(row_idx, 1, self._center_item(row.get("start_time", "-")))
@@ -866,7 +863,7 @@ class _TrolleyDetailDialog(QDialog):
     @staticmethod
     def _center_item(text: str) -> QTableWidgetItem:
         item = QTableWidgetItem(text)
-        item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
         return item
 
     def _on_cells_loaded(self, tray_id: str, request_id: int, rows: object, error: object) -> None:
@@ -885,6 +882,10 @@ class _TrolleyDetailDialog(QDialog):
         values = list(rows or [])
         self._tray_cells_cache[tray_id] = [dict(item) for item in values]
         self._render_cells(tray_id, self._tray_cells_cache[tray_id])
+        if not values:
+            self._status.setText(
+                "No cell detail in local cache for this tray. Wait for refresh or reopen after data sync.",
+            )
         pending = self._pending_tray_id
         self._pending_tray_id = None
         if pending and pending != tray_id:

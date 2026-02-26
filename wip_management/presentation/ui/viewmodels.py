@@ -148,6 +148,8 @@ class TrolleyListModel(QAbstractListModel):
     def replace_all(self, payload_rows: list[dict[str, Any]]) -> None:
         items = [TrolleyRowVM.from_payload(row) for row in payload_rows if row.get("trolley_id")]
         items.sort(key=lambda row: row.trolley_id)
+        if items == self._rows:
+            return
         self.beginResetModel()
         self._rows = items
         self.endResetModel()
@@ -207,10 +209,10 @@ class UngroupTrayTableModel(QAbstractTableModel):
             if role == Qt.ItemDataRole.DisplayRole:
                 return _SELECT_ON if item.tray_id in self._checked_tray_ids else _SELECT_OFF
             if role == Qt.ItemDataRole.TextAlignmentRole:
-                return int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+                return Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
             return None
-        if role == Qt.ItemDataRole.TextAlignmentRole and col in {1, 3}:
-            return int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            return Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if col == 1:
@@ -280,10 +282,12 @@ class UngroupTrayTableModel(QAbstractTableModel):
                         return _SELECT_ON
                     return _SELECT_PARTIAL
                 if role == Qt.ItemDataRole.TextAlignmentRole:
-                    return int(Qt.AlignmentFlag.AlignCenter)
+                    return Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
                 return None
             if role == Qt.ItemDataRole.DisplayRole:
                 return self._headers[section]
+            if role == Qt.ItemDataRole.TextAlignmentRole:
+                return Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
             return None
         if role != Qt.ItemDataRole.DisplayRole:
             return None
@@ -351,6 +355,21 @@ class UngroupTrayTableModel(QAbstractTableModel):
             )
 
         retained = {row.tray_id for row in ordered}
+        if self._rows == ordered:
+            new_checked = self._checked_tray_ids.intersection(retained)
+            if new_checked != self._checked_tray_ids:
+                self._checked_tray_ids = set(new_checked)
+                if self._rows:
+                    top_left = self.index(0, 0)
+                    bottom_right = self.index(len(self._rows) - 1, 0)
+                    self.dataChanged.emit(
+                        top_left,
+                        bottom_right,
+                        [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.TextAlignmentRole],
+                    )
+                self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, 0)
+            return
+
         self.beginResetModel()
         self._rows = ordered
         self._checked_tray_ids.intersection_update(retained)

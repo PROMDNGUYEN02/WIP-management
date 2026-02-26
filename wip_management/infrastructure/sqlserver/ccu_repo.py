@@ -11,6 +11,7 @@ from typing import Any
 from wip_management.config import settings
 from wip_management.domain.models.tray import SignalSource, TrayId, TraySignal, Watermark
 from wip_management.infrastructure.sqlserver.connection import SQLServerConnection
+from wip_management.infrastructure.sqlserver.window_cache import SQLWindowRowCache
 
 _TOKEN_PATTERN = re.compile(r"V[A-Z]\d{4,}", re.IGNORECASE)
 log = logging.getLogger(__name__)
@@ -27,6 +28,18 @@ class CcuRepo:
         self._tray_key = settings.ccu_json_tray_id_key
         self._pos_key = settings.ccu_json_pos_key
         self._keyword = settings.record_filter_keyword.strip().upper()
+        self._tray_cells_cache: dict[str, list[dict[str, str | None]]] = {}
+        self._tray_cells_cache_keys: dict[str, set[tuple[str, str | None, str | None]]] = {}
+        self._tray_cells_cache_max_trays = 2000
+        self._tray_cells_max_rows_per_tray = 2000
+        self._cell_owner_cache: dict[str, dict[str, str | None]] = {}
+        self._cell_owner_cache_times: dict[str, datetime] = {}
+        self._cell_owner_cache_max_entries = 200000
+        self._range_cache = SQLWindowRowCache(
+            name="CCU",
+            overlap_seconds=settings.delta_overlap_seconds,
+            max_rows=max(50000, settings.max_fetch_batch * 8),
+        )
 
     async def start(self) -> None:
         await self._conn.start()
@@ -125,6 +138,20 @@ class CcuRepo:
         wanted = _normalize_tray_id(tray_id)
         if not wanted:
             return []
+        cached = self._get_cached_cells_for_tray(wanted)
+        if cached is not None:
+            log.info(
+                "CCU tray detail fetch tray_id=%s cells=%s source=memory-cache",
+                wanted,
+                len(cached),
+            )
+            return cached
+        if settings.sql_driver.strip().lower() == "sql server":
+            log.warning(
+                "CCU tray detail skipped tray_id=%s reason=legacy-driver-no-cache",
+                wanted,
+            )
+            return []
         query = (
             "SELECT TOP 5000 "
             f"{self._lot_col} AS lot_no, "
@@ -179,6 +206,8 @@ class CcuRepo:
             )
 
         out.sort(key=lambda item: (item.get("start_time") or "", item.get("cell_id") or ""))
+        if out:
+            self._replace_cached_cells_for_tray(wanted, out)
         log.info(
             "CCU tray detail fetch tray_id=%s cells=%s raw_rows=%s start_time=%s end_time=%s",
             wanted,
@@ -197,6 +226,16 @@ class CcuRepo:
     ) -> dict[str, str | None] | None:
         wanted_cell = str(cell_id).strip().upper()
         if not wanted_cell:
+            return None
+        cached_owner = self._cell_owner_cache.get(wanted_cell)
+        if cached_owner is not None:
+            log.info("CCU cell owner lookup cache hit cell_id=%s tray_id=%s", wanted_cell, cached_owner.get("tray_id"))
+            return dict(cached_owner)
+        if settings.sql_driver.strip().lower() == "sql server":
+            log.warning(
+                "CCU cell owner lookup skipped cell_id=%s reason=legacy-driver-no-cache",
+                wanted_cell,
+            )
             return None
         query = (
             "SELECT TOP 400 "
@@ -246,6 +285,12 @@ class CcuRepo:
                 "start_time": start_dt.isoformat(sep=" ", timespec="seconds") if start_dt else None,
                 "end_time": end_dt.isoformat(sep=" ", timespec="seconds") if end_dt else None,
             }
+            self._cache_cell_owner(
+                cell_id=wanted_cell,
+                tray_id=tray_key,
+                start_time=start_dt,
+                end_time=end_dt,
+            )
             log.info(
                 "CCU cell owner lookup hit cell_id=%s tray_id=%s start_time=%s end_time=%s",
                 wanted_cell,
@@ -263,6 +308,13 @@ class CcuRepo:
         return None
 
     async def _fetch_range(self, start_time: datetime, end_time: datetime) -> list[dict[str, Any]]:
+        return await self._range_cache.fetch(
+            start_time=start_time,
+            end_time=end_time,
+            fetch_uncached=self._fetch_range_uncached,
+        )
+
+    async def _fetch_range_uncached(self, start_time: datetime, end_time: datetime) -> list[dict[str, Any]]:
         all_rows: list[dict[str, Any]] = []
         offset = 0
         page = 0
@@ -363,6 +415,12 @@ class CcuRepo:
 
             if not lot_no:
                 missing_lot_rows += 1
+            self._cache_cell_row(
+                tray_key=tray_key,
+                lot_no=lot_no,
+                start_time=start_time,
+                end_time=end_time,
+            )
 
             stat = per_tray.get(tray_key)
             if stat is None:
@@ -450,6 +508,118 @@ class CcuRepo:
             tray_from_token,
             self._keyword or "<none>",
         )
+        return out
+
+    def _cache_cell_row(
+        self,
+        *,
+        tray_key: str,
+        lot_no: str,
+        start_time: datetime | None,
+        end_time: datetime | None,
+    ) -> None:
+        if not tray_key or not lot_no:
+            return
+        start_iso = start_time.isoformat(sep=" ", timespec="seconds") if start_time else None
+        end_iso = end_time.isoformat(sep=" ", timespec="seconds") if end_time else None
+        dedup_key = (lot_no, start_iso, end_iso)
+
+        if tray_key not in self._tray_cells_cache:
+            if len(self._tray_cells_cache) >= self._tray_cells_cache_max_trays:
+                oldest_tray = next(iter(self._tray_cells_cache))
+                self._tray_cells_cache.pop(oldest_tray, None)
+                self._tray_cells_cache_keys.pop(oldest_tray, None)
+            self._tray_cells_cache[tray_key] = []
+            self._tray_cells_cache_keys[tray_key] = set()
+
+        keys = self._tray_cells_cache_keys[tray_key]
+        if dedup_key in keys:
+            return
+        rows = self._tray_cells_cache[tray_key]
+        rows.append({"cell_id": lot_no, "start_time": start_iso, "end_time": end_iso})
+        keys.add(dedup_key)
+
+        if len(rows) > self._tray_cells_max_rows_per_tray:
+            removed = rows.pop(0)
+            removed_key = (
+                str(removed.get("cell_id") or ""),
+                removed.get("start_time"),
+                removed.get("end_time"),
+            )
+            keys.discard(removed_key)
+        self._cache_cell_owner(
+            cell_id=lot_no,
+            tray_id=tray_key,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+    def _cache_cell_owner(
+        self,
+        *,
+        cell_id: str,
+        tray_id: str,
+        start_time: datetime | None,
+        end_time: datetime | None,
+    ) -> None:
+        cell_key = str(cell_id).strip().upper()
+        tray_key = str(tray_id).strip()
+        if not cell_key or not tray_key:
+            return
+        signal_time = end_time or start_time
+        if signal_time is None:
+            signal_time = datetime.min
+        prev_time = self._cell_owner_cache_times.get(cell_key)
+        if prev_time is not None and prev_time > signal_time:
+            return
+        owner = {
+            "cell_id": cell_key,
+            "tray_id": tray_key,
+            "start_time": start_time.isoformat(sep=" ", timespec="seconds") if start_time else None,
+            "end_time": end_time.isoformat(sep=" ", timespec="seconds") if end_time else None,
+        }
+        if cell_key in self._cell_owner_cache:
+            self._cell_owner_cache.pop(cell_key, None)
+            self._cell_owner_cache_times.pop(cell_key, None)
+        self._cell_owner_cache[cell_key] = owner
+        self._cell_owner_cache_times[cell_key] = signal_time
+        overflow = len(self._cell_owner_cache) - self._cell_owner_cache_max_entries
+        if overflow > 0:
+            stale_keys = list(self._cell_owner_cache.keys())[:overflow]
+            for stale_key in stale_keys:
+                self._cell_owner_cache.pop(stale_key, None)
+                self._cell_owner_cache_times.pop(stale_key, None)
+
+    def _replace_cached_cells_for_tray(self, tray_key: str, rows: list[dict[str, str | None]]) -> None:
+        keys: set[tuple[str, str | None, str | None]] = set()
+        dedup_rows: list[dict[str, str | None]] = []
+        for row in rows:
+            dedup_key = (
+                str(row.get("cell_id") or ""),
+                row.get("start_time"),
+                row.get("end_time"),
+            )
+            if dedup_key in keys:
+                continue
+            keys.add(dedup_key)
+            dedup_rows.append(
+                {
+                    "cell_id": dedup_key[0],
+                    "start_time": dedup_key[1],
+                    "end_time": dedup_key[2],
+                }
+            )
+            if len(dedup_rows) >= self._tray_cells_max_rows_per_tray:
+                break
+        self._tray_cells_cache[tray_key] = dedup_rows
+        self._tray_cells_cache_keys[tray_key] = keys
+
+    def _get_cached_cells_for_tray(self, tray_key: str) -> list[dict[str, str | None]] | None:
+        rows = self._tray_cells_cache.get(tray_key)
+        if rows is None:
+            return None
+        out = [dict(item) for item in rows]
+        out.sort(key=lambda item: (item.get("start_time") or "", item.get("cell_id") or ""))
         return out
 
 

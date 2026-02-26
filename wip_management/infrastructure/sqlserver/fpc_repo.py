@@ -4,12 +4,14 @@ import json
 import logging
 import re
 import time
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from wip_management.config import settings
 from wip_management.domain.models.tray import SignalSource, TrayId, TraySignal, Watermark
 from wip_management.infrastructure.sqlserver.connection import SQLServerConnection
+from wip_management.infrastructure.sqlserver.window_cache import SQLWindowRowCache
 
 _TOKEN_PATTERN = re.compile(r"V[A-Z]\d{4,}", re.IGNORECASE)
 log = logging.getLogger(__name__)
@@ -26,6 +28,11 @@ class FpcRepo:
         self._tray_key = settings.fpc_json_tray_id_key
         self._cell_key = settings.fpc_json_pos_key
         self._keyword = settings.record_filter_keyword.strip().upper()
+        self._range_cache = SQLWindowRowCache(
+            name="FPC",
+            overlap_seconds=settings.delta_overlap_seconds,
+            max_rows=max(50000, settings.max_fetch_batch * 8),
+        )
 
     async def start(self) -> None:
         await self._conn.start()
@@ -46,6 +53,55 @@ class FpcRepo:
             len(signals),
         )
         return signals
+
+    async def iter_initial_chunks(
+        self,
+        *,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> AsyncIterator[tuple[list[TraySignal], int]]:
+        log.info(
+            "FPC initial stream start start_time=%s end_time=%s batch_size=%s",
+            start_time.isoformat(),
+            end_time.isoformat(),
+            settings.max_fetch_batch,
+        )
+        started_at = time.perf_counter()
+        offset = 0
+        chunk = 0
+        total_rows = 0
+        total_signals = 0
+        while True:
+            batch = await self._fetch_batch(
+                start_time=start_time,
+                end_time=end_time,
+                offset=offset,
+            )
+            if not batch:
+                break
+            chunk += 1
+            raw_rows = len(batch)
+            total_rows += raw_rows
+            signals = self._rows_to_signals(batch)
+            total_signals += len(signals)
+            log.info(
+                "FPC initial stream chunk=%s raw_rows=%s signals=%s offset=%s",
+                chunk,
+                raw_rows,
+                len(signals),
+                offset,
+            )
+            yield signals, raw_rows
+            if raw_rows < settings.max_fetch_batch:
+                break
+            offset += raw_rows
+        log.info(
+            "FPC initial stream done elapsed_ms=%s raw_rows=%s signals=%s chunks=%s",
+            int((time.perf_counter() - started_at) * 1000),
+            total_rows,
+            total_signals,
+            chunk,
+        )
 
     async def fetch_delta(self, watermark: Watermark, end_time: datetime) -> list[TraySignal]:
         overlap_start = watermark.collected_time - timedelta(seconds=settings.delta_overlap_seconds)
@@ -87,6 +143,13 @@ class FpcRepo:
         return latest
 
     async def _fetch_range(self, start_time: datetime, end_time: datetime) -> list[dict[str, Any]]:
+        return await self._range_cache.fetch(
+            start_time=start_time,
+            end_time=end_time,
+            fetch_uncached=self._fetch_range_uncached,
+        )
+
+    async def _fetch_range_uncached(self, start_time: datetime, end_time: datetime) -> list[dict[str, Any]]:
         all_rows: list[dict[str, Any]] = []
         offset = 0
         page = 0

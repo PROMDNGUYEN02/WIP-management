@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +26,15 @@ from wip_management.domain.models.tray import TrayId, TraySignal, Watermark
 from wip_management.domain.models.trolley import Column
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(slots=True, frozen=True)
+class _FpcInitialStreamResult:
+    norm_signals: list[TraySignal]
+    raw_rows: int
+    chunks: int
+    partial_published: bool
+    stream_failed: bool = False
 
 
 class OrchestratorService:
@@ -86,6 +96,7 @@ class OrchestratorService:
         self._tray_cells_cache: dict[str, tuple[datetime, list[dict[str, str | None]]]] = {}
         self._tray_cells_inflight: dict[str, asyncio.Task[list[dict[str, str | None]]]] = {}
         self._active_detail_queries = 0
+        self._initial_publish_lock = asyncio.Lock()
 
     async def start(self) -> None:
         if self._running:
@@ -437,6 +448,15 @@ class OrchestratorService:
             now.isoformat(),
         )
         previous = await self._delta_tracker.get()
+        if self._supports_fpc_initial_streaming():
+            await self._initial_load_with_fpc_stream(
+                started_at=started_at,
+                start=start,
+                end=now,
+                previous=previous,
+            )
+            return
+
         ccu_task = asyncio.create_task(
             self._ccu_repo.fetch_initial(start_time=start, end_time=now),
             name="initial-ccu-fetch",
@@ -515,6 +535,232 @@ class OrchestratorService:
             now.isoformat(),
             partial_source,
         )
+
+    def _supports_fpc_initial_streaming(self) -> bool:
+        stream_method = getattr(self._fpc_repo, "iter_initial_chunks", None)
+        return callable(stream_method)
+
+    async def _initial_load_with_fpc_stream(
+        self,
+        *,
+        started_at: float,
+        start: datetime,
+        end: datetime,
+        previous: Watermark | None,
+    ) -> None:
+        log.info("Initial load using FPC stream mode")
+        ccu_task = asyncio.create_task(
+            self._load_initial_ccu_partial(start_time=start, end_time=end, previous=previous),
+            name="initial-ccu-partial",
+        )
+        fpc_task = asyncio.create_task(
+            self._load_initial_fpc_stream_partial(start_time=start, end_time=end, previous=previous),
+            name="initial-fpc-stream",
+        )
+        ccu_out, fpc_out = await asyncio.gather(ccu_task, fpc_task, return_exceptions=True)
+        ccu_failed = isinstance(ccu_out, Exception)
+        fpc_failed = isinstance(fpc_out, Exception)
+        if ccu_failed and fpc_failed:
+            raise RuntimeError("Initial load failed for both CCU and FPC stream") from ccu_out
+
+        if ccu_failed:
+            log.exception("Initial load CCU partial failed, continue with available FPC stream", exc_info=ccu_out)
+            norm_ccu = []
+        else:
+            norm_ccu = ccu_out
+
+        if fpc_failed:
+            log.exception("Initial load FPC stream failed, continue with available CCU", exc_info=fpc_out)
+            fpc_result = _FpcInitialStreamResult(
+                norm_signals=[],
+                raw_rows=0,
+                chunks=0,
+                partial_published=False,
+                stream_failed=True,
+            )
+        else:
+            fpc_result = fpc_out
+
+        ccu_tray_ids = {str(item.tray_id) for item in norm_ccu}
+        fpc_tray_ids = {str(item.tray_id) for item in fpc_result.norm_signals}
+        raw_overlap = ccu_tray_ids & fpc_tray_ids
+        if ccu_tray_ids and fpc_tray_ids and not raw_overlap:
+            ccu_sample = sorted(ccu_tray_ids)[:3]
+            fpc_sample = sorted(fpc_tray_ids)[:3]
+            log.warning(
+                "Initial load (stream) no tray overlap between CCU/FPC ccu_sample=%s fpc_sample=%s",
+                ccu_sample,
+                fpc_sample,
+            )
+
+        merged_count = len({item.dedup_key for item in [*norm_ccu, *fpc_result.norm_signals]})
+        await self._set_refresh_watermark(end)
+        projection = await self._publish_initial_partial_snapshot(
+            source="final",
+            merged=merged_count,
+            changed=0,
+        )
+        log.info(
+            "Initial load completed elapsed_ms=%s merged=%s trays=%s ccu=%s fpc=%s overlap=%s fpc_chunks=%s fpc_raw_rows=%s fpc_stream_failed=%s watermark=%s partial_source=%s",
+            int((time.perf_counter() - started_at) * 1000),
+            merged_count,
+            len(projection.trays),
+            len(norm_ccu),
+            len(fpc_result.norm_signals),
+            len(raw_overlap),
+            fpc_result.chunks,
+            fpc_result.raw_rows,
+            fpc_result.stream_failed,
+            end.isoformat(),
+            "ccu+fpc-stream",
+        )
+
+    async def _load_initial_ccu_partial(
+        self,
+        *,
+        start_time: datetime,
+        end_time: datetime,
+        previous: Watermark | None,
+    ) -> list[TraySignal]:
+        rows = await self._ccu_repo.fetch_initial(start_time=start_time, end_time=end_time)
+        norm_ccu = await self._normalize_signals(rows)
+        result = await self._ingest.execute(norm_ccu, [], previous_watermark=previous)
+        backfill_changed = await self._maybe_backfill_ccu(result.store_result.missing_ccu_tray_ids)
+        changed = len(result.store_result.changed) + (1 if backfill_changed else 0)
+        await self._publish_initial_partial_snapshot(
+            source="ccu",
+            merged=len(result.merged),
+            changed=changed,
+        )
+        return norm_ccu
+
+    async def _load_initial_fpc_stream_partial(
+        self,
+        *,
+        start_time: datetime,
+        end_time: datetime,
+        previous: Watermark | None,
+    ) -> _FpcInitialStreamResult:
+        stream_method = getattr(self._fpc_repo, "iter_initial_chunks", None)
+        if not callable(stream_method):
+            try:
+                rows = await self._fpc_repo.fetch_initial(start_time=start_time, end_time=end_time)
+                norm_fpc = await self._normalize_signals(rows)
+                result = await self._ingest.execute([], norm_fpc, previous_watermark=previous)
+                backfill_changed = await self._maybe_backfill_ccu(result.store_result.missing_ccu_tray_ids)
+                changed = len(result.store_result.changed) + (1 if backfill_changed else 0)
+                await self._publish_initial_partial_snapshot(
+                    source="fpc",
+                    merged=len(result.merged),
+                    changed=changed,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("Initial load fallback FPC fetch failed")
+                return _FpcInitialStreamResult(
+                    norm_signals=[],
+                    raw_rows=0,
+                    chunks=0,
+                    partial_published=False,
+                    stream_failed=True,
+                )
+            return _FpcInitialStreamResult(
+                norm_signals=norm_fpc,
+                raw_rows=len(rows),
+                chunks=1 if rows else 0,
+                partial_published=True,
+                stream_failed=False,
+            )
+
+        all_norm_fpc: list[TraySignal] = []
+        raw_rows_total = 0
+        chunk_count = 0
+        partial_published = False
+        stream_failed = False
+        last_publish_at = 0.0
+        publish_interval_seconds = max(0.1, float(settings.initial_partial_publish_max_interval_seconds))
+        min_changed_to_publish = max(1, int(settings.initial_partial_publish_min_changed))
+        pending_changed = 0
+
+        try:
+            async for chunk in stream_method(start_time=start_time, end_time=end_time):
+                if isinstance(chunk, tuple) and len(chunk) == 2:
+                    chunk_signals = list(chunk[0] or [])
+                    raw_rows = int(chunk[1] or 0)
+                else:
+                    chunk_signals = list(chunk or [])
+                    raw_rows = len(chunk_signals)
+                raw_rows_total += max(0, raw_rows)
+                chunk_count += 1
+                norm_chunk = await self._normalize_signals(chunk_signals)
+                if norm_chunk:
+                    all_norm_fpc.extend(norm_chunk)
+                result = await self._ingest.execute([], norm_chunk, previous_watermark=previous)
+                backfill_changed = await self._maybe_backfill_ccu(result.store_result.missing_ccu_tray_ids)
+                changed = len(result.store_result.changed) + (1 if backfill_changed else 0)
+                pending_changed += changed
+
+                now_perf = time.perf_counter()
+                should_publish_first = (not partial_published) and pending_changed > 0
+                should_publish_count = pending_changed >= min_changed_to_publish
+                should_publish_time = pending_changed > 0 and (now_perf - last_publish_at) >= publish_interval_seconds
+                if should_publish_first or should_publish_count or (partial_published and should_publish_time):
+                    await self._publish_initial_partial_snapshot(
+                        source=f"fpc-stream#{chunk_count}",
+                        merged=len(result.merged),
+                        changed=pending_changed,
+                    )
+                    partial_published = True
+                    pending_changed = 0
+                    last_publish_at = now_perf
+                log.info(
+                    "Initial load FPC stream chunk=%s raw_rows=%s signals=%s merged=%s changed=%s pending_changed=%s total_signals=%s",
+                    chunk_count,
+                    raw_rows,
+                    len(norm_chunk),
+                    len(result.merged),
+                    changed,
+                    pending_changed,
+                    len(all_norm_fpc),
+                )
+        except Exception:  # noqa: BLE001
+            stream_failed = True
+            log.exception("Initial load FPC stream interrupted, continue with partial data")
+
+        if pending_changed > 0:
+            await self._publish_initial_partial_snapshot(
+                source=f"fpc-stream#{chunk_count}-final",
+                merged=0,
+                changed=pending_changed,
+            )
+            partial_published = True
+
+        return _FpcInitialStreamResult(
+            norm_signals=all_norm_fpc,
+            raw_rows=raw_rows_total,
+            chunks=chunk_count,
+            partial_published=partial_published,
+            stream_failed=stream_failed,
+        )
+
+    async def _publish_initial_partial_snapshot(
+        self,
+        *,
+        source: str,
+        merged: int,
+        changed: int,
+    ) -> Projection:
+        async with self._initial_publish_lock:
+            projection = await self._compute_projection()
+            await self._publish_snapshot_ready(projection)
+            await self._save_projection_to_repo(projection)
+        log.info(
+            "Initial load partial published source=%s merged=%s changed=%s trays=%s",
+            source,
+            merged,
+            changed,
+            len(projection.trays),
+        )
+        return projection
 
     async def _refresh_loop(self) -> None:
         log.info("Refresh loop started interval_seconds=%s", self._delta_poll_interval_seconds)

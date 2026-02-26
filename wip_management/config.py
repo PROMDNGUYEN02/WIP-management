@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     delta_poll_interval_seconds: float = Field(default=1.0, ge=0.1)
     delta_poll_idle_interval_seconds: float = Field(default=15.0, ge=1.0, le=300.0)
     delta_overlap_seconds: float = Field(default=2.0, ge=0.0, le=120.0)
+    initial_partial_publish_min_changed: int = Field(default=20, ge=1, le=5000)
+    initial_partial_publish_max_interval_seconds: float = Field(default=2.0, ge=0.1, le=60.0)
     ccu_backfill_cooldown_seconds: float = Field(default=10.0, ge=0.5, le=300.0)
     sql_query_timeout_seconds: int = Field(default=15, ge=2, le=300)
     sql_max_concurrent_queries: int = Field(default=1, ge=1, le=16)
