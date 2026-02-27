@@ -7,11 +7,15 @@ import logging
 import logging.handlers
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any, Callable
+
+if os.name == "nt":
+    import msvcrt
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen, QShortcut
@@ -34,6 +38,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QStyledItemDelegate,
     QStyle,
     QStyleOptionViewItem,
@@ -125,6 +130,11 @@ class _SystemClock:
         return datetime.now()
 
 
+def _lookback_hours_for_days(days: int) -> float:
+    normalized_days = max(1, min(3, int(days)))
+    return float((normalized_days + 1) * 24)
+
+
 def _sync_data_window_settings() -> None:
     days = int(getattr(settings, "ui_data_window_days", 1))
     if days < 1:
@@ -132,8 +142,9 @@ def _sync_data_window_settings() -> None:
     if days > 3:
         days = 3
     settings.ui_data_window_days = days
-    settings.initial_load_lookback_hours = float(days * 24)
-    settings.ccu_backfill_lookback_hours = float(days * 24)
+    lookback_hours = _lookback_hours_for_days(days)
+    settings.initial_load_lookback_hours = lookback_hours
+    settings.ccu_backfill_lookback_hours = lookback_hours
 
 
 class _UiBridge(QObject):
@@ -142,6 +153,57 @@ class _UiBridge(QObject):
 
 class _UiActionBridge(QObject):
     action_done = Signal(str, object, object)
+
+
+_TRO_ID_PATTERN = re.compile(r"^TRO-(\d+)$", re.IGNORECASE)
+
+
+class _LeaderFileLock:
+    def __init__(self, lock_path: Path) -> None:
+        self._path = lock_path
+        self._fh = None
+
+    def try_acquire(self) -> bool:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self._path, "a+b")
+        try:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b" ")
+                fh.flush()
+            if os.name == "nt":
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl  # type: ignore
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"pid={os.getpid()} ts={time.time():.3f}\n".encode("ascii", errors="ignore"))
+            fh.flush()
+            self._fh = fh
+            return True
+        except Exception:  # noqa: BLE001
+            with contextlib.suppress(Exception):
+                fh.close()
+            return False
+
+    def release(self) -> None:
+        fh = self._fh
+        self._fh = None
+        if fh is None:
+            return
+        with contextlib.suppress(Exception):
+            if os.name == "nt":
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl  # type: ignore
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(Exception):
+            fh.close()
 
 
 class _Runtime:
@@ -154,6 +216,8 @@ class _Runtime:
         self._started = threading.Event()
         self._start_error: BaseException | None = None
         self._tray_detail_submit_lock = threading.Lock()
+        self._runtime_role = "leader"
+        self._leader_lock: _LeaderFileLock | None = None
 
     def start(self) -> None:
         log.info("Runtime start requested")
@@ -229,22 +293,28 @@ class _Runtime:
         self,
         *,
         max_trays_per_trolley: int,
+        total_trolley_count: int,
         refresh_interval_seconds: float,
         data_window_days: int,
     ) -> dict[str, object]:
         log.info(
-            "Update grouping settings requested max_trays_per_trolley=%s refresh_interval_seconds=%s data_window_days=%s",
+            "Update grouping settings requested max_trays_per_trolley=%s total_trolley_count=%s refresh_interval_seconds=%s data_window_days=%s",
             max_trays_per_trolley,
+            total_trolley_count,
             refresh_interval_seconds,
             data_window_days,
         )
         return self._submit(
             self._update_grouping_settings(
                 max_trays_per_trolley=max_trays_per_trolley,
+                total_trolley_count=total_trolley_count,
                 refresh_interval_seconds=refresh_interval_seconds,
                 data_window_days=data_window_days,
             )
         )
+
+    def data_window_loading_status(self, *, data_window_days: int | None = None) -> dict[str, object]:
+        return self._submit(self._data_window_loading_status(data_window_days=data_window_days))
 
     def tray_cells(self, tray_id: str) -> list[dict[str, str | None]]:
         log.info("Tray detail requested tray_id=%s", tray_id)
@@ -285,13 +355,7 @@ class _Runtime:
     async def _run(self) -> None:
         log.info("Runtime async bootstrap started")
         _sync_data_window_settings()
-        connection = SQLServerConnection()
-        ccu_repo = CcuRepo(connection)
-        fpc_repo = FpcRepo(connection)
-        dashboard_repo = DashboardRepo(connection)
-        delta_tracker = InMemoryDeltaTracker()
-        event_bus = AsyncEventBus(default_queue_size=settings.event_queue_size)
-        state_store = SingleWriterStateStore(queue_size=settings.event_queue_size)
+        self._stop_event = asyncio.Event()
         grouping_state_repo = None
         if settings.shared_state_enabled:
             grouping_state_repo = SharedGroupingStateRepository(
@@ -304,6 +368,41 @@ class _Runtime:
             )
         else:
             log.info("Shared grouping state disabled")
+
+        self._runtime_role = "leader"
+        self._leader_lock = None
+        if grouping_state_repo is not None:
+            lock_path = Path(settings.shared_state_dir) / ".leader.lock"
+            lock = _LeaderFileLock(lock_path)
+            acquired = await asyncio.to_thread(lock.try_acquire)
+            if acquired:
+                self._leader_lock = lock
+                self._runtime_role = "leader"
+                log.info("Runtime role=leader lock_path=%s", lock_path)
+            else:
+                self._runtime_role = "viewer"
+                log.info("Runtime role=viewer leader lock already held lock_path=%s", lock_path)
+        else:
+            log.info("Runtime role=leader (shared state disabled)")
+
+        if self._runtime_role == "viewer":
+            self._started.set()
+            log.info("Runtime bootstrap signal emitted to UI thread")
+            try:
+                await self._viewer_loop(grouping_state_repo)
+            finally:
+                if self._leader_lock is not None:
+                    self._leader_lock.release()
+                    self._leader_lock = None
+            return
+
+        connection = SQLServerConnection()
+        ccu_repo = CcuRepo(connection)
+        fpc_repo = FpcRepo(connection)
+        dashboard_repo = DashboardRepo(connection)
+        delta_tracker = InMemoryDeltaTracker()
+        event_bus = AsyncEventBus(default_queue_size=settings.event_queue_size)
+        state_store = SingleWriterStateStore(queue_size=settings.event_queue_size)
 
         legacy_driver = settings.sql_driver.strip().lower() == "sql server"
         refresh_peek_enabled = bool(settings.refresh_peek_enabled)
@@ -330,6 +429,7 @@ class _Runtime:
             max_parallel_workers=settings.max_parallel_workers,
             snapshot_limit=settings.ui_snapshot_limit,
             max_trays_per_trolley=settings.trolley_max_trays,
+            total_trolley_count=settings.total_trolley_count,
             assembly_auto_trolley_count=settings.assembly_auto_trolley_count,
             auto_group_enabled=settings.auto_group_default_enabled,
             grouping_sync_interval_seconds=settings.grouping_sync_interval_seconds,
@@ -342,7 +442,6 @@ class _Runtime:
 
         queue = await event_bus.subscribe(maxsize=settings.event_queue_size)
         log.info("Runtime subscribed to event bus queue_size=%s", settings.event_queue_size)
-        self._stop_event = asyncio.Event()
         ui_task = asyncio.create_task(self._ui_event_loop(queue), name="ui-event-coalescer")
         self._started.set()
         log.info("Runtime bootstrap signal emitted to UI thread")
@@ -362,7 +461,64 @@ class _Runtime:
                 await ui_task
             with contextlib.suppress(Exception):
                 await event_bus.unsubscribe(queue)
+            if self._leader_lock is not None:
+                self._leader_lock.release()
+                self._leader_lock = None
             log.info("Runtime shutdown sequence completed")
+
+    async def _viewer_loop(self, grouping_state_repo: SharedGroupingStateRepository | None) -> None:
+        if grouping_state_repo is None:
+            log.warning("Viewer loop skipped because shared grouping repo is unavailable")
+            if self._stop_event is not None:
+                await self._stop_event.wait()
+            return
+        log.info("Viewer loop started sync_interval_seconds=%s", settings.grouping_sync_interval_seconds)
+        last_signature: Any = None
+        emit_seq = 0
+        poll_seconds = max(0.5, float(settings.grouping_sync_interval_seconds))
+        while self._stop_event is not None and not self._stop_event.is_set():
+            payload = None
+            try:
+                projection = await grouping_state_repo.load_projection()
+                payload = self._shared_projection_to_ui_payload(projection)
+            except Exception:  # noqa: BLE001
+                log.exception("Viewer loop failed to load projection from shared state")
+            if payload is not None:
+                payload_signature = _signature(payload)
+                if payload_signature != last_signature:
+                    emit_seq += 1
+                    event_payload = dict(payload)
+                    event_payload["seq"] = emit_seq
+                    self._bridge.event_ready.emit(event_payload)
+                    last_signature = payload_signature
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=poll_seconds)
+            except asyncio.TimeoutError:
+                continue
+        log.info("Viewer loop stopped")
+
+    def _shared_projection_to_ui_payload(self, projection: dict[str, Any]) -> dict[str, Any] | None:
+        if not projection:
+            return None
+        assembly = projection.get("assembly_trolleys")
+        queue = projection.get("queue_trolleys")
+        precharge = projection.get("precharge_trolleys")
+        ungrouped = projection.get("assembly_ungrouped")
+        trays = projection.get("trays")
+        if not isinstance(assembly, list) or not isinstance(queue, list) or not isinstance(precharge, list):
+            return None
+        payload: dict[str, Any] = {
+            "assembly_trolleys": [row for row in assembly if isinstance(row, dict)],
+            "queue_trolleys": [row for row in queue if isinstance(row, dict)],
+            "precharge_trolleys": [row for row in precharge if isinstance(row, dict)],
+            "assembly_ungrouped": [row for row in (ungrouped or []) if isinstance(row, dict)],
+        }
+        if isinstance(trays, list):
+            payload["type"] = "snapshot"
+            payload["trays"] = [row for row in trays if isinstance(row, dict)]
+        else:
+            payload["type"] = "projection"
+        return payload
 
     async def _ui_event_loop(self, queue: asyncio.Queue[Any]) -> None:
         log.info("UI event coalescer loop started")
@@ -547,23 +703,27 @@ class _Runtime:
             return
         self._bridge.event_ready.emit(payload)
 
+    def _require_orchestrator(self) -> OrchestratorService:
+        if self._orchestrator is not None:
+            return self._orchestrator
+        if self._runtime_role == "viewer":
+            raise RuntimeError("This instance is viewer mode. Use the leader instance for refresh/group actions.")
+        raise RuntimeError("Runtime is not started")
+
     async def _manual_refresh(self, *, full_scan: bool) -> dict[str, object]:
-        if self._orchestrator is None:
-            raise RuntimeError("Runtime is not started")
-        result = await self._orchestrator.manual_refresh(full_scan=full_scan)
+        orchestrator = self._require_orchestrator()
+        result = await orchestrator.manual_refresh(full_scan=full_scan)
         log.info("Manual refresh completed full_scan=%s result=%s", full_scan, result)
         return result
 
     async def _manual_group(self, *, tray_id: str, trolley_id: str, column: Column) -> None:
-        if self._orchestrator is None:
-            raise RuntimeError("Runtime is not started")
-        await self._orchestrator.group_tray_manual(tray_id=tray_id, trolley_id=trolley_id, column=column)
+        orchestrator = self._require_orchestrator()
+        await orchestrator.group_tray_manual(tray_id=tray_id, trolley_id=trolley_id, column=column)
         log.info("Manual group completed tray_id=%s trolley_id=%s column=%s", tray_id, trolley_id, column.value)
 
     async def _manual_group_many(self, *, tray_ids: list[str], trolley_id: str, column: Column) -> dict[str, object]:
-        if self._orchestrator is None:
-            raise RuntimeError("Runtime is not started")
-        result = await self._orchestrator.group_trays_manual(
+        orchestrator = self._require_orchestrator()
+        result = await orchestrator.group_trays_manual(
             tray_ids=tray_ids,
             trolley_id=trolley_id,
             column=column,
@@ -578,36 +738,31 @@ class _Runtime:
         return result
 
     async def _manual_ungroup(self, *, tray_id: str) -> None:
-        if self._orchestrator is None:
-            raise RuntimeError("Runtime is not started")
-        await self._orchestrator.ungroup_tray_manual(tray_id=tray_id)
+        orchestrator = self._require_orchestrator()
+        await orchestrator.ungroup_tray_manual(tray_id=tray_id)
         log.info("Manual ungroup completed tray_id=%s", tray_id)
 
     async def _rename_trolley(self, *, old_trolley_id: str, new_trolley_id: str) -> dict[str, object]:
-        if self._orchestrator is None:
-            raise RuntimeError("Runtime is not started")
-        result = await self._orchestrator.rename_trolley_manual(old_trolley_id, new_trolley_id)
+        orchestrator = self._require_orchestrator()
+        result = await orchestrator.rename_trolley_manual(old_trolley_id, new_trolley_id)
         log.info("Rename trolley completed old=%s new=%s result=%s", old_trolley_id, new_trolley_id, result)
         return result
 
     async def _clear_trolley(self, *, trolley_id: str) -> dict[str, object]:
-        if self._orchestrator is None:
-            raise RuntimeError("Runtime is not started")
-        result = await self._orchestrator.clear_trolley_manual(trolley_id)
+        orchestrator = self._require_orchestrator()
+        result = await orchestrator.clear_trolley_manual(trolley_id)
         log.info("Clear trolley completed trolley_id=%s result=%s", trolley_id, result)
         return result
 
     async def _delete_trolley(self, *, trolley_id: str) -> dict[str, object]:
-        if self._orchestrator is None:
-            raise RuntimeError("Runtime is not started")
-        result = await self._orchestrator.delete_trolley_manual(trolley_id)
+        orchestrator = self._require_orchestrator()
+        result = await orchestrator.delete_trolley_manual(trolley_id)
         log.info("Delete trolley completed trolley_id=%s result=%s", trolley_id, result)
         return result
 
     async def _set_auto_group_enabled(self, *, enabled: bool) -> dict[str, object]:
-        if self._orchestrator is None:
-            raise RuntimeError("Runtime is not started")
-        result = await self._orchestrator.set_auto_group_enabled(enabled=enabled)
+        orchestrator = self._require_orchestrator()
+        result = await orchestrator.set_auto_group_enabled(enabled=enabled)
         log.info("Set auto group completed enabled=%s result=%s", enabled, result)
         return result
 
@@ -615,29 +770,32 @@ class _Runtime:
         self,
         *,
         max_trays_per_trolley: int,
+        total_trolley_count: int,
         refresh_interval_seconds: float,
         data_window_days: int,
     ) -> dict[str, object]:
-        if self._orchestrator is None:
-            raise RuntimeError("Runtime is not started")
-        result = await self._orchestrator.update_grouping_settings(
+        orchestrator = self._require_orchestrator()
+        result = await orchestrator.update_grouping_settings(
             max_trays_per_trolley=max_trays_per_trolley,
+            total_trolley_count=total_trolley_count,
             refresh_interval_seconds=refresh_interval_seconds,
             data_window_days=data_window_days,
         )
         log.info("Update grouping settings completed result=%s", result)
         return result
 
+    async def _data_window_loading_status(self, *, data_window_days: int | None = None) -> dict[str, object]:
+        orchestrator = self._require_orchestrator()
+        return await orchestrator.data_window_loading_status(data_window_days=data_window_days)
+
     async def _tray_cells(self, *, tray_id: str) -> list[dict[str, str | None]]:
-        if self._orchestrator is None:
-            raise RuntimeError("Runtime is not started")
-        rows = await self._orchestrator.fetch_tray_cells(tray_id=tray_id)
+        orchestrator = self._require_orchestrator()
+        rows = await orchestrator.fetch_tray_cells(tray_id=tray_id)
         return rows
 
     async def _cell_owner(self, *, cell_id: str) -> dict[str, str | None] | None:
-        if self._orchestrator is None:
-            raise RuntimeError("Runtime is not started")
-        row = await self._orchestrator.fetch_cell_owner(cell_id=cell_id)
+        orchestrator = self._require_orchestrator()
+        row = await orchestrator.fetch_cell_owner(cell_id=cell_id)
         return row
 
 
@@ -645,14 +803,18 @@ class _MetricBox(QFrame):
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("metricBox")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(2)
 
         self._title = QLabel(title, self)
         self._title.setObjectName("metricTitle")
+        self._title.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        self._title.setWordWrap(True)
         self._value = QLabel("0", self)
         self._value.setObjectName("metricValue")
+        self._value.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
 
         layout.addWidget(self._title)
         layout.addWidget(self._value)
@@ -727,6 +889,7 @@ class _ColumnCard(QWidget):
         tray_actions_widget: QWidget | None = None,
         on_trolley_context: Callable[[QListView, QModelIndex], None] | None = None,
         on_trolley_double_click: Callable[[QListView, QModelIndex], None] | None = None,
+        on_trolley_click: Callable[[QListView, QModelIndex], None] | None = None,
         on_tray_header_click: Callable[[int], None] | None = None,
     ) -> None:
         super().__init__()
@@ -734,6 +897,8 @@ class _ColumnCard(QWidget):
         self.tray_table: QTableView | None = None
         self._tray_copy_shortcut: QShortcut | None = None
         self._tray_select_all_shortcut: QShortcut | None = None
+        self._trolley_copy_shortcut: QShortcut | None = None
+        self._trolley_select_all_shortcut: QShortcut | None = None
         self._tray_resize_pending = False
         self._last_tray_resize_at: datetime | None = None
         self._interaction_release_timer: QTimer | None = None
@@ -755,11 +920,23 @@ class _ColumnCard(QWidget):
 
         self.trolley_list.setModel(trolley_model)
         self.trolley_list.setAlternatingRowColors(True)
-        self.trolley_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.trolley_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._trolley_copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self.trolley_list)
+        self._trolley_copy_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._trolley_copy_shortcut.activated.connect(self._copy_selected_trolley_rows)
+        self._trolley_select_all_shortcut = QShortcut(QKeySequence.StandardKey.SelectAll, self.trolley_list)
+        self._trolley_select_all_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._trolley_select_all_shortcut.activated.connect(self._select_all_trolley_rows)
+        self.trolley_list.installEventFilter(self)
+        self.trolley_list.viewport().installEventFilter(self)
         root.addWidget(self.trolley_list, 1)
         if on_trolley_context is not None:
             self.trolley_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self.trolley_list.customContextMenuRequested.connect(self._handle_trolley_context)
+        if on_trolley_click is not None:
+            self.trolley_list.clicked.connect(
+                lambda idx: on_trolley_click(self.trolley_list, idx),
+            )
         if on_trolley_double_click is not None:
             self.trolley_list.doubleClicked.connect(
                 lambda idx: on_trolley_double_click(self.trolley_list, idx),
@@ -808,19 +985,28 @@ class _ColumnCard(QWidget):
             self.tray_table.setTextElideMode(Qt.TextElideMode.ElideNone)
             self.tray_table.setMouseTracking(True)
             self.tray_table.setItemDelegateForColumn(0, _TraySelectItemDelegate(self.tray_table))
+            self.tray_table.setContentsMargins(0, 0, 0, 0)
+            self.tray_table.setViewportMargins(0, 0, 0, 0)
+            self.tray_table.setFrameShape(QFrame.Shape.NoFrame)
             if on_tray_header_click is not None:
                 header.sectionClicked.connect(on_tray_header_click)
             self.tray_table.clicked.connect(self._on_tray_table_clicked)
             self.tray_table.setShowGrid(False)
             self.tray_table.setStyleSheet(
-                "QTableView::item { padding: 0px; border: none; } "
+                "QTableView { padding: 0px; margin: 0px; border: 0px; } "
+                "QTableView::item { padding: 0px; margin: 0px; border: none; } "
                 "QTableView::item:focus { outline: none; } "
                 "QTableView::item:hover { background: #eef2f7; } "
-                "QTableView::item:selected { background: #dbeafe; color: #0f172a; }"
+                "QTableView::item:selected { background: #dbeafe; color: #0f172a; } "
+                "QHeaderView { margin: 0px; padding: 0px; border: 0px; } "
+                "QHeaderView::section { padding: 0px; margin: 0px; border: 0px; } "
+                "QTableCornerButton::section { padding: 0px; margin: 0px; border: 0px; }"
             )
             self._tray_copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self.tray_table)
+            self._tray_copy_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
             self._tray_copy_shortcut.activated.connect(self._copy_selected_tray_cells)
             self._tray_select_all_shortcut = QShortcut(QKeySequence.StandardKey.SelectAll, self.tray_table)
+            self._tray_select_all_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
             self._tray_select_all_shortcut.activated.connect(self._select_all_tray_cells)
             self._interaction_release_timer = QTimer(self)
             self._interaction_release_timer.setSingleShot(True)
@@ -861,6 +1047,17 @@ class _ColumnCard(QWidget):
             toggle_row(index.row())
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        trolley_list = self.trolley_list
+        if watched in {trolley_list, trolley_list.viewport()} and event.type() == QEvent.Type.KeyPress:
+            key = getattr(event, "key", lambda: None)()
+            modifiers = getattr(event, "modifiers", lambda: Qt.KeyboardModifier.NoModifier)()
+            if modifiers & Qt.KeyboardModifier.ControlModifier:
+                if key == Qt.Key.Key_A:
+                    self._select_all_trolley_rows()
+                    return True
+                if key == Qt.Key.Key_C:
+                    self._copy_selected_trolley_rows()
+                    return True
         tray_table = self.tray_table
         if tray_table is not None and watched in {tray_table, tray_table.viewport()}:
             event_type = event.type()
@@ -904,6 +1101,29 @@ class _ColumnCard(QWidget):
         if self.tray_table is None:
             return
         self.tray_table.selectAll()
+
+    def _select_all_trolley_rows(self) -> None:
+        self.trolley_list.selectAll()
+
+    def _copy_selected_trolley_rows(self) -> None:
+        model = self.trolley_list.model()
+        selection_model = self.trolley_list.selectionModel()
+        if model is None or selection_model is None:
+            return
+        selected_indexes = list(selection_model.selectedIndexes())
+        if not selected_indexes:
+            current = self.trolley_list.currentIndex()
+            if current.isValid():
+                selected_indexes = [current]
+        if not selected_indexes:
+            return
+        row_ids = sorted({index.row() for index in selected_indexes if index.isValid()})
+        lines: list[str] = []
+        for row in row_ids:
+            index = model.index(row, 0)
+            value = model.data(index, Qt.ItemDataRole.DisplayRole)
+            lines.append("" if value is None else str(value))
+        QApplication.clipboard().setText("\n".join(lines))
 
     def _copy_selected_tray_cells(self) -> None:
         if self.tray_table is None:
@@ -1037,6 +1257,17 @@ class _SettingsDialog(QDialog):
         self._max_trays_input.setValue(settings.trolley_max_trays)
         form.addRow("Max Tray / Trolley", self._max_trays_input)
 
+        self._total_trolley_input = QSpinBox(self)
+        self._total_trolley_input.setRange(1, 999)
+        self._total_trolley_input.setValue(int(getattr(settings, "total_trolley_count", 99)))
+        form.addRow("Total Trolley", self._total_trolley_input)
+
+        self._auto_group_gap_input = QSpinBox(self)
+        self._auto_group_gap_input.setRange(0, 240)
+        self._auto_group_gap_input.setValue(int(getattr(settings, "auto_group_gap_minutes", 10)))
+        self._auto_group_gap_input.setSuffix(" min")
+        form.addRow("Auto Group Gap", self._auto_group_gap_input)
+
         self._target_aging_input = QDoubleSpinBox(self)
         self._target_aging_input.setRange(0.1, 72.0)
         self._target_aging_input.setDecimals(1)
@@ -1090,12 +1321,14 @@ class _SettingsDialog(QDialog):
 
     def payload(self) -> dict[str, object]:
         days = int(self._data_window_days_input.value())
-        lookback_hours = float(days * 24)
+        lookback_hours = _lookback_hours_for_days(days)
         return {
             "sql_server": self._host_input.text().strip(),
             "sql_user": self._user_input.text().strip(),
             "sql_password": self._pass_input.text(),
             "trolley_max_trays": int(self._max_trays_input.value()),
+            "total_trolley_count": int(self._total_trolley_input.value()),
+            "auto_group_gap_minutes": int(self._auto_group_gap_input.value()),
             "target_aging_hours": float(self._target_aging_input.value()),
             "target_aging_tolerance_hours": float(self._aging_tolerance_input.value()),
             "refresh_interval_seconds": float(self._refresh_interval_input.value()),
@@ -1105,7 +1338,8 @@ class _SettingsDialog(QDialog):
 
     def _on_data_window_days_changed(self, value: int) -> None:
         days = max(1, min(3, int(value)))
-        self._lookback_label.setText(f"{days * 24} hours ({days} day window)")
+        lookback_hours = int(_lookback_hours_for_days(days))
+        self._lookback_label.setText(f"{lookback_hours} hours ({days} day window)")
 
 
 class _TrayDetailBridge(QObject):
@@ -1303,7 +1537,16 @@ class _MainWindow(QMainWindow):
         self._action_bridge = _UiActionBridge()
         self._action_inflight = False
         self._action_locked_ui = False
+        self._settings_inflight = False
         self._pending_db_restart_notice = False
+        self._pending_settings_context: dict[str, Any] | None = None
+        self._window_load_monitor_days: int | None = None
+        self._window_status_check_inflight = False
+        self._suggested_trolley_id = ""
+        self._centered_once = False
+        self._window_status_timer = QTimer(self)
+        self._window_status_timer.setInterval(2000)
+        self._window_status_timer.timeout.connect(self._on_window_status_timer)
         self._event_filter_installed = False
         self.setWindowTitle("WIP Management - Clean Architecture")
         self.resize(1400, 820)
@@ -1352,35 +1595,35 @@ class _MainWindow(QMainWindow):
         self._auto_group_checkbox.setChecked(settings.auto_group_default_enabled)
         self._settings_btn = QPushButton("Settings", self)
         self._search_input = QLineEdit(self)
-        self._search_input.setPlaceholderText("Find Tray_ID / Cell_ID")
-        self._search_input.setMinimumWidth(220)
+        self._search_input.setPlaceholderText("Tray/Cell ID")
+        search_width = self._search_input.fontMetrics().horizontalAdvance("VB050002596") + 36
+        self._search_input.setFixedWidth(max(140, min(190, search_width)))
         self._search_btn = QPushButton("Search", self)
-        self._search_result = QLabel("-", self)
-        self._search_result.setWordWrap(True)
-        self._search_result.setStyleSheet("color: #334155;")
         self._pending_search_query = ""
-        controls_layout.addWidget(self._search_input, 2)
+        controls_layout.addWidget(self._search_input)
         controls_layout.addWidget(self._search_btn)
-        controls_layout.addWidget(self._search_result, 3)
         controls_layout.addStretch(1)
         controls_layout.addWidget(self._quick_refresh_btn)
         controls_layout.addWidget(self._full_refresh_btn)
-        controls_layout.addWidget(self._auto_group_checkbox)
         controls_layout.addWidget(self._settings_btn)
         layout.addWidget(controls)
 
         self._status = QLabel("", self)
         self._status.setObjectName("statusBar")
-        layout.addWidget(self._status)
+        status_bar = self.statusBar()
+        status_bar.setSizeGripEnabled(False)
+        status_bar.addPermanentWidget(self._status, 1)
 
         self._add_trolley_input = QLineEdit(self)
         self._add_trolley_input.setPlaceholderText("Trolley ID")
+        self._refresh_suggested_trolley_id(force=True)
         self._add_trolley_btn = QPushButton("Add Trolley", self)
         ungroup_actions = QWidget(self)
         ungroup_actions_layout = QHBoxLayout(ungroup_actions)
         ungroup_actions_layout.setContentsMargins(0, 0, 0, 0)
         ungroup_actions_layout.setSpacing(6)
         ungroup_actions_layout.addStretch(1)
+        ungroup_actions_layout.addWidget(self._auto_group_checkbox)
         ungroup_actions_layout.addWidget(self._add_trolley_input)
         ungroup_actions_layout.addWidget(self._add_trolley_btn)
 
@@ -1397,6 +1640,7 @@ class _MainWindow(QMainWindow):
             tray_actions_widget=ungroup_actions,
             on_trolley_context=self._on_trolley_item_context,
             on_trolley_double_click=self._on_trolley_item_double_click,
+            on_trolley_click=self._on_trolley_item_clicked,
             on_tray_header_click=self._on_ungroup_header_clicked,
         )
         self._queue_card = _ColumnCard(
@@ -1404,12 +1648,14 @@ class _MainWindow(QMainWindow):
             vm.queue_trolley_model,
             on_trolley_context=self._on_trolley_item_context,
             on_trolley_double_click=self._on_trolley_item_double_click,
+            on_trolley_click=self._on_trolley_item_clicked,
         )
         self._precharge_card = _ColumnCard(
             "Precharge",
             vm.precharge_trolley_model,
             on_trolley_context=self._on_trolley_item_context,
             on_trolley_double_click=self._on_trolley_item_double_click,
+            on_trolley_click=self._on_trolley_item_clicked,
         )
         board_layout.addWidget(self._assembly_card, 1)
         board_layout.addWidget(self._queue_card, 1)
@@ -1426,6 +1672,33 @@ class _MainWindow(QMainWindow):
         self._settings_btn.clicked.connect(self._on_settings)
         self._auto_group_checkbox.toggled.connect(self._on_auto_group_toggled)
         self._action_bridge.action_done.connect(self._on_action_done)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if self._centered_once:
+            return
+        self._centered_once = True
+        self._center_in_screen()
+
+    def _center_in_screen(self) -> None:
+        screen = self.screen()
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        max_width = max(640, int(available.width() * 0.96))
+        max_height = max(480, int(available.height() * 0.90))
+        if self.width() > max_width or self.height() > max_height:
+            self.resize(min(self.width(), max_width), min(self.height(), max_height))
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        top_left = frame.topLeft()
+        if top_left.x() < available.left():
+            top_left.setX(available.left())
+        if top_left.y() < available.top():
+            top_left.setY(available.top())
+        self.move(top_left)
 
     def _on_updated(self, payload: dict[str, int]) -> None:
         for key, box in self._metric_boxes.items():
@@ -1445,6 +1718,63 @@ class _MainWindow(QMainWindow):
                 **payload
             )
         )
+        self._refresh_suggested_trolley_id(force=False)
+
+    def _format_tro_id_for_ui(self, seq: int, *, total_count: int) -> str:
+        safe_total = max(1, int(total_count))
+        safe_seq = max(1, int(seq))
+        if safe_seq > safe_total:
+            safe_seq = ((safe_seq - 1) % safe_total) + 1
+        width = max(2, len(str(safe_total)))
+        return f"TRO-{safe_seq:0{width}d}"
+
+    def _parse_tro_seq_for_ui(self, trolley_id: str, *, total_count: int) -> int | None:
+        text = str(trolley_id).strip().upper()
+        if not text:
+            return None
+        match = _TRO_ID_PATTERN.match(text)
+        if not match:
+            return None
+        try:
+            seq = int(match.group(1))
+        except Exception:  # noqa: BLE001
+            return None
+        if seq < 1 or seq > max(1, int(total_count)):
+            return None
+        return seq
+
+    def _all_visible_trolley_ids(self) -> list[str]:
+        return [
+            *self._vm.assembly_trolley_model.trolley_ids(),
+            *self._vm.queue_trolley_model.trolley_ids(),
+            *self._vm.precharge_trolley_model.trolley_ids(),
+        ]
+
+    def _refresh_suggested_trolley_id(self, *, force: bool = False, used_trolley_id: str | None = None) -> None:
+        total_count = max(1, int(getattr(settings, "total_trolley_count", 99)))
+        previous_suggestion = self._suggested_trolley_id
+
+        base_seq = self._parse_tro_seq_for_ui(str(used_trolley_id or ""), total_count=total_count)
+        if base_seq is None:
+            parsed_sequences = [
+                parsed
+                for trolley_id in self._all_visible_trolley_ids()
+                if (parsed := self._parse_tro_seq_for_ui(trolley_id, total_count=total_count)) is not None
+            ]
+            if parsed_sequences:
+                base_seq = max(parsed_sequences)
+
+        if base_seq is None:
+            next_seq = 1
+        else:
+            next_seq = (base_seq % total_count) + 1
+
+        next_suggestion = self._format_tro_id_for_ui(next_seq, total_count=total_count)
+        self._suggested_trolley_id = next_suggestion
+
+        current_text = self._add_trolley_input.text().strip()
+        if force or not current_text or current_text.upper() == previous_suggestion.upper():
+            self._add_trolley_input.setText(next_suggestion)
 
     def _on_quick_refresh(self) -> None:
         self._run_action(
@@ -1463,17 +1793,14 @@ class _MainWindow(QMainWindow):
     def _on_search(self) -> None:
         raw = self._search_input.text().strip()
         if not raw:
-            self._search_result.setText("-")
             self._status.setText("Search input is empty.")
             return
         lookup = raw.upper()
         tray_payload = self._vm.tray_payload_by_id(lookup)
         if tray_payload is not None:
-            self._search_result.setText(self._format_tray_search_result(lookup, tray_payload))
-            self._status.setText(f"Found tray {lookup}.")
+            self._status.setText(self._format_tray_search_result(lookup, tray_payload))
             return
         self._pending_search_query = lookup
-        self._search_result.setText(f"Searching {lookup} ...")
         self._run_action(
             action_name="Search",
             action=lambda: self._runtime.cell_owner(lookup),
@@ -1543,8 +1870,11 @@ class _MainWindow(QMainWindow):
             return
         trolley_id = self._add_trolley_input.text().strip()
         if not trolley_id:
-            self._status.setText("Please input trolley ID for Add Trolley.")
-            return
+            self._refresh_suggested_trolley_id(force=True)
+            trolley_id = self._add_trolley_input.text().strip()
+            if not trolley_id:
+                self._status.setText("Please input trolley ID for Add Trolley.")
+                return
         self._run_action(
             action_name="Add trolley",
             action=lambda: self._runtime.manual_group_many(
@@ -1575,12 +1905,81 @@ class _MainWindow(QMainWindow):
                 out.append(tray_id)
         return out
 
+    def _on_trolley_item_clicked(self, list_view: QListView, index: QModelIndex) -> None:
+        if not index.isValid():
+            return
+        self._clear_trolley_selection_except(list_view)
+
+    def _clear_trolley_selection_except(self, active_list: QListView) -> None:
+        for list_view in (
+            self._assembly_card.trolley_list,
+            self._queue_card.trolley_list,
+            self._precharge_card.trolley_list,
+        ):
+            if list_view is active_list:
+                continue
+            with contextlib.suppress(Exception):
+                list_view.clearSelection()
+
+    def _selected_trolley_payloads(
+        self,
+        list_view: QListView,
+        *,
+        fallback_index: QModelIndex | None = None,
+    ) -> list[dict[str, Any]]:
+        selection_model = list_view.selectionModel()
+        selected_rows: list[QModelIndex] = []
+        if selection_model is not None:
+            selected_rows = list(selection_model.selectedRows())
+
+        if fallback_index is not None and fallback_index.isValid():
+            fallback_row = fallback_index.row()
+            has_fallback_selected = any(index.row() == fallback_row for index in selected_rows)
+            if selected_rows and not has_fallback_selected:
+                selected_rows = [fallback_index]
+                with contextlib.suppress(Exception):
+                    list_view.clearSelection()
+                    list_view.setCurrentIndex(fallback_index)
+            elif not selected_rows:
+                selected_rows = [fallback_index]
+
+        selected_rows.sort(key=lambda index: index.row())
+        out: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for index in selected_rows:
+            payload = self._trolley_payload_from_index(index)
+            if payload is None:
+                continue
+            trolley_id = str(payload.get("trolley_id", "")).strip()
+            if not trolley_id or trolley_id in seen_ids:
+                continue
+            seen_ids.add(trolley_id)
+            out.append(payload)
+        return out
+
+    def _delete_trolleys_action(self, trolley_ids: list[str]) -> dict[str, object]:
+        requested_ids = [trolley_id.strip() for trolley_id in trolley_ids if trolley_id.strip()]
+        deleted = 0
+        errors: list[str] = []
+        for trolley_id in requested_ids:
+            try:
+                self._runtime.delete_trolley(trolley_id=trolley_id)
+                deleted += 1
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{trolley_id}: {exc}")
+        return {
+            "requested": len(requested_ids),
+            "deleted": deleted,
+            "failed": len(errors),
+            "errors": errors[:5],
+        }
+
     def _on_trolley_item_context(self, list_view: QListView, index: QModelIndex) -> None:
-        payload = self._trolley_payload_from_index(index)
-        if payload is None:
+        selected_trolleys = self._selected_trolley_payloads(list_view, fallback_index=index)
+        if not selected_trolleys:
             return
         global_pos = list_view.viewport().mapToGlobal(list_view.visualRect(index).bottomRight())
-        self._show_trolley_menu(payload, global_pos)
+        self._show_trolley_menu(selected_trolleys[0], selected_trolleys, global_pos)
 
     def _on_trolley_item_double_click(self, _: QListView, index: QModelIndex) -> None:
         payload = self._trolley_payload_from_index(index)
@@ -1610,22 +2009,52 @@ class _MainWindow(QMainWindow):
             "state": str(index.data(state_role) or ""),
         }
 
-    def _show_trolley_menu(self, trolley: dict[str, Any], global_pos: QPoint) -> None:
+    def _show_trolley_menu(
+        self,
+        trolley: dict[str, Any],
+        selected_trolleys: list[dict[str, Any]],
+        global_pos: QPoint,
+    ) -> None:
         trolley_id = str(trolley.get("trolley_id", "")).strip()
         if not trolley_id:
             return
         mode = str(trolley.get("mode", "")).strip().lower()
         is_manual = mode == "manual"
         tray_ids = [str(item).strip() for item in trolley.get("tray_ids", []) if str(item).strip()]
+        selected_rows = list(selected_trolleys) if selected_trolleys else [trolley]
+        selected_manual_ids: list[str] = []
+        has_auto_selected = False
+        for row in selected_rows:
+            row_id = str(row.get("trolley_id", "")).strip()
+            if not row_id:
+                continue
+            row_mode = str(row.get("mode", "")).strip().lower()
+            if row_mode == "manual":
+                selected_manual_ids.append(row_id)
+            else:
+                has_auto_selected = True
+        selected_manual_ids = list(dict.fromkeys(selected_manual_ids))
+        multi_selected = len(selected_rows) > 1
 
         menu = QMenu(self)
+        rename_action = menu.addAction("Edit Trolley: Rename...")
+        menu.addSeparator()
         add_action = menu.addAction("Edit Trolley: Add Selected Trays")
         remove_action = menu.addAction("Edit Trolley: Delete Tray...")
         menu.addSeparator()
         clear_action = menu.addAction("Clear Trolley")
-        delete_action = menu.addAction("Delete Trolley")
+        if multi_selected:
+            delete_action = menu.addAction(f"Delete Selected Trolleys ({len(selected_rows)})")
+        else:
+            delete_action = menu.addAction("Delete Trolley")
 
-        if not is_manual:
+        if multi_selected:
+            rename_action.setEnabled(False)
+            add_action.setEnabled(False)
+            remove_action.setEnabled(False)
+            clear_action.setEnabled(False)
+            delete_action.setEnabled(bool(selected_manual_ids) and (not has_auto_selected))
+        elif not is_manual:
             add_action.setEnabled(False)
             remove_action.setEnabled(False)
             clear_action.setEnabled(False)
@@ -1634,8 +2063,42 @@ class _MainWindow(QMainWindow):
         chosen = menu.exec(global_pos)
         if chosen is None:
             return
+        if chosen == rename_action:
+            new_trolley_id, ok = QInputDialog.getText(
+                self,
+                "Edit Trolley",
+                "Trolley ID",
+                QLineEdit.EchoMode.Normal,
+                trolley_id,
+            )
+            if not ok:
+                return
+            new_id = str(new_trolley_id).strip()
+            if not new_id:
+                self._status.setText("Trolley ID cannot be empty.")
+                return
+            if new_id == trolley_id:
+                self._status.setText("Trolley ID unchanged.")
+                return
+            self._run_action(
+                action_name="Rename trolley",
+                action=lambda: self._runtime.rename_trolley(old_trolley_id=trolley_id, new_trolley_id=new_id),
+            )
+            return
+        if multi_selected:
+            if has_auto_selected:
+                self._status.setText("Only manual trolleys can be deleted in multi-select mode.")
+                return
+            if not selected_manual_ids:
+                self._status.setText("No manual trolley selected to delete.")
+                return
+            self._run_action(
+                action_name="Delete trolleys",
+                action=lambda: self._delete_trolleys_action(selected_manual_ids),
+            )
+            return
         if not is_manual:
-            self._status.setText("Auto trolley cannot be edited. Please use manual group trolley.")
+            self._status.setText("Auto trolley only supports rename.")
             return
         if chosen == add_action:
             tray_ids_to_add = self._selected_ungroup_tray_ids()
@@ -1768,6 +2231,22 @@ class _MainWindow(QMainWindow):
             self._status.setText("DB host/user cannot be empty.")
             return
 
+        prev_max_trays = int(settings.trolley_max_trays)
+        prev_total_trolley_count = int(getattr(settings, "total_trolley_count", 99))
+        prev_refresh_interval = float(settings.delta_poll_interval_seconds)
+        prev_window_days = int(settings.ui_data_window_days)
+        prev_auto_group_gap = int(getattr(settings, "auto_group_gap_minutes", 10))
+        prev_target_aging = float(settings.target_aging_hours)
+        prev_aging_tolerance = float(settings.target_aging_tolerance_hours)
+
+        next_max_trays = int(payload["trolley_max_trays"])
+        next_total_trolley_count = int(payload["total_trolley_count"])
+        next_auto_group_gap = int(payload["auto_group_gap_minutes"])
+        next_target_aging = float(payload["target_aging_hours"])
+        next_aging_tolerance = float(payload["target_aging_tolerance_hours"])
+        next_refresh_interval = float(payload["refresh_interval_seconds"])
+        next_window_days = int(payload["data_window_days"])
+
         db_changed = (
             sql_server != settings.sql_server
             or sql_user != settings.sql_user
@@ -1776,12 +2255,22 @@ class _MainWindow(QMainWindow):
         settings.sql_server = sql_server
         settings.sql_user = sql_user
         settings.sql_password = sql_password
-        settings.trolley_max_trays = int(payload["trolley_max_trays"])
-        settings.target_aging_hours = float(payload["target_aging_hours"])
-        settings.target_aging_tolerance_hours = float(payload["target_aging_tolerance_hours"])
-        settings.delta_poll_interval_seconds = float(payload["refresh_interval_seconds"])
-        settings.ui_data_window_days = int(payload["data_window_days"])
+        settings.trolley_max_trays = next_max_trays
+        settings.total_trolley_count = max(1, next_total_trolley_count)
+        settings.auto_group_gap_minutes = next_auto_group_gap
+        settings.target_aging_hours = next_target_aging
+        settings.target_aging_tolerance_hours = next_aging_tolerance
+        settings.delta_poll_interval_seconds = next_refresh_interval
+        settings.ui_data_window_days = next_window_days
         _sync_data_window_settings()
+
+        max_trays_changed = prev_max_trays != settings.trolley_max_trays
+        total_trolley_changed = prev_total_trolley_count != settings.total_trolley_count
+        refresh_changed = abs(prev_refresh_interval - settings.delta_poll_interval_seconds) > 1e-6
+        window_days_changed = prev_window_days != settings.ui_data_window_days
+        auto_group_gap_changed = prev_auto_group_gap != settings.auto_group_gap_minutes
+        target_aging_changed = abs(prev_target_aging - settings.target_aging_hours) > 1e-6
+        aging_tolerance_changed = abs(prev_aging_tolerance - settings.target_aging_tolerance_hours) > 1e-6
 
         try:
             _upsert_env_values(
@@ -1791,6 +2280,8 @@ class _MainWindow(QMainWindow):
                     "SQL_USER": settings.sql_user,
                     "SQL_PASSWORD": settings.sql_password,
                     "TROLLEY_MAX_TRAYS": str(settings.trolley_max_trays),
+                    "TOTAL_TROLLEY_COUNT": str(settings.total_trolley_count),
+                    "AUTO_GROUP_GAP_MINUTES": str(settings.auto_group_gap_minutes),
                     "TARGET_AGING_HOURS": str(settings.target_aging_hours),
                     "TARGET_AGING_TOLERANCE_HOURS": str(settings.target_aging_tolerance_hours),
                     "DELTA_POLL_INTERVAL_SECONDS": str(settings.delta_poll_interval_seconds),
@@ -1803,14 +2294,46 @@ class _MainWindow(QMainWindow):
             QMessageBox.critical(self, "Settings", f"Failed to save .env settings: {exc}")
             return
 
+        extra_messages: list[str] = []
+        if auto_group_gap_changed:
+            extra_messages.append(f"App setting changed auto group gap {settings.auto_group_gap_minutes} min completed")
+        if target_aging_changed:
+            extra_messages.append(f"App setting changed target aging {settings.target_aging_hours:g}h completed")
+        if aging_tolerance_changed:
+            extra_messages.append(f"App setting changed aging tolerance {settings.target_aging_tolerance_hours:g}h completed")
+
+        self._pending_settings_context = {
+            "max_trays_changed": max_trays_changed,
+            "max_trays_per_trolley": settings.trolley_max_trays,
+            "total_trolley_changed": total_trolley_changed,
+            "total_trolley_count": settings.total_trolley_count,
+            "refresh_changed": refresh_changed,
+            "refresh_interval_seconds": settings.delta_poll_interval_seconds,
+            "window_days_changed": window_days_changed,
+            "data_window_days": settings.ui_data_window_days,
+            "extra_messages": extra_messages,
+        }
+
         self._pending_db_restart_notice = db_changed
-        self._run_action(
-            action_name="Apply settings",
+        runtime_settings_changed = max_trays_changed or total_trolley_changed or refresh_changed or window_days_changed
+        if not runtime_settings_changed:
+            message_parts = list(extra_messages)
+            if not message_parts:
+                message_parts.append("No runtime setting value changed.")
+            if self._pending_db_restart_notice:
+                message_parts.append("Restart app to apply DB host/user/password.")
+                self._pending_db_restart_notice = False
+            self._status.setText(" ".join(message_parts))
+            self._pending_settings_context = None
+            return
+
+        self._run_settings_action(
             action=lambda: self._runtime.update_grouping_settings(
                 max_trays_per_trolley=settings.trolley_max_trays,
+                total_trolley_count=settings.total_trolley_count,
                 refresh_interval_seconds=settings.delta_poll_interval_seconds,
                 data_window_days=settings.ui_data_window_days,
-            ),
+            )
         )
 
     def _run_action(self, *, action_name: str, action: Callable[[], Any], lock_ui: bool = True) -> None:
@@ -1837,27 +2360,104 @@ class _MainWindow(QMainWindow):
             daemon=True,
         ).start()
 
+    def _run_settings_action(self, *, action: Callable[[], Any]) -> None:
+        action_name = "Apply settings"
+        if self._settings_inflight:
+            self._status.setText("Apply settings is already running.")
+            return
+        self._settings_inflight = True
+        self._status.setText(f"{action_name} running...")
+        log.info("UI action started action=%s", action_name)
+
+        def _worker() -> None:
+            try:
+                result = action()
+                self._action_bridge.action_done.emit(action_name, result, None)
+            except Exception as exc:  # noqa: BLE001
+                self._action_bridge.action_done.emit(action_name, None, str(exc))
+
+        threading.Thread(
+            target=_worker,
+            name="ui-action-apply-settings",
+            daemon=True,
+        ).start()
+
+    def _on_window_status_timer(self) -> None:
+        days = self._window_load_monitor_days
+        if days is None:
+            self._window_status_timer.stop()
+            return
+        if self._window_status_check_inflight:
+            return
+        self._window_status_check_inflight = True
+
+        def _worker() -> None:
+            try:
+                result = self._runtime.data_window_loading_status(data_window_days=int(days))
+                self._action_bridge.action_done.emit("Window status", result, None)
+            except Exception as exc:  # noqa: BLE001
+                self._action_bridge.action_done.emit("Window status", None, str(exc))
+
+        threading.Thread(
+            target=_worker,
+            name="ui-action-window-status",
+            daemon=True,
+        ).start()
+
+    def _start_window_load_monitor(self, *, days: int) -> None:
+        self._window_load_monitor_days = int(days)
+        self._window_status_check_inflight = False
+        if not self._window_status_timer.isActive():
+            self._window_status_timer.start()
+
+    def _stop_window_load_monitor(self) -> None:
+        self._window_load_monitor_days = None
+        self._window_status_check_inflight = False
+        if self._window_status_timer.isActive():
+            self._window_status_timer.stop()
+
     def _on_action_done(self, action_name: str, result: object, error: object) -> None:
-        self._action_inflight = False
-        if self._action_locked_ui:
-            self._set_controls_enabled(True)
-        self._action_locked_ui = False
+        if action_name == "Window status":
+            self._window_status_check_inflight = False
+            if error:
+                log.warning("Window status poll failed error=%s", error)
+                return
+            payload = dict(result) if isinstance(result, dict) else {}
+            ready = bool(payload.get("ready"))
+            if not ready:
+                return
+            days_value_raw = payload.get("data_window_days")
+            try:
+                days_value = int(str(days_value_raw).strip()) if days_value_raw is not None else 0
+            except Exception:  # noqa: BLE001
+                days_value = int(self._window_load_monitor_days or 0)
+            self._stop_window_load_monitor()
+            if days_value > 0:
+                self._status.setText(f"{days_value}days data loaded.")
+            else:
+                self._status.setText("Data window loaded.")
+            return
+
+        if action_name == "Apply settings":
+            self._settings_inflight = False
+        else:
+            self._action_inflight = False
+            if self._action_locked_ui:
+                self._set_controls_enabled(True)
+            self._action_locked_ui = False
         if action_name == "Search":
             query = self._pending_search_query
             self._pending_search_query = ""
             if error:
-                self._search_result.setText(f"Search failed: {error}")
-                self._status.setText("Search failed.")
+                self._status.setText(f"Search failed: {error}")
                 log.error("UI action failed action=%s error=%s", action_name, error)
                 return
             owner = dict(result) if isinstance(result, dict) else None
             if owner is None:
-                self._search_result.setText(f"No data for {query}.")
-                self._status.setText("Search completed.")
+                self._status.setText(f"No data for {query}.")
                 log.info("UI action completed action=%s", action_name)
                 return
-            self._search_result.setText(self._format_cell_search_result(query, owner))
-            self._status.setText("Search completed.")
+            self._status.setText(self._format_cell_search_result(query, owner))
             log.info("UI action completed action=%s", action_name)
             return
         if error:
@@ -1866,17 +2466,66 @@ class _MainWindow(QMainWindow):
             log.error("UI action failed action=%s error=%s", action_name, error)
             if action_name == "Apply settings":
                 self._pending_db_restart_notice = False
+                self._pending_settings_context = None
             return
+        if action_name == "Apply settings":
+            payload = dict(result) if isinstance(result, dict) else {}
+            context = self._pending_settings_context or {}
+            self._pending_settings_context = None
+            message_parts: list[str] = []
+            if context.get("max_trays_changed"):
+                message_parts.append(
+                    f"App setting changed max {int(context.get('max_trays_per_trolley') or 0)}tray/trolley completed"
+                )
+            if context.get("total_trolley_changed"):
+                message_parts.append(
+                    f"App setting changed total {int(context.get('total_trolley_count') or 0)} trolley completed"
+                )
+            if context.get("refresh_changed"):
+                refresh_seconds = float(context.get("refresh_interval_seconds") or 0.0)
+                message_parts.append(f"App setting changed refresh {refresh_seconds:g}s completed")
+
+            waiting_for_window_data = False
+            if context.get("window_days_changed"):
+                days_value = int(context.get("data_window_days") or settings.ui_data_window_days)
+                waiting_for_window_data = bool(payload.get("window_backfill_scheduled"))
+                if waiting_for_window_data:
+                    message_parts.append(
+                        f"App setting changed {days_value} days. Please waiting a few minute to loading....."
+                    )
+                    self._start_window_load_monitor(days=days_value)
+                else:
+                    message_parts.append(f"App setting changed {days_value} days completed")
+                    self._stop_window_load_monitor()
+
+            for extra in context.get("extra_messages", []):
+                if isinstance(extra, str) and extra.strip():
+                    message_parts.append(extra.strip())
+
+            if not message_parts:
+                if payload.get("changed"):
+                    message_parts.append("App setting changed completed")
+                else:
+                    message_parts.append("No setting value changed.")
+
+            message = " ".join(message_parts)
+            if self._pending_db_restart_notice:
+                message = f"{message} Restart app to apply DB host/user/password."
+                self._pending_db_restart_notice = False
+            self._status.setText(message)
+            log.info("UI action completed action=%s result=%s", action_name, payload)
+            return
+
         if result is None:
             message = f"{action_name} completed."
         else:
             message = f"{action_name} completed: {result}"
         if action_name in {"Add trolley", "Edit trolley add trays"}:
             self._vm.assembly_ungrouped_model.clear_checked()
-            self._add_trolley_input.clear()
-        if action_name == "Apply settings" and self._pending_db_restart_notice:
-            message = f"{message} Restart app to apply DB host/user/password."
-            self._pending_db_restart_notice = False
+            used_trolley_id = ""
+            if isinstance(result, dict):
+                used_trolley_id = str(result.get("trolley_id") or "").strip()
+            self._refresh_suggested_trolley_id(force=True, used_trolley_id=used_trolley_id)
         self._status.setText(message)
         log.info("UI action completed action=%s", action_name)
 
@@ -1902,6 +2551,15 @@ class _MainWindow(QMainWindow):
         if tray_table.selectionModel() is not None:
             tray_table.clearSelection()
         self._vm.assembly_ungrouped_model.clear_checked()
+
+    def _clear_all_trolley_selections(self) -> None:
+        for list_view in (
+            self._assembly_card.trolley_list,
+            self._queue_card.trolley_list,
+            self._precharge_card.trolley_list,
+        ):
+            with contextlib.suppress(Exception):
+                list_view.clearSelection()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if event.type() == QEvent.Type.MouseButtonPress:
@@ -1932,11 +2590,26 @@ class _MainWindow(QMainWindow):
                         target_widget is not None
                         and (target_widget is tray_table or tray_table.isAncestorOf(target_widget))
                     )
+                    trolley_lists = (
+                        self._assembly_card.trolley_list,
+                        self._queue_card.trolley_list,
+                        self._precharge_card.trolley_list,
+                    )
+                    inside_trolley_list = bool(
+                        target_widget is not None
+                        and any(
+                            target_widget is list_view or list_view.isAncestorOf(target_widget)
+                            for list_view in trolley_lists
+                        )
+                    )
+                    if not inside_trolley_list:
+                        self._clear_all_trolley_selections()
                     if not inside_table and not keep_selection:
                         self._clear_ungroup_selection()
         return super().eventFilter(watched, event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._stop_window_load_monitor()
         app = QApplication.instance()
         if self._event_filter_installed and app is not None:
             app.removeEventFilter(self)

@@ -24,10 +24,15 @@ class FpcRepo:
         self._lot_col = SQLServerConnection.column_name(settings.fpc_lot_column)
         self._start_col = SQLServerConnection.column_name(settings.fpc_start_column)
         self._end_col = SQLServerConnection.column_name(settings.fpc_end_column)
+        self._update_col = SQLServerConnection.column_name(settings.update_time_column)
         self._record_col = SQLServerConnection.column_name(settings.fpc_record_json_column)
         self._tray_key = settings.fpc_json_tray_id_key
         self._cell_key = settings.fpc_json_pos_key
         self._keyword = settings.record_filter_keyword.strip().upper()
+        self._sql_tray_markers = _build_sql_marker_patterns(
+            self._tray_key,
+            fallback_keys=("TRAYID", "TRAY_ID", "TRAYBARCODE", "TRAY_BARCODE"),
+        )
         self._range_cache = SQLWindowRowCache(
             name="FPC",
             overlap_seconds=settings.delta_overlap_seconds,
@@ -67,35 +72,29 @@ class FpcRepo:
             settings.max_fetch_batch,
         )
         started_at = time.perf_counter()
-        offset = 0
         chunk = 0
         total_rows = 0
         total_signals = 0
-        while True:
-            batch = await self._fetch_batch(
-                start_time=start_time,
-                end_time=end_time,
-                offset=offset,
-                query_name="fpc.initial_stream_batch",
-            )
-            if not batch:
-                break
-            chunk += 1
+        batch = await self._fetch_batch(
+            start_time=start_time,
+            end_time=end_time,
+            offset=0,
+            query_name="fpc.initial_stream_batch",
+        )
+        if batch:
+            chunk = 1
             raw_rows = len(batch)
-            total_rows += raw_rows
+            total_rows = raw_rows
             signals = self._rows_to_signals(batch, min_start_time=start_time)
-            total_signals += len(signals)
+            total_signals = len(signals)
             log.info(
                 "FPC initial stream chunk=%s raw_rows=%s signals=%s offset=%s",
                 chunk,
                 raw_rows,
                 len(signals),
-                offset,
+                0,
             )
             yield signals, raw_rows
-            if raw_rows < settings.max_fetch_batch:
-                break
-            offset += raw_rows
         log.info(
             "FPC initial stream done elapsed_ms=%s raw_rows=%s signals=%s chunks=%s",
             int((time.perf_counter() - started_at) * 1000),
@@ -106,18 +105,16 @@ class FpcRepo:
 
     async def fetch_delta(self, watermark: Watermark, end_time: datetime) -> list[TraySignal]:
         overlap_start = watermark.collected_time - timedelta(seconds=settings.delta_overlap_seconds)
-        day_start = end_time.replace(hour=settings.initial_load_start_hour, minute=0, second=0, microsecond=0)
-        window_start = max(overlap_start, day_start)
+        window_start = overlap_start
         log.debug(
-            "FPC delta fetch start watermark=%s overlap_start=%s window_start=%s end_time=%s",
+            "FPC delta fetch start watermark=%s overlap_start=%s end_time=%s",
             watermark.collected_time.isoformat(),
             overlap_start.isoformat(),
-            window_start.isoformat(),
             end_time.isoformat(),
         )
         started_at = time.perf_counter()
         rows = await self._fetch_range(start_time=window_start, end_time=end_time)
-        signals = self._rows_to_signals(rows, min_start_time=day_start)
+        signals = self._rows_to_signals(rows, min_start_time=None)
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
         log.debug("FPC delta fetch done elapsed_ms=%s raw_rows=%s signals=%s", elapsed_ms, len(rows), len(signals))
         return signals
@@ -159,26 +156,14 @@ class FpcRepo:
         )
 
     async def _fetch_range_uncached(self, start_time: datetime, end_time: datetime) -> list[dict[str, Any]]:
-        all_rows: list[dict[str, Any]] = []
-        offset = 0
-        page = 0
-        while True:
-            batch = await self._fetch_batch(
-                start_time=start_time,
-                end_time=end_time,
-                offset=offset,
-                query_name="fpc.window_fetch_batch",
-            )
-            if not batch:
-                log.debug("FPC fetch range page=%s offset=%s returned empty", page, offset)
-                break
-            all_rows.extend(batch)
-            log.debug("FPC fetch range page=%s offset=%s batch_rows=%s", page, offset, len(batch))
-            if len(batch) < settings.max_fetch_batch:
-                break
-            offset += len(batch)
-            page += 1
-        return all_rows
+        rows = await self._fetch_batch(
+            start_time=start_time,
+            end_time=end_time,
+            offset=0,
+            query_name="fpc.window_fetch_batch",
+        )
+        log.debug("FPC fetch range rows=%s start_time=%s end_time=%s", len(rows), start_time.isoformat(), end_time.isoformat())
+        return rows
 
     async def _fetch_batch(
         self,
@@ -188,28 +173,32 @@ class FpcRepo:
         offset: int,
         query_name: str = "fpc.fetch_batch",
     ) -> list[dict[str, Any]]:
+        if offset > 0:
+            # SQL is already deduped to one tray-bearing row per LOT_NO for this window.
+            return []
+        marker_filter = " OR ".join(f"{self._record_col} LIKE ?" for _ in self._sql_tray_markers)
         query = (
+            "WITH cte AS ("
             "SELECT "
             f"{self._lot_col} AS lot_no, "
             f"{self._start_col} AS start_time, "
             f"{self._end_col} AS end_time, "
-            f"{self._record_col} AS record_json "
-            f" FROM {self._table} "
-            "WHERE ("
-            f"({self._end_col} IS NOT NULL AND {self._end_col} >= ? AND {self._end_col} <= ?) "
-            "OR "
-            f"({self._end_col} IS NULL AND {self._start_col} >= ? AND {self._start_col} <= ?)"
+            f"{self._record_col} AS record_json, "
+            f"{self._update_col} AS update_time, "
+            "ROW_NUMBER() OVER (PARTITION BY "
+            f"{self._lot_col} ORDER BY {self._update_col} DESC, {self._start_col} DESC, {self._end_col} DESC) AS rn "
+            f"FROM {self._table} "
+            f"WHERE {self._update_col} >= ? AND {self._update_col} <= ? "
+            f"AND ({marker_filter})"
             ") "
-            "ORDER BY COALESCE(end_time, start_time) ASC, lot_no ASC, start_time ASC, end_time ASC "
-            "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+            "SELECT lot_no, start_time, end_time, record_json, update_time "
+            "FROM cte WHERE rn = 1 "
+            "ORDER BY update_time ASC, lot_no ASC, start_time ASC, end_time ASC"
         )
         params: list[Any] = [
             start_time,
             end_time,
-            start_time,
-            end_time,
-            offset,
-            settings.max_fetch_batch,
+            *self._sql_tray_markers,
         ]
         return await self._conn.query_rows(query, params, query_name=query_name)
 
@@ -243,29 +232,51 @@ class FpcRepo:
                 continue
 
             raw_json = row.get("record_json")
-            parsed_json = _parse_json(raw_json)
-            if parsed_json is None:
-                skipped_bad_json += 1
-            raw_text = _stringify_record_json(raw_json, parsed_json)
+            raw_text = _stringify_record_json(raw_json, None)
             token = _extract_token(raw_text)
             lot_value = row.get("lot_no")
             lot_no = str(lot_value).strip() if lot_value is not None else ""
             if token is None and lot_no:
                 token = _extract_token(lot_no)
-            if token is None and self._keyword:
-                skipped_no_token += 1
-                continue
-            searchable = f"{raw_text} {lot_no} {token or ''}".upper()
-            if self._keyword and self._keyword not in searchable:
-                skipped_no_token += 1
-                continue
+            if self._keyword:
+                if token is None:
+                    skipped_no_token += 1
+                    continue
+                searchable = f"{raw_text} {lot_no} {token or ''}".upper()
+                if self._keyword not in searchable:
+                    skipped_no_token += 1
+                    continue
 
-            tray_key, tray_source = _extract_tray_id_key(
-                parsed_json=parsed_json,
-                raw_text=raw_text,
-                primary_key=self._tray_key,
-                fallback_keys=("TRAYID", "TRAY_ID", "TRAYBARCODE", "TRAY_BARCODE"),
-            )
+            tray_key = ""
+            tray_source = ""
+            tray_text_direct = _find_text_value(raw_text, self._tray_key)
+            if tray_text_direct is not None:
+                tray_key = _normalize_tray_id(tray_text_direct)
+                if not _is_plausible_tray_id(tray_key):
+                    tray_key = ""
+            if not tray_key:
+                for key_name in ("TRAYID", "TRAY_ID", "TRAYBARCODE", "TRAY_BARCODE"):
+                    value = _find_text_value(raw_text, key_name)
+                    if value is None:
+                        continue
+                    candidate = _normalize_tray_id(value)
+                    if _is_plausible_tray_id(candidate):
+                        tray_key = candidate
+                        tray_source = "text"
+                        break
+            if tray_key and not tray_source:
+                tray_source = "text"
+            parsed_json = None
+            if not tray_key:
+                parsed_json = _parse_json(raw_json)
+                if parsed_json is None:
+                    skipped_bad_json += 1
+                tray_key, tray_source = _extract_tray_id_key(
+                    parsed_json=parsed_json,
+                    raw_text=raw_text,
+                    primary_key=self._tray_key,
+                    fallback_keys=("TRAYID", "TRAY_ID", "TRAYBARCODE", "TRAY_BARCODE"),
+                )
             if not tray_key:
                 skipped_no_tray += 1
                 continue
@@ -281,6 +292,7 @@ class FpcRepo:
             if stat is None:
                 stat = {
                     "cell_count": 0,
+                    "seen_lots": set(),
                     "first_start_time": None,
                     "last_end_time": None,
                     "latest_signal_time": collected_time,
@@ -289,7 +301,13 @@ class FpcRepo:
                 }
                 per_tray[tray_key] = stat
 
-            stat["cell_count"] += 1
+            if lot_no:
+                seen_lots = stat["seen_lots"]
+                if lot_no not in seen_lots:
+                    seen_lots.add(lot_no)
+                    stat["cell_count"] += 1
+            else:
+                stat["cell_count"] += 1
             if lot_no:
                 stat["latest_lot_no"] = lot_no
             if token:
@@ -392,6 +410,22 @@ def _find_json_value(obj: Any, target_key: str) -> Any | None:
             if found is not None:
                 return found
     return None
+
+
+def _build_sql_marker_patterns(primary_key: str, *, fallback_keys: tuple[str, ...]) -> tuple[str, ...]:
+    keys = [primary_key, *fallback_keys]
+    out: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        normalized = str(key).strip()
+        if not normalized:
+            continue
+        upper = normalized.upper()
+        if upper in seen:
+            continue
+        seen.add(upper)
+        out.append(f"%{normalized}%")
+    return tuple(out)
 
 
 def _stringify_record_json(raw_json: Any, parsed_json: Any | None) -> str:

@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     initial_load_start_hour: int = 0
     initial_load_lookback_hours: float = Field(default=72.0, ge=0.0, le=720.0)
     ui_data_window_days: int = Field(default=2, ge=1, le=3)
-    delta_poll_interval_seconds: float = Field(default=1.0, ge=0.1)
+    delta_poll_interval_seconds: float = Field(default=1.0, ge=0.5, le=60.0)
     delta_poll_idle_interval_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
     delta_overlap_seconds: float = Field(default=2.0, ge=0.0, le=120.0)
     initial_partial_publish_min_changed: int = Field(default=20, ge=1, le=5000)
@@ -99,6 +99,8 @@ class Settings(BaseSettings):
     target_aging_tolerance_hours: float = Field(default=1.0, ge=0.0, le=24.0)
     assembly_auto_trolley_count: int = Field(default=1, ge=1, le=20)
     auto_group_default_enabled: bool = False
+    auto_group_gap_minutes: int = Field(default=10, ge=0, le=240)
+    total_trolley_count: int = Field(default=99, ge=1, le=999)
 
     snapshot_file: str = ".state_snapshot.json"
 

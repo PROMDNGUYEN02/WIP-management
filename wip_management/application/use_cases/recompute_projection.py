@@ -26,6 +26,7 @@ class RecomputeProjectionUseCase:
         max_per_trolley: int = 30,
         assembly_auto_trolley_count: int = 1,
         auto_group_enabled: bool = True,
+        total_trolley_count: int = 99,
     ) -> Projection:
         grouped = build_trolley_projection(
             trays,
@@ -33,6 +34,7 @@ class RecomputeProjectionUseCase:
             max_per_trolley=max_per_trolley,
             assembly_auto_trolley_count=assembly_auto_trolley_count,
             auto_group_enabled=auto_group_enabled,
+            total_trolley_count=total_trolley_count,
         )
         trolleys = [
             *grouped.assembly_trolleys,

@@ -18,14 +18,14 @@ from wip_management.application.ports import (
     FpcRepoPort,
     GroupingStateRepoPort,
 )
-from wip_management.application.state.state_store import SingleWriterStateStore
+from wip_management.application.state.state_store import SingleWriterStateStore, StoreApplyResult
 from wip_management.application.use_cases.ingest_signals import IngestResult, IngestSignalsUseCase
 from wip_management.application.use_cases.manual_group import ManualGroupUseCase
 from wip_management.application.use_cases.recompute_projection import Projection, RecomputeProjectionUseCase
 from wip_management.config import settings
 from wip_management.domain.events import SnapshotReady, TrolleyUpdated, TrayUpdated
-from wip_management.domain.models.tray import Tray, TrayId, TraySignal, Watermark
-from wip_management.domain.models.trolley import Column
+from wip_management.domain.models.tray import SignalSource, Tray, TrayId, TraySignal, Watermark
+from wip_management.domain.models.trolley import Column, TrolleyMode
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +67,7 @@ class OrchestratorService:
         max_parallel_workers: int,
         snapshot_limit: int,
         max_trays_per_trolley: int,
+        total_trolley_count: int,
         assembly_auto_trolley_count: int,
         auto_group_enabled: bool,
         grouping_sync_interval_seconds: float,
@@ -94,6 +95,7 @@ class OrchestratorService:
         )
         self._snapshot_limit = snapshot_limit
         self._max_trays_per_trolley = max_trays_per_trolley
+        self._total_trolley_count = max(1, int(total_trolley_count))
         self._assembly_auto_trolley_count = assembly_auto_trolley_count
         self._auto_group_enabled = auto_group_enabled
         self._grouping_sync_interval = timedelta(seconds=grouping_sync_interval_seconds)
@@ -140,12 +142,16 @@ class OrchestratorService:
         self._scheduled_backfill_latest_hint: datetime | None = None
         self._scheduled_backfill_allow_historical_scan = False
         self._scheduled_backfill_allow_targeted_lookup = False
+        self._window_backfill_task: asyncio.Task[None] | None = None
+        self._scheduled_window_backfill_start: datetime | None = None
+        self._window_backfill_generation = 0
         self._forced_delta_next_at: datetime | None = None
         self._forced_delta_interval = timedelta(
             seconds=max(self._delta_poll_idle_interval_seconds, self._delta_poll_interval_seconds * 8.0),
         )
         self._projection_cache_key: tuple | None = None
         self._projection_cache_value: Projection | None = None
+        self._loaded_window_start: datetime | None = None
 
     async def start(self) -> None:
         if self._running:
@@ -173,9 +179,13 @@ class OrchestratorService:
         self._scheduled_backfill_latest_hint = None
         self._scheduled_backfill_allow_historical_scan = False
         self._scheduled_backfill_allow_targeted_lookup = False
+        self._window_backfill_task = None
+        self._scheduled_window_backfill_start = None
+        self._window_backfill_generation = 0
         self._forced_delta_next_at = None
         self._projection_cache_key = None
         self._projection_cache_value = None
+        self._loaded_window_start = None
         self._running = True
         self._stop_event.clear()
         self._bootstrap_in_progress = True
@@ -211,6 +221,11 @@ class OrchestratorService:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._backfill_task
             self._backfill_task = None
+        if self._window_backfill_task is not None:
+            self._window_backfill_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._window_backfill_task
+            self._window_backfill_task = None
         for task in list(self._tray_cells_inflight.values()):
             task.cancel()
         if self._tray_cells_inflight:
@@ -224,9 +239,12 @@ class OrchestratorService:
         self._scheduled_backfill_latest_hint = None
         self._scheduled_backfill_allow_historical_scan = False
         self._scheduled_backfill_allow_targeted_lookup = False
+        self._scheduled_window_backfill_start = None
+        self._window_backfill_generation = 0
         self._forced_delta_next_at = None
         self._projection_cache_key = None
         self._projection_cache_value = None
+        self._loaded_window_start = None
         self._executor.shutdown(wait=True, cancel_futures=False)
         await self._store.stop()
         await _maybe_close(self._dashboard_repo)
@@ -252,14 +270,35 @@ class OrchestratorService:
         projection = await self._compute_projection()
         return _projection_to_payload(projection)
 
+    async def data_window_loading_status(self, *, data_window_days: int | None = None) -> dict[str, object]:
+        now = self._clock.now()
+        days = self._ui_data_window_days if data_window_days is None else _normalize_data_window_days(data_window_days)
+        requested_start = self._window_start_for_days(end_time=now, days=days)
+        loaded_start = self._loaded_window_start
+        scheduled_start = self._scheduled_window_backfill_start
+        task = self._window_backfill_task
+        backfill_running = bool(task is not None and (not task.done()))
+        ready = bool(loaded_start is not None and loaded_start <= requested_start)
+        return {
+            "data_window_days": days,
+            "requested_start": requested_start.isoformat(),
+            "loaded_start": loaded_start.isoformat() if loaded_start is not None else None,
+            "scheduled_start": scheduled_start.isoformat() if scheduled_start is not None else None,
+            "backfill_running": backfill_running,
+            "ready": ready,
+        }
+
     def _window_start(self, end_time: datetime) -> datetime:
+        return self._window_start_for_days(end_time=end_time, days=self._ui_data_window_days)
+
+    def _window_start_for_days(self, *, end_time: datetime, days: int) -> datetime:
         day_anchor = end_time.replace(
             hour=self._initial_load_start_hour,
             minute=0,
             second=0,
             microsecond=0,
         )
-        day_offset = max(self._ui_data_window_days - 1, 0)
+        day_offset = max(int(days) - 1, 0)
         return day_anchor - timedelta(days=day_offset)
 
     def _filter_trays_for_data_window(self, trays: list[Tray], *, end_time: datetime) -> list[Tray]:
@@ -377,6 +416,15 @@ class OrchestratorService:
         log.info("Manual rename trolley apply old=%s new=%s", old_id, new_id)
         await self._sync_manual_assignments_from_repo(force=True)
         changed = self._manual_group.rename_trolley(old_id, new_id)
+        promoted_from_auto = 0
+        if changed == 0:
+            projection = await self._compute_projection()
+            promoted_from_auto = self._promote_auto_trolleys_to_manual(
+                projection,
+                source_trolley_id=old_id,
+                target_trolley_id=new_id,
+            )
+            changed += promoted_from_auto
         session_updated = 0
         if self._dashboard_repo is not None:
             session_updated = await self._dashboard_repo.rename_open_session_trolley(
@@ -384,7 +432,7 @@ class OrchestratorService:
                 new_trolley_id=new_id,
             )
         if changed == 0 and session_updated == 0:
-            raise ValueError(f"No manual tray assignments found for trolley_id={old_id}")
+            raise ValueError(f"No tray assignments found for trolley_id={old_id}")
         await self._persist_manual_assignments_to_repo()
         projection = await self._compute_projection()
         await self._publish_trolley_updated(projection)
@@ -392,6 +440,7 @@ class OrchestratorService:
             "old_trolley_id": old_id,
             "new_trolley_id": new_id,
             "updated": changed,
+            "promoted_from_auto": promoted_from_auto,
             "session_updated": session_updated,
         }
 
@@ -399,16 +448,55 @@ class OrchestratorService:
         enabled = bool(enabled)
         if self._auto_group_enabled == enabled:
             return {"changed": False, "auto_group_enabled": enabled}
+        promoted_auto = 0
+        if not enabled:
+            await self._sync_manual_assignments_from_repo(force=True)
+            projection_before_disable = await self._compute_projection()
+            promoted_auto = self._promote_auto_trolleys_to_manual(projection_before_disable)
+            if promoted_auto > 0:
+                await self._persist_manual_assignments_to_repo()
         self._auto_group_enabled = enabled
         projection = await self._compute_projection()
         await self._publish_trolley_updated(projection)
-        log.info("Auto group mode changed enabled=%s", enabled)
-        return {"changed": True, "auto_group_enabled": enabled}
+        log.info("Auto group mode changed enabled=%s promoted_auto=%s", enabled, promoted_auto)
+        return {
+            "changed": True,
+            "auto_group_enabled": enabled,
+            "promoted_auto": promoted_auto,
+        }
+
+    def _promote_auto_trolleys_to_manual(
+        self,
+        projection: Projection,
+        *,
+        source_trolley_id: str | None = None,
+        target_trolley_id: str | None = None,
+    ) -> int:
+        source_id = str(source_trolley_id or "").strip()
+        target_id = str(target_trolley_id or "").strip()
+        promoted = 0
+        for trolley in projection.trolleys:
+            if trolley.mode is not TrolleyMode.AUTO:
+                continue
+            trolley_id = str(trolley.trolley_id).strip()
+            if source_id and trolley_id != source_id:
+                continue
+            tray_ids = [str(tray_id).strip() for tray_id in trolley.tray_ids if str(tray_id).strip()]
+            if not tray_ids:
+                continue
+            assign_trolley_id = target_id or trolley_id
+            promoted += self._manual_group.group_many_to_trolley(
+                [TrayId(tray_id) for tray_id in tray_ids],
+                trolley_id=assign_trolley_id,
+                column=trolley.column,
+            )
+        return promoted
 
     async def update_grouping_settings(
         self,
         *,
         max_trays_per_trolley: int | None = None,
+        total_trolley_count: int | None = None,
         refresh_interval_seconds: float | None = None,
         data_window_days: int | None = None,
     ) -> dict[str, object]:
@@ -423,10 +511,19 @@ class OrchestratorService:
                 self._max_trays_per_trolley = normalized
                 changed = True
             payload["max_trays_per_trolley"] = self._max_trays_per_trolley
+        if total_trolley_count is not None:
+            normalized_total = int(total_trolley_count)
+            if normalized_total <= 0:
+                raise ValueError("total_trolley_count must be > 0")
+            if self._total_trolley_count != normalized_total:
+                self._total_trolley_count = normalized_total
+                settings.total_trolley_count = normalized_total
+                changed = True
+            payload["total_trolley_count"] = self._total_trolley_count
         if refresh_interval_seconds is not None:
             refresh_interval = float(refresh_interval_seconds)
-            if refresh_interval <= 0:
-                raise ValueError("refresh_interval_seconds must be > 0")
+            if refresh_interval < 0.5 or refresh_interval > 60.0:
+                raise ValueError("refresh_interval_seconds must be between 0.5 and 60.0")
             if self._delta_poll_interval_seconds != refresh_interval:
                 self._delta_poll_interval_seconds = refresh_interval
                 settings.delta_poll_interval_seconds = refresh_interval
@@ -438,17 +535,33 @@ class OrchestratorService:
         if data_window_days is not None:
             normalized_days = _normalize_data_window_days(data_window_days)
             if self._ui_data_window_days != normalized_days:
+                previous_window_start = self._window_start(now)
                 self._ui_data_window_days = normalized_days
-                self._initial_load_lookback_hours = float(normalized_days * 24)
+                self._initial_load_lookback_hours = _lookback_hours_for_window_days(normalized_days)
                 settings.ui_data_window_days = normalized_days
                 settings.initial_load_lookback_hours = self._initial_load_lookback_hours
                 settings.ccu_backfill_lookback_hours = self._initial_load_lookback_hours
                 changed = True
-                rescan_result = await self._run_full_window_scan(now)
-                self._invalidate_tray_detail_cache_for_trays(rescan_result.store_result.changed)
-                await self._set_data_watermark(rescan_result.watermark, fallback_time=now)
-                payload["window_rescan_merged"] = len(rescan_result.merged)
-                payload["window_rescan_changed"] = len(rescan_result.store_result.changed)
+                desired_window_start = self._window_start(now)
+                if self._loaded_window_start is None:
+                    # Do not run synchronous full window rescan on settings update because it blocks UI actions.
+                    # Reuse current in-memory state immediately; background delta/backfill keeps filling missing data.
+                    payload["window_reuse"] = True
+                    payload["window_loaded_start"] = None
+                    payload["window_scan_skipped"] = True
+                elif desired_window_start < self._loaded_window_start:
+                    payload["window_reuse"] = True
+                    payload["window_backfill_scheduled"] = self._schedule_window_backfill(
+                        requested_start=desired_window_start,
+                        reason="settings-window-expand",
+                    )
+                    payload["window_requested_start"] = desired_window_start.isoformat()
+                    payload["window_loaded_start"] = self._loaded_window_start.isoformat()
+                else:
+                    self._cancel_window_backfill(reason="settings-window-shrink-or-reuse")
+                    payload["window_reuse"] = True
+                    payload["window_previous_start"] = previous_window_start.isoformat()
+                    payload["window_loaded_start"] = self._loaded_window_start.isoformat()
             payload["data_window_days"] = self._ui_data_window_days
             payload["initial_load_lookback_hours"] = self._initial_load_lookback_hours
         if changed:
@@ -671,6 +784,13 @@ class OrchestratorService:
             self._ui_data_window_days,
             self._initial_load_lookback_hours,
         )
+        warm_started = await self._warm_start_from_projection(window_start=start, now=now)
+        if warm_started:
+            log.info(
+                "Initial load warm-start completed elapsed_ms=%s source=shared_projection",
+                int((time.perf_counter() - started_at) * 1000),
+            )
+            return
         previous = await self._delta_tracker.get()
         if self._supports_fpc_initial_streaming():
             await self._initial_load_with_fpc_stream(
@@ -761,6 +881,8 @@ class OrchestratorService:
             allow_targeted_lookup=self._ccu_backfill_allow_targeted_lookup,
             reason="initial-load-final",
         )
+        if self._loaded_window_start is None or start < self._loaded_window_start:
+            self._loaded_window_start = start
         self._invalidate_tray_detail_cache_for_trays(result.store_result.changed)
         await self._set_data_watermark(result.watermark, fallback_time=now)
         projection = await self._compute_projection()
@@ -782,6 +904,52 @@ class OrchestratorService:
     def _supports_fpc_initial_streaming(self) -> bool:
         stream_method = getattr(self._fpc_repo, "iter_initial_chunks", None)
         return callable(stream_method)
+
+    async def _warm_start_from_projection(self, *, window_start: datetime, now: datetime) -> bool:
+        if self._grouping_state_repo is None:
+            return False
+        try:
+            cached_projection = await self._grouping_state_repo.load_projection()
+        except Exception:  # noqa: BLE001
+            log.exception("Warm start failed to load shared projection")
+            return False
+        tray_rows_raw = cached_projection.get("trays")
+        if not isinstance(tray_rows_raw, list) or not tray_rows_raw:
+            return False
+        tray_rows = [row for row in tray_rows_raw if isinstance(row, dict)]
+        if not tray_rows:
+            return False
+
+        ccu_signals, fpc_signals = _tray_rows_to_signals(tray_rows, fallback_time=now)
+        if not ccu_signals and not fpc_signals:
+            return False
+
+        warm_watermark = _watermark_from_projection_payload(cached_projection, tray_rows)
+        result = await self._ingest.execute(ccu_signals, fpc_signals, previous_watermark=warm_watermark)
+        loaded_window_start = _parse_datetime_safe(cached_projection.get("loaded_window_start"))
+        if loaded_window_start is None:
+            loaded_window_start = window_start
+        self._loaded_window_start = loaded_window_start
+        self._invalidate_tray_detail_cache_for_trays(result.store_result.changed)
+        await self._set_data_watermark(warm_watermark or result.watermark, fallback_time=now)
+        self._schedule_ccu_backfill(
+            result.store_result.missing_ccu_tray_ids,
+            allow_historical_scan=True,
+            allow_targeted_lookup=self._ccu_backfill_allow_targeted_lookup,
+            reason="warm-start-shared-projection",
+        )
+        projection = await self._compute_projection()
+        await self._publish_snapshot_ready(projection)
+        await self._save_projection_to_repo(projection)
+        log.info(
+            "Warm start applied trays=%s ccu=%s fpc=%s watermark=%s loaded_window_start=%s",
+            len(tray_rows),
+            len(ccu_signals),
+            len(fpc_signals),
+            (warm_watermark.collected_time.isoformat() if warm_watermark else None),
+            loaded_window_start.isoformat(),
+        )
+        return True
 
     async def _initial_load_with_fpc_stream(
         self,
@@ -862,6 +1030,9 @@ class OrchestratorService:
 
         merged_count = len({item.dedup_key for item in [*norm_ccu, *fpc_result.norm_signals]})
         initial_watermark = _watermark_from_signals([*norm_ccu, *fpc_result.norm_signals], previous=previous)
+        if (not ccu_failed) and (not fpc_failed):
+            if self._loaded_window_start is None or start < self._loaded_window_start:
+                self._loaded_window_start = start
         await self._set_data_watermark(initial_watermark, fallback_time=end)
         projection = await self._publish_initial_partial_snapshot(
             source="final",
@@ -1208,6 +1379,8 @@ class OrchestratorService:
             )
         previous = await self._delta_tracker.get()
         result = await self._ingest.execute(norm_ccu, norm_fpc, previous_watermark=previous)
+        if self._loaded_window_start is None or start < self._loaded_window_start:
+            self._loaded_window_start = start
         log.info(
             "Full window scan done elapsed_ms=%s ccu=%s fpc=%s merged=%s ccu_unique=%s fpc_unique=%s raw_overlap=%s",
             int((time.perf_counter() - started_at) * 1000),
@@ -1219,6 +1392,200 @@ class OrchestratorService:
             len(raw_overlap),
         )
         return result
+
+    async def _backfill_window_range(
+        self,
+        *,
+        start_time: datetime,
+        end_time: datetime,
+        expected_generation: int | None = None,
+    ) -> IngestResult:
+        if expected_generation is not None and expected_generation != self._window_backfill_generation:
+            log.info(
+                "Window backfill skip obsolete generation expected=%s current=%s start=%s end=%s",
+                expected_generation,
+                self._window_backfill_generation,
+                start_time.isoformat(),
+                end_time.isoformat(),
+            )
+            previous = await self._delta_tracker.get()
+            return IngestResult(
+                merged=[],
+                store_result=StoreApplyResult(changed=[], missing_ccu_tray_ids=set()),
+                watermark=previous,
+            )
+        if end_time <= start_time:
+            previous = await self._delta_tracker.get()
+            return IngestResult(
+                merged=[],
+                store_result=StoreApplyResult(changed=[], missing_ccu_tray_ids=set()),
+                watermark=previous,
+            )
+        started_at = time.perf_counter()
+        ccu_rows, fpc_rows = await asyncio.gather(
+            self._ccu_repo.fetch_initial(start_time=start_time, end_time=end_time),
+            self._fpc_repo.fetch_initial(start_time=start_time, end_time=end_time),
+        )
+        if expected_generation is not None and expected_generation != self._window_backfill_generation:
+            log.info(
+                "Window backfill discard fetched rows due obsolete generation expected=%s current=%s start=%s end=%s ccu_rows=%s fpc_rows=%s",
+                expected_generation,
+                self._window_backfill_generation,
+                start_time.isoformat(),
+                end_time.isoformat(),
+                len(ccu_rows),
+                len(fpc_rows),
+            )
+            previous = await self._delta_tracker.get()
+            return IngestResult(
+                merged=[],
+                store_result=StoreApplyResult(changed=[], missing_ccu_tray_ids=set()),
+                watermark=previous,
+            )
+        required_start = self._window_start(self._clock.now())
+        if start_time < required_start:
+            log.info(
+                "Window backfill discard obsolete range start=%s required_start=%s end=%s",
+                start_time.isoformat(),
+                required_start.isoformat(),
+                end_time.isoformat(),
+            )
+            previous = await self._delta_tracker.get()
+            return IngestResult(
+                merged=[],
+                store_result=StoreApplyResult(changed=[], missing_ccu_tray_ids=set()),
+                watermark=previous,
+            )
+        norm_ccu, norm_fpc = await asyncio.gather(
+            self._normalize_signals(ccu_rows),
+            self._normalize_signals(fpc_rows),
+        )
+        previous = await self._delta_tracker.get()
+        result = await self._ingest.execute(norm_ccu, norm_fpc, previous_watermark=previous)
+        if self._loaded_window_start is None or start_time < self._loaded_window_start:
+            self._loaded_window_start = start_time
+        log.info(
+            "Window backfill done elapsed_ms=%s start=%s end=%s ccu=%s fpc=%s merged=%s changed=%s",
+            int((time.perf_counter() - started_at) * 1000),
+            start_time.isoformat(),
+            end_time.isoformat(),
+            len(norm_ccu),
+            len(norm_fpc),
+            len(result.merged),
+            len(result.store_result.changed),
+        )
+        return result
+
+    def _schedule_window_backfill(self, *, requested_start: datetime, reason: str) -> bool:
+        if not self._running:
+            return False
+        if self._loaded_window_start is None:
+            return False
+        if requested_start >= self._loaded_window_start:
+            return False
+        if self._scheduled_window_backfill_start is None or requested_start < self._scheduled_window_backfill_start:
+            self._scheduled_window_backfill_start = requested_start
+        if self._window_backfill_task is not None and (not self._window_backfill_task.done()):
+            log.info(
+                "Window backfill schedule merged reason=%s requested_start=%s loaded_start=%s generation=%s",
+                reason,
+                requested_start.isoformat(),
+                self._loaded_window_start.isoformat(),
+                self._window_backfill_generation,
+            )
+            return True
+        self._window_backfill_generation += 1
+        generation = self._window_backfill_generation
+        self._window_backfill_task = asyncio.create_task(
+            self._run_scheduled_window_backfill(reason=reason, generation=generation),
+            name="wip-window-backfill-worker",
+        )
+        log.info(
+            "Window backfill scheduled reason=%s requested_start=%s loaded_start=%s generation=%s",
+            reason,
+            requested_start.isoformat(),
+            self._loaded_window_start.isoformat(),
+            generation,
+        )
+        return True
+
+    def _cancel_window_backfill(self, *, reason: str) -> None:
+        self._scheduled_window_backfill_start = None
+        self._window_backfill_generation += 1
+        if self._window_backfill_task is None or self._window_backfill_task.done():
+            return
+        self._window_backfill_task.cancel()
+        log.info(
+            "Window backfill cancel requested reason=%s generation=%s",
+            reason,
+            self._window_backfill_generation,
+        )
+
+    async def _run_scheduled_window_backfill(self, *, reason: str, generation: int) -> None:
+        try:
+            while self._running:
+                if generation != self._window_backfill_generation:
+                    log.info(
+                        "Window backfill worker stop obsolete reason=%s worker_generation=%s current_generation=%s",
+                        reason,
+                        generation,
+                        self._window_backfill_generation,
+                    )
+                    break
+                target_start = self._scheduled_window_backfill_start
+                loaded_start = self._loaded_window_start
+                self._scheduled_window_backfill_start = None
+                if target_start is None or loaded_start is None or target_start >= loaded_start:
+                    break
+                required_start = self._window_start(self._clock.now())
+                if target_start < required_start:
+                    log.info(
+                        "Window backfill clamp target_start from %s to %s reason=%s generation=%s",
+                        target_start.isoformat(),
+                        required_start.isoformat(),
+                        reason,
+                        generation,
+                    )
+                    target_start = required_start
+                if target_start >= loaded_start:
+                    break
+                result = await self._backfill_window_range(
+                    start_time=target_start,
+                    end_time=loaded_start,
+                    expected_generation=generation,
+                )
+                if generation != self._window_backfill_generation:
+                    log.info(
+                        "Window backfill worker ignore result obsolete reason=%s worker_generation=%s current_generation=%s",
+                        reason,
+                        generation,
+                        self._window_backfill_generation,
+                    )
+                    break
+                self._invalidate_tray_detail_cache_for_trays(result.store_result.changed)
+                await self._set_data_watermark(result.watermark, fallback_time=self._clock.now())
+                if result.store_result.changed:
+                    # Window backfill can touch many historical trays; publish projection only to avoid UI event flood.
+                    projection = await self._compute_projection()
+                    await self._publish_trolley_updated(projection)
+                log.info(
+                    "Window backfill worker step reason=%s target_start=%s loaded_start=%s merged=%s changed=%s generation=%s",
+                    reason,
+                    target_start.isoformat(),
+                    loaded_start.isoformat(),
+                    len(result.merged),
+                    len(result.store_result.changed),
+                    generation,
+                )
+            log.info("Window backfill worker completed reason=%s generation=%s", reason, generation)
+        except asyncio.CancelledError:
+            log.info("Window backfill worker cancelled reason=%s generation=%s", reason, generation)
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("Window backfill worker failed reason=%s generation=%s", reason, generation)
+        finally:
+            if self._window_backfill_task is not None and self._window_backfill_task.done():
+                self._window_backfill_task = None
 
     async def _run_delta_scan(self, *, watermark: Watermark, end_time: datetime) -> IngestResult:
         started_at = time.perf_counter()
@@ -1628,6 +1995,7 @@ class OrchestratorService:
             store_version,
             manual_signature,
             self._max_trays_per_trolley,
+            self._total_trolley_count,
             self._assembly_auto_trolley_count,
             self._auto_group_enabled,
             self._ui_data_window_days,
@@ -1648,6 +2016,7 @@ class OrchestratorService:
             snapshot,
             manual_assignments=manual_assignments,
             max_per_trolley=self._max_trays_per_trolley,
+            total_trolley_count=self._total_trolley_count,
             assembly_auto_trolley_count=self._assembly_auto_trolley_count,
             auto_group_enabled=self._auto_group_enabled,
         )
@@ -1742,7 +2111,13 @@ class OrchestratorService:
     async def _save_projection_to_repo(self, projection: Projection) -> None:
         if self._grouping_state_repo is None:
             return
-        payload = _projection_grouping_payload(projection)
+        watermark = await self._delta_tracker.get()
+        payload = _projection_grouping_payload(
+            projection,
+            watermark=watermark,
+            loaded_window_start=self._loaded_window_start,
+            data_window_days=self._ui_data_window_days,
+        )
         try:
             await self._grouping_state_repo.save_projection(payload)
         except Exception:  # noqa: BLE001
@@ -1824,6 +2199,11 @@ def _normalize_data_window_days(value: int) -> int:
     return days
 
 
+def _lookback_hours_for_window_days(days: int) -> float:
+    normalized_days = _normalize_data_window_days(days)
+    return float((normalized_days + 1) * 24)
+
+
 def _projection_to_payload(projection: Projection) -> dict[str, object]:
     return {
         "trays": [tray.to_dict() for tray in projection.trays],
@@ -1834,13 +2214,138 @@ def _projection_to_payload(projection: Projection) -> dict[str, object]:
     }
 
 
-def _projection_grouping_payload(projection: Projection) -> dict[str, object]:
+def _projection_grouping_payload(
+    projection: Projection,
+    *,
+    watermark: Watermark | None,
+    loaded_window_start: datetime | None,
+    data_window_days: int,
+) -> dict[str, object]:
     return {
+        "trays": [tray.to_dict() for tray in projection.trays],
         "assembly_trolleys": [trolley.to_dict() for trolley in projection.assembly_trolleys],
         "queue_trolleys": [trolley.to_dict() for trolley in projection.queue_trolleys],
         "precharge_trolleys": [trolley.to_dict() for trolley in projection.precharge_trolleys],
+        "assembly_ungrouped": [tray.to_dict() for tray in projection.assembly_ungrouped],
         "assembly_ungrouped_tray_ids": [str(tray.tray_id) for tray in projection.assembly_ungrouped],
+        "data_window_days": int(data_window_days),
+        "loaded_window_start": loaded_window_start.isoformat() if loaded_window_start is not None else None,
+        "data_watermark": (
+            {
+                "collected_time": watermark.collected_time.isoformat(),
+                "tray_id": watermark.tray_id,
+            }
+            if watermark is not None
+            else None
+        ),
     }
+
+
+def _watermark_from_projection_payload(
+    payload: dict[str, Any],
+    tray_rows: list[dict[str, Any]],
+) -> Watermark | None:
+    raw = payload.get("data_watermark")
+    if isinstance(raw, dict):
+        collected_time = _parse_datetime_safe(raw.get("collected_time"))
+        if collected_time is not None:
+            tray_id = str(raw.get("tray_id") or "").strip()
+            return Watermark(collected_time=collected_time, tray_id=tray_id)
+
+    latest_time: datetime | None = None
+    latest_tray_id = ""
+    for row in tray_rows:
+        collected = _parse_datetime_safe(row.get("latest_collected_time"))
+        if collected is None:
+            continue
+        tray_id = str(row.get("tray_id") or "").strip()
+        if latest_time is None or collected > latest_time:
+            latest_time = collected
+            latest_tray_id = tray_id
+    if latest_time is None:
+        return None
+    return Watermark(collected_time=latest_time, tray_id=latest_tray_id)
+
+
+def _tray_rows_to_signals(
+    tray_rows: list[dict[str, Any]],
+    *,
+    fallback_time: datetime,
+) -> tuple[list[TraySignal], list[TraySignal]]:
+    ccu_signals: list[TraySignal] = []
+    fpc_signals: list[TraySignal] = []
+    for row in tray_rows:
+        tray_id_text = str(row.get("tray_id") or "").strip()
+        if not tray_id_text:
+            continue
+        tray_id = TrayId(tray_id_text)
+        latest_time = _parse_datetime_safe(row.get("latest_collected_time"))
+
+        ccu_payload_raw = row.get("ccu_payload")
+        if isinstance(ccu_payload_raw, dict):
+            ccu_payload = {str(k): v for k, v in ccu_payload_raw.items()}
+            ccu_time = _signal_time_from_payload(
+                payload=ccu_payload,
+                preferred_keys=("end_time", "start_time"),
+                fallback=latest_time or fallback_time,
+            )
+            ccu_signals.append(
+                TraySignal(
+                    source=SignalSource.CCU,
+                    tray_id=tray_id,
+                    collected_time=ccu_time,
+                    payload=ccu_payload,
+                )
+            )
+
+        fpc_payload_raw = row.get("fpc_payload")
+        if isinstance(fpc_payload_raw, dict):
+            fpc_payload = {str(k): v for k, v in fpc_payload_raw.items()}
+            fpc_time = _signal_time_from_payload(
+                payload=fpc_payload,
+                preferred_keys=("precharge_end_time", "precharge_start_time"),
+                fallback=latest_time or fallback_time,
+            )
+            fpc_signals.append(
+                TraySignal(
+                    source=SignalSource.FPC,
+                    tray_id=tray_id,
+                    collected_time=fpc_time,
+                    payload=fpc_payload,
+                )
+            )
+    return ccu_signals, fpc_signals
+
+
+def _signal_time_from_payload(
+    *,
+    payload: dict[str, Any],
+    preferred_keys: tuple[str, ...],
+    fallback: datetime,
+) -> datetime:
+    for key in preferred_keys:
+        parsed = _parse_datetime_safe(payload.get(key))
+        if parsed is not None:
+            return parsed
+    return fallback
+
+
+def _parse_datetime_safe(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is not None:
+            return parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    except ValueError:
+        return None
 
 
 async def _maybe_start(obj: object) -> None:

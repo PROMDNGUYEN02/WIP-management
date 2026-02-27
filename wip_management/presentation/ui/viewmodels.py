@@ -148,7 +148,6 @@ class TrolleyListModel(QAbstractListModel):
 
     def replace_all(self, payload_rows: list[dict[str, Any]]) -> None:
         items = [TrolleyRowVM.from_payload(row) for row in payload_rows if row.get("trolley_id")]
-        items.sort(key=lambda row: row.trolley_id)
         if items == self._rows:
             return
         self.beginResetModel()
@@ -308,10 +307,12 @@ class UngroupTrayTableModel(QAbstractTableModel):
             return None
         return section + 1
 
-    def replace_from_tray_payloads(self, tray_payload_rows: list[dict[str, Any]]) -> None:
-        if self._interaction_hold:
+    def replace_from_tray_payloads(self, tray_payload_rows: list[dict[str, Any]], *, force: bool = False) -> None:
+        if self._interaction_hold and (not force):
             self._pending_tray_payload_rows = list(tray_payload_rows)
             return
+        if force:
+            self._pending_tray_payload_rows = None
         self._apply_tray_payload_rows(tray_payload_rows)
 
     def set_interaction_hold(self, hold: bool) -> None:
@@ -330,7 +331,7 @@ class UngroupTrayTableModel(QAbstractTableModel):
     def _apply_tray_payload_rows(self, tray_payload_rows: list[dict[str, Any]]) -> None:
         started_at = time.perf_counter()
         now = _coarse_now(step_seconds=30)
-        items: list[tuple[datetime | None, UngroupTrayRowVM]] = []
+        items: list[tuple[tuple[datetime, datetime, str], UngroupTrayRowVM]] = []
         for row in tray_payload_rows:
             tray_id = str(row.get("tray_id", "")).strip()
             if not tray_id:
@@ -378,9 +379,15 @@ class UngroupTrayTableModel(QAbstractTableModel):
                 status=status,
                 location=location,
             )
-            items.append((end_dt, vm))
+            production_order_key = (
+                end_dt or datetime.min,
+                precharge_start_dt or datetime.min,
+                tray_id,
+            )
+            items.append((production_order_key, vm))
 
-        items.sort(key=lambda item: (item[0] or datetime.min, item[1].tray_id), reverse=True)
+        items.sort(key=lambda item: item[0], reverse=True)
+
         ordered: list[UngroupTrayRowVM] = []
         for idx, (_, vm) in enumerate(items, start=1):
             ordered.append(
@@ -395,7 +402,6 @@ class UngroupTrayTableModel(QAbstractTableModel):
                     location=vm.location,
                 )
             )
-
         retained = {row.tray_id for row in ordered}
         if self._rows == ordered:
             new_checked = self._checked_tray_ids.intersection(retained)
@@ -623,7 +629,8 @@ class BoardViewModel(QObject):
                 if tray_id:
                     self._tray_cache[tray_id] = row
             self._rebuild_ungroup_pending = False
-            self.assembly_ungrouped_model.replace_from_tray_payloads(ungrouped_rows)
+            # Projection payload is authoritative; apply immediately so summary and list stay consistent.
+            self.assembly_ungrouped_model.replace_from_tray_payloads(ungrouped_rows, force=True)
             return
         self._schedule_rebuild_assembly_ungrouped()
 

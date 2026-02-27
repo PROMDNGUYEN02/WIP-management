@@ -65,6 +65,13 @@ class SharedGroupingStateRepository:
             out[tray_key] = (column, trolley_id)
         return out
 
+    async def load_projection(self) -> dict[str, Any]:
+        document = await asyncio.to_thread(self._read_document_sync)
+        raw = document.get("last_projection")
+        if not isinstance(raw, dict):
+            return {}
+        return dict(raw)
+
     async def set_manual_assignment(self, tray_id: str, column: str, trolley_id: str) -> None:
         tray_key = tray_id.strip()
         column_key = column.strip()
