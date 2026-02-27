@@ -47,6 +47,15 @@ def build_http_router(orchestrator: OrchestratorService) -> APIRouter:
         log.debug("HTTP GET /projection")
         return await orchestrator.projection_snapshot()
 
+    @router.get("/dashboard/trolley-sessions")
+    async def dashboard_trolley_sessions(include_closed: bool = False, only_wip: bool = False) -> dict:
+        log.debug(
+            "HTTP GET /dashboard/trolley-sessions include_closed=%s only_wip=%s",
+            include_closed,
+            only_wip,
+        )
+        return await orchestrator.dashboard_sessions(include_closed=include_closed, only_wip=only_wip)
+
     @router.post("/refresh/manual")
     async def manual_refresh(full_scan: bool = False) -> dict:
         log.info("HTTP POST /refresh/manual full_scan=%s", full_scan)

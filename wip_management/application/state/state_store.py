@@ -35,6 +35,11 @@ class _SizeCommand:
     future: asyncio.Future[int]
 
 
+@dataclass(slots=True)
+class _VersionCommand:
+    future: asyncio.Future[int]
+
+
 class _StopCommand:
     pass
 
@@ -50,6 +55,7 @@ class SingleWriterStateStore:
         self._task: asyncio.Task | None = None
         self._trays: dict[str, Tray] = {}
         self._state_machine = TrayStateMachine()
+        self._version = 0
 
     async def start(self) -> None:
         if self._task is not None:
@@ -89,6 +95,13 @@ class SingleWriterStateStore:
         await self._queue.put(_SizeCommand(future=fut))
         return await fut
 
+    async def version(self) -> int:
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[int] = loop.create_future()
+        log.debug("State store enqueue version")
+        await self._queue.put(_VersionCommand(future=fut))
+        return await fut
+
     async def _writer_loop(self) -> None:
         log.debug("State store writer loop entered")
         while True:
@@ -102,6 +115,9 @@ class SingleWriterStateStore:
                     continue
                 if isinstance(cmd, _SizeCommand):
                     cmd.future.set_result(len(self._trays))
+                    continue
+                if isinstance(cmd, _VersionCommand):
+                    cmd.future.set_result(self._version)
                     continue
                 if isinstance(cmd, _StopCommand):
                     log.debug("State store writer loop received stop command")
@@ -143,6 +159,8 @@ class SingleWriterStateStore:
             len(self._trays),
             len(missing_ccu_ids),
         )
+        if changed:
+            self._version += 1
         return StoreApplyResult(changed=changed, missing_ccu_tray_ids=missing_ccu_ids)
 
     def _snapshot_desc(self, limit: int | None = None) -> list[Tray]:

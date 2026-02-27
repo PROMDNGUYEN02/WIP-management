@@ -29,7 +29,14 @@ class SignalRepoPort(Protocol):
 
 
 class CcuRepoPort(SignalRepoPort, Protocol):
-    async def fetch_by_tray_ids(self, tray_ids: Iterable[str], end_time: datetime) -> list[TraySignal]: ...
+    async def fetch_by_tray_ids(
+        self,
+        tray_ids: Iterable[str],
+        end_time: datetime,
+        *,
+        allow_historical_scan: bool = True,
+        allow_targeted_lookup: bool = True,
+    ) -> list[TraySignal]: ...
 
     async def fetch_tray_cells(
         self,
@@ -70,3 +77,22 @@ class GroupingStateRepoPort(Protocol):
     async def replace_manual_assignments(self, assignments: dict[str, tuple[str, str]]) -> None: ...
 
     async def save_projection(self, projection: dict[str, Any]) -> None: ...
+
+
+class DashboardRepoPort(Protocol):
+    async def ingest_signals(self, signals: list[TraySignal]) -> None: ...
+
+    async def map_trays_to_open_session(self, *, trolley_id: str, tray_ids: list[str]) -> str | None: ...
+
+    async def remove_tray_mappings(self, *, tray_ids: list[str]) -> int: ...
+
+    async def close_open_session(self, *, trolley_id: str) -> str | None: ...
+
+    async def rename_open_session_trolley(self, *, old_trolley_id: str, new_trolley_id: str) -> int: ...
+
+    async def dashboard_sessions(
+        self,
+        *,
+        include_closed: bool = False,
+        only_wip: bool = False,
+    ) -> list[dict[str, Any]]: ...

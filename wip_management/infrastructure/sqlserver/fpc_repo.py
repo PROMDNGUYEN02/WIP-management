@@ -44,7 +44,7 @@ class FpcRepo:
         log.info("FPC initial fetch start start_time=%s end_time=%s", start_time.isoformat(), end_time.isoformat())
         started_at = time.perf_counter()
         rows = await self._fetch_range(start_time=start_time, end_time=end_time)
-        signals = self._rows_to_signals(rows)
+        signals = self._rows_to_signals(rows, min_start_time=start_time)
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
         log.info(
             "FPC initial fetch done elapsed_ms=%s raw_rows=%s signals=%s",
@@ -83,7 +83,7 @@ class FpcRepo:
             chunk += 1
             raw_rows = len(batch)
             total_rows += raw_rows
-            signals = self._rows_to_signals(batch)
+            signals = self._rows_to_signals(batch, min_start_time=start_time)
             total_signals += len(signals)
             log.info(
                 "FPC initial stream chunk=%s raw_rows=%s signals=%s offset=%s",
@@ -106,35 +106,39 @@ class FpcRepo:
 
     async def fetch_delta(self, watermark: Watermark, end_time: datetime) -> list[TraySignal]:
         overlap_start = watermark.collected_time - timedelta(seconds=settings.delta_overlap_seconds)
+        day_start = end_time.replace(hour=settings.initial_load_start_hour, minute=0, second=0, microsecond=0)
+        window_start = max(overlap_start, day_start)
         log.debug(
-            "FPC delta fetch start watermark=%s overlap_start=%s end_time=%s",
+            "FPC delta fetch start watermark=%s overlap_start=%s window_start=%s end_time=%s",
             watermark.collected_time.isoformat(),
             overlap_start.isoformat(),
+            window_start.isoformat(),
             end_time.isoformat(),
         )
         started_at = time.perf_counter()
-        rows = await self._fetch_range(start_time=overlap_start, end_time=end_time)
-        signals = self._rows_to_signals(rows)
+        rows = await self._fetch_range(start_time=window_start, end_time=end_time)
+        signals = self._rows_to_signals(rows, min_start_time=day_start)
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
         log.debug("FPC delta fetch done elapsed_ms=%s raw_rows=%s signals=%s", elapsed_ms, len(rows), len(signals))
         return signals
 
     async def peek_latest_signal_time(self, end_time: datetime) -> datetime | None:
         query = (
-            "SELECT TOP 1 COALESCE("
-            f"{self._end_col}, {self._start_col}"
-            ") AS latest_signal_time "
+            "SELECT TOP 1 latest_signal_time FROM ("
+            f"SELECT MAX({self._end_col}) AS latest_signal_time "
             f"FROM {self._table} "
-            "WHERE COALESCE("
-            f"{self._end_col}, {self._start_col}"
-            ") <= ? "
-            "ORDER BY COALESCE("
-            f"{self._end_col}, {self._start_col}"
-            ") DESC"
+            f"WHERE {self._end_col} IS NOT NULL AND {self._end_col} <= ? "
+            "UNION ALL "
+            f"SELECT MAX({self._start_col}) AS latest_signal_time "
+            f"FROM {self._table} "
+            f"WHERE {self._end_col} IS NULL AND {self._start_col} <= ?"
+            ") AS latest "
+            "WHERE latest_signal_time IS NOT NULL "
+            "ORDER BY latest_signal_time DESC"
         )
         rows = await self._conn.query_rows(
             query,
-            [end_time],
+            [end_time, end_time],
             query_name="fpc.peek_latest_signal_time",
         )
         if not rows:
@@ -209,7 +213,12 @@ class FpcRepo:
         ]
         return await self._conn.query_rows(query, params, query_name=query_name)
 
-    def _rows_to_signals(self, rows: list[dict[str, Any]]) -> list[TraySignal]:
+    def _rows_to_signals(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        min_start_time: datetime | None = None,
+    ) -> list[TraySignal]:
         per_tray: dict[str, dict[str, Any]] = {}
         skipped_no_time = 0
         skipped_bad_json = 0
@@ -218,11 +227,17 @@ class FpcRepo:
         missing_lot_rows = 0
         parsed_from_text = 0
         tray_from_token = 0
+        clamped_start_rows = 0
 
         for row in rows:
             start_time = _coerce_datetime(row.get("start_time"))
             end_time = _coerce_datetime(row.get("end_time"))
+            if min_start_time is not None and start_time is not None and start_time < min_start_time:
+                start_time = min_start_time
+                clamped_start_rows += 1
             collected_time = end_time or start_time
+            if min_start_time is not None and collected_time is not None and collected_time < min_start_time:
+                collected_time = min_start_time
             if collected_time is None:
                 skipped_no_time += 1
                 continue
@@ -312,7 +327,7 @@ class FpcRepo:
         out.sort(key=lambda item: (item.collected_time, str(item.tray_id)))
         log_level = log.warning if rows and not out else log.debug
         log_level(
-            "FPC convert rows done input=%s output=%s skipped_no_time=%s skipped_bad_json=%s skipped_no_token=%s skipped_no_tray=%s missing_lot_rows=%s parsed_from_text=%s tray_from_token=%s keyword=%s",
+            "FPC convert rows done input=%s output=%s skipped_no_time=%s skipped_bad_json=%s skipped_no_token=%s skipped_no_tray=%s missing_lot_rows=%s parsed_from_text=%s tray_from_token=%s clamped_start_rows=%s keyword=%s",
             len(rows),
             len(out),
             skipped_no_time,
@@ -322,6 +337,7 @@ class FpcRepo:
             missing_lot_rows,
             parsed_from_text,
             tray_from_token,
+            clamped_start_rows,
             self._keyword or "<none>",
         )
         return out

@@ -41,13 +41,21 @@ class SQLServerConnection:
                 concurrency_limit = max(1, int(settings.sql_max_concurrent_queries))
                 # Legacy "SQL Server" driver is not stable under high concurrency.
                 if driver.strip().lower() == "sql server":
-                    if concurrency_limit != 1:
+                    if not settings.sql_allow_legacy_parallel_queries:
+                        if concurrency_limit != 1:
+                            log.warning(
+                                "Forcing SQL max concurrent queries to 1 for legacy driver '%s' (configured=%s)",
+                                driver,
+                                concurrency_limit,
+                            )
+                        concurrency_limit = 1
+                    elif concurrency_limit > 1:
                         log.warning(
-                            "Forcing SQL max concurrent queries to 1 for legacy driver '%s' (configured=%s)",
+                            "Legacy SQL driver '%s' running with parallel queries limit=%s. "
+                            "If connection stability drops, disable SQL_ALLOW_LEGACY_PARALLEL_QUERIES.",
                             driver,
                             concurrency_limit,
                         )
-                    concurrency_limit = 1
                 pool_size = max(1, min(8, concurrency_limit))
                 self._pool = await aioodbc.create_pool(
                     dsn=settings.build_odbc_dsn(driver=driver),

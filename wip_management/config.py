@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     sql_schema: str = "dbo"
     ccu_table: str = "TT_WO_RPARAM_RECORD_CCU"
     fpc_table: str = "TT_WO_RPARAM_RECORD_FPC"
+    tray_event_norm_table: str = "WIP_TRAY_EVENT_NORM"
+    trolley_session_table: str = "WIP_TROLLEY_SESSION"
+    tray_timeline_table: str = "WIP_TRAY_TIMELINE"
+    tray_trolley_map_table: str = "WIP_TRAY_TROLLEY_MAP"
     record_filter_keyword: str = ""
 
     tray_id_column: str = "MANUFACTURE_CODE"
@@ -55,17 +59,34 @@ class Settings(BaseSettings):
     fpc_json_pos_key: str = "Cell_position"
 
     initial_load_start_hour: int = 0
+    initial_load_lookback_hours: float = Field(default=72.0, ge=0.0, le=720.0)
+    ui_data_window_days: int = Field(default=2, ge=1, le=3)
     delta_poll_interval_seconds: float = Field(default=1.0, ge=0.1)
     delta_poll_idle_interval_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
     delta_overlap_seconds: float = Field(default=2.0, ge=0.0, le=120.0)
     initial_partial_publish_min_changed: int = Field(default=20, ge=1, le=5000)
     initial_partial_publish_max_interval_seconds: float = Field(default=2.0, ge=0.1, le=60.0)
     peek_latest_cache_ttl_seconds: float = Field(default=8.0, ge=0.0, le=120.0)
+    refresh_peek_enabled: bool = True
+    refresh_peek_disable_for_legacy_driver: bool = True
     ccu_backfill_cooldown_seconds: float = Field(default=10.0, ge=0.5, le=300.0)
+    ccu_backfill_retry_seconds: float = Field(default=25.0, ge=5.0, le=600.0)
+    ccu_backfill_allow_targeted_lookup: bool = True
+    ccu_backfill_targeted_first_max_trays: int = Field(default=40, ge=1, le=2000)
+    ccu_backfill_targeted_batch_enabled: bool = True
+    ccu_backfill_targeted_batch_max_trays: int = Field(default=24, ge=2, le=256)
+    ccu_backfill_targeted_batch_rows_per_tray: int = Field(default=80, ge=20, le=400)
+    ccu_backfill_targeted_batch_max_rows: int = Field(default=12000, ge=500, le=100000)
+    ccu_backfill_lookback_hours: float = Field(default=72.0, ge=1.0, le=720.0)
+    ccu_backfill_step_hours: float = Field(default=1.0, ge=0.25, le=24.0)
     sql_query_timeout_seconds: int = Field(default=15, ge=2, le=300)
-    sql_max_concurrent_queries: int = Field(default=1, ge=1, le=16)
+    sql_max_concurrent_queries: int = Field(default=4, ge=1, le=32)
+    sql_allow_legacy_parallel_queries: bool = True
     tray_detail_cache_ttl_seconds: float = Field(default=120.0, ge=0.0, le=3600.0)
     tray_detail_cache_max_entries: int = Field(default=128, ge=0, le=2000)
+    ccu_backfill_targeted_workers: int = Field(default=8, ge=1, le=64)
+    refresh_skip_while_backfill: bool = False
+    initial_fpc_publish_requires_ccu: bool = True
 
     max_parallel_workers: int = Field(default=8, ge=1, le=64)
     max_fetch_batch: int = Field(default=20000, ge=100, le=100000)

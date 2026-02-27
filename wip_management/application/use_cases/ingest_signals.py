@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 import logging
 
+from wip_management.application.ports import DashboardRepoPort
 from wip_management.application.state.state_store import SingleWriterStateStore, StoreApplyResult
 from wip_management.domain.models.tray import TrayId, TraySignal, Watermark
 
@@ -46,9 +47,15 @@ class IngestResult:
 
 
 class IngestSignalsUseCase:
-    def __init__(self, store: SingleWriterStateStore) -> None:
+    def __init__(
+        self,
+        store: SingleWriterStateStore,
+        *,
+        dashboard_repo: DashboardRepoPort | None = None,
+    ) -> None:
         self._store = store
         self._merger = DeltaMerger()
+        self._dashboard_repo = dashboard_repo
 
     async def execute(
         self,
@@ -64,6 +71,8 @@ class IngestSignalsUseCase:
         )
 
         merged = self._merger.merge_and_dedup(ccu_list, aligned_fpc)
+        if self._dashboard_repo is not None and merged:
+            await self._dashboard_repo.ingest_signals(merged)
         store_result = await self._store.apply_signals(merged)
         next_wm = self._merger.next_watermark(previous_watermark, merged)
         log.info(

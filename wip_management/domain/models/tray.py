@@ -51,7 +51,7 @@ class Tray:
     def apply_signal(self, signal: TraySignal) -> bool:
         changed = False
 
-        if self.latest_collected_time is None or signal.collected_time >= self.latest_collected_time:
+        if self.latest_collected_time is None or signal.collected_time > self.latest_collected_time:
             self.latest_collected_time = signal.collected_time
             changed = True
 
