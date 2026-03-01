@@ -6,7 +6,7 @@ import atexit
 import hashlib
 import json
 import logging
-import pickle
+import os
 import tempfile
 import threading
 import time
@@ -202,14 +202,21 @@ class DiskCache:
         return {}
 
     def _save_index(self) -> None:
+        tmp_path = self._index_file.with_suffix(".tmp")
         try:
-            with open(self._index_file, "w") as f:
-                json.dump(self._index, f)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self._index, f, ensure_ascii=False)
+            os.replace(tmp_path, self._index_file)
         except Exception:
             log.warning("Disk cache index save failed")
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
 
     def _key_to_filename(self, key: str) -> str:
-        return hashlib.sha256(key.encode()).hexdigest()[:32] + ".pkl"
+        return hashlib.sha256(key.encode()).hexdigest()[:32] + ".json"
 
     def get(self, key: str) -> Any | None:
         with self._lock:
@@ -224,8 +231,8 @@ class DiskCache:
             filepath = self._cache_dir / filename
             try:
                 if filepath.exists():
-                    with open(filepath, "rb") as f:
-                        return pickle.load(f)
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        return json.load(f)
             except Exception:
                 log.debug("Disk cache read failed key=%s", key)
                 self._remove_entry(key)
@@ -236,9 +243,11 @@ class DiskCache:
             self._evict_if_needed()
             filename = self._key_to_filename(key)
             filepath = self._cache_dir / filename
+            tmp_path = filepath.with_suffix(".tmp")
             try:
-                with open(filepath, "wb") as f:
-                    pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(value, f, default=str, ensure_ascii=False)
+                os.replace(tmp_path, filepath)
                 self._index[key] = {
                     "filename": filename,
                     "created_at": time.time(),
@@ -247,6 +256,11 @@ class DiskCache:
                 self._save_index()
             except Exception:
                 log.warning("Disk cache write failed key=%s", key)
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except Exception:
+                    pass
 
     def _remove_entry(self, key: str) -> None:
         entry = self._index.pop(key, None)
@@ -1004,94 +1018,78 @@ class CcuRepo:
         start_time: datetime,
         end_time: datetime,
     ) -> list[dict[str, Any]]:
-        """Offset-based paginated range fetch for initial/delta loads."""
+        """Keyset-paginated range fetch for initial/delta loads."""
         batch_size = max(1, int(settings.max_fetch_batch))
-        offset = 0
         pages = 0
-        rows_desc: list[dict[str, Any]] = []
+        all_rows: list[dict[str, Any]] = []
 
-        paged_query = f"""
-        SELECT
+        # Keyset cursor over (COLLECTED_TIME, PK_ID) for O(n) paging.
+        last_collected_time: datetime = start_time
+        last_pk_id: str = ""
+
+        keyset_query = f"""
+        SELECT TOP {batch_size}
             {self._lot_col}    AS lot_no,
             {self._start_col}  AS start_time,
             {self._end_col}    AS end_time,
             {self._record_col} AS record_json,
-            {self._update_col} AS update_time
+            {self._update_col} AS update_time,
+            [PK_ID]            AS pk_id
         FROM {self._table} WITH (NOLOCK)
-        WHERE {self._update_col} >= ?
+        WHERE (
+            {self._update_col} > ?
+            OR ({self._update_col} = ? AND [PK_ID] > ?)
+        )
           AND {self._update_col} <= ?
           AND {self._record_col} IS NOT NULL
           AND LEN({self._record_col}) > 10
-        ORDER BY
-            {self._update_col} DESC,
-            {self._lot_col} DESC,
-            {self._start_col} DESC,
-            {self._end_col} DESC
-        OFFSET ? ROWS
-        FETCH NEXT {batch_size} ROWS ONLY
+        ORDER BY {self._update_col} ASC, [PK_ID] ASC
         """
 
         while True:
-            try:
-                chunk = await self._conn.query_rows(
-                    paged_query,
-                    [start_time, end_time, offset],
-                    query_name="ccu.fetch_range",
-                )
-            except Exception as exc:
-                message = str(exc).lower()
-                if offset == 0 and ("offset" in message or "fetch" in message):
-                    legacy_query = f"""
-                    SELECT
-                        lot_no, start_time, end_time, record_json, update_time
-                    FROM (
-                        SELECT TOP {batch_size}
-                            {self._lot_col}    AS lot_no,
-                            {self._start_col}  AS start_time,
-                            {self._end_col}    AS end_time,
-                            {self._record_col} AS record_json,
-                            {self._update_col} AS update_time
-                        FROM {self._table} WITH (NOLOCK)
-                        WHERE {self._update_col} >= ?
-                          AND {self._update_col} <= ?
-                          AND {self._record_col} IS NOT NULL
-                          AND LEN({self._record_col}) > 10
-                        ORDER BY {self._update_col} DESC
-                    ) AS recent
-                    ORDER BY update_time ASC
-                    """
-                    log.warning(
-                        "CCU fetch_range paging unsupported, fallback max_rows=%s",
-                        batch_size,
-                    )
-                    return await self._conn.query_rows(
-                        legacy_query,
-                        [start_time, end_time],
-                        query_name="ccu.fetch_range",
-                    )
-                raise
+            chunk = await self._conn.query_rows(
+                keyset_query,
+                [
+                    last_collected_time,
+                    last_collected_time,
+                    last_pk_id,
+                    end_time,
+                ],
+                query_name="ccu.fetch_range",
+            )
 
             if not chunk:
                 break
 
-            rows_desc.extend(chunk)
+            all_rows.extend(chunk)
             pages += 1
+
+            last_row = chunk[-1]
+            next_collected_time = _coerce_datetime(last_row.get("update_time"))
+            if next_collected_time is None:
+                log.warning(
+                    "CCU fetch range keyset cursor missing update_time; "
+                    "stopping pagination page=%s",
+                    pages,
+                )
+                break
+            last_collected_time = next_collected_time
+            last_pk_id = str(last_row.get("pk_id") or "")
 
             if len(chunk) < batch_size:
                 break
-
-            offset += batch_size
 
         if pages > 1:
             log.info(
                 "CCU fetch range paged pages=%s raw_rows=%s batch_size=%s",
                 pages,
-                len(rows_desc),
+                len(all_rows),
                 batch_size,
             )
 
-        rows_desc.reverse()
-        return rows_desc
+        for row in all_rows:
+            row.pop("pk_id", None)
+        return all_rows
 
     async def _fetch_by_tray_ids_batch(
         self,

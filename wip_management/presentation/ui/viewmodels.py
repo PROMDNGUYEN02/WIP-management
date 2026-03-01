@@ -168,6 +168,14 @@ class TrolleyListModel(QAbstractListModel):
     def trolley_ids(self) -> list[str]:
         return [row.trolley_id for row in self._rows]
 
+    def queue_ready_rows(self) -> list[TrolleyRowVM]:
+        """Return Queue rows currently inside target aging window."""
+        return [
+            row
+            for row in self._rows
+            if row.column == "Queue" and row.aging_state == _AGE_STATE_READY and row.trolley_id
+        ]
+
     def find_by_tray_id(self, tray_id: str) -> TrolleyRowVM | None:
         wanted = tray_id.strip()
         for row in self._rows:

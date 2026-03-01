@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 if os.name == "nt":
     import msvcrt
+    import winsound
 
 from PySide6.QtCore import (
     QEvent, QModelIndex, QObject, QPoint, QPointF, QRectF, QSize, QSignalBlocker, Qt, QTimer, Signal
@@ -2639,6 +2640,12 @@ class _MainWindow(QMainWindow):
         self._theme = get_theme()
         self._metrics_loaded = False
         self._metric_skeletons: list[Skeleton] = []
+        self._queue_alert_latched_ids: set[str] = set()
+        self._queue_alert_active_ids: set[str] = set()
+        self._queue_alert_shadow: QGraphicsDropShadowEffect | None = None
+        self._queue_alert_timer: QTimer | None = None
+        self._queue_alert_sound_timer: QTimer | None = None
+        self._queue_alert_pulse_on = False
         
         self._window_status_timer = QTimer(self)
         self._window_status_timer.setInterval(2000)
@@ -2658,8 +2665,9 @@ class _MainWindow(QMainWindow):
         self.setWindowTitle("🏭 WIP Management")
         self.resize(1500, 900)
         
-        
+
         self._setup_ui()
+        self._setup_queue_ready_alert_feedback()
         self._auto_group_last_state = bool(self._auto_group_checkbox.is_checked())
         self._setup_connections()
         self._setup_shortcuts()
@@ -2953,6 +2961,7 @@ class _MainWindow(QMainWindow):
         self._status.setStyleSheet(f"color: {self._theme.palette.text_secondary}; padding: 4px 12px;")
         self._clock_label.setStyleSheet(f"color: {self._theme.palette.text_muted}; padding: 4px 12px;")
         self._refresh_connection_badge()
+        self._sync_queue_alert_palette()
         if self.isVisible():
             toast_manager.info(
                 f"Switched to {'dark' if is_dark else 'light'} mode",
@@ -2995,6 +3004,169 @@ class _MainWindow(QMainWindow):
         frame = self.frameGeometry()
         frame.moveCenter(available.center())
         self.move(frame.topLeft())
+
+    def _setup_queue_ready_alert_feedback(self) -> None:
+        self._queue_alert_shadow = QGraphicsDropShadowEffect(self._queue_card)
+        self._queue_alert_shadow.setOffset(0, 0)
+        self._queue_alert_shadow.setBlurRadius(0)
+        self._queue_card.setGraphicsEffect(self._queue_alert_shadow)
+        self._sync_queue_alert_palette()
+
+        self._queue_alert_timer = QTimer(self)
+        self._queue_alert_timer.setInterval(140)
+        self._queue_alert_timer.timeout.connect(self._on_queue_alert_pulse_tick)
+
+        self._queue_alert_sound_timer = QTimer(self)
+        self._queue_alert_sound_timer.setInterval(3000)
+        self._queue_alert_sound_timer.timeout.connect(self._on_queue_alert_sound_tick)
+
+    def _sync_queue_alert_palette(self) -> None:
+        if self._queue_alert_shadow is None:
+            return
+        base_color = QColor(self._theme.palette.chart_6)
+        pulse_color = QColor(self._theme.palette.warning)
+        self._queue_alert_shadow.setColor(pulse_color if self._queue_alert_pulse_on else base_color)
+
+    def _on_queue_alert_pulse_tick(self) -> None:
+        if self._queue_alert_shadow is None:
+            return
+        self._queue_alert_pulse_on = not self._queue_alert_pulse_on
+        self._queue_alert_shadow.setBlurRadius(34 if self._queue_alert_pulse_on else 10)
+        self._sync_queue_alert_palette()
+
+    def _trigger_queue_alert_visual(self) -> None:
+        if self._queue_alert_timer is not None and not self._queue_alert_timer.isActive():
+            self._queue_alert_timer.start()
+
+    def _stop_queue_alert_visual(self) -> None:
+        if self._queue_alert_timer is not None:
+            self._queue_alert_timer.stop()
+        if self._queue_alert_shadow is not None:
+            self._queue_alert_pulse_on = False
+            self._queue_alert_shadow.setBlurRadius(0)
+            self._sync_queue_alert_palette()
+
+    def _play_queue_alert_sound(self) -> None:
+        if os.name == "nt":
+            with contextlib.suppress(Exception):
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                return
+        with contextlib.suppress(Exception):
+            QApplication.beep()
+
+    def _on_queue_alert_sound_tick(self) -> None:
+        if not self._queue_alert_active_ids:
+            if self._queue_alert_sound_timer is not None:
+                self._queue_alert_sound_timer.stop()
+            return
+        self._play_queue_alert_sound()
+
+    def _set_queue_alert_active(self, active: bool) -> None:
+        if active:
+            self._trigger_queue_alert_visual()
+            started_sound_timer = False
+            if self._queue_alert_sound_timer is not None and not self._queue_alert_sound_timer.isActive():
+                self._queue_alert_sound_timer.start()
+                started_sound_timer = True
+            if started_sound_timer:
+                self._play_queue_alert_sound()
+            return
+        if self._queue_alert_sound_timer is not None:
+            self._queue_alert_sound_timer.stop()
+        self._stop_queue_alert_visual()
+
+    def _parse_aging_hours(self, text: str) -> float | None:
+        raw = str(text or "").strip()
+        if not raw or raw == "-":
+            return None
+        parts = raw.split(":")
+        if len(parts) != 3:
+            return None
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = int(parts[2])
+        except ValueError:
+            return None
+        if hours < 0 or minutes < 0 or seconds < 0:
+            return None
+        return (hours * 3600 + minutes * 60 + seconds) / 3600.0
+
+    def _scroll_queue_to_trolley(self, trolley_id: str) -> None:
+        tid = str(trolley_id).strip()
+        if not tid:
+            return
+        model = self._vm.queue_trolley_model
+        list_view = self._queue_card.trolley_list
+        for row in range(model.rowCount()):
+            index = model.index(row, 0)
+            row_tid = str(model.data(index, TrolleyListModel.TrolleyIdRole) or "").strip()
+            if row_tid != tid:
+                continue
+            list_view.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
+            return
+
+    def _handle_queue_target_aging_alerts(self) -> None:
+        min_target = max(float(settings.target_aging_hours) - float(settings.target_aging_tolerance_hours), 0.0)
+        max_target = float(settings.target_aging_hours) + float(settings.target_aging_tolerance_hours)
+        queue_rows = self._vm.queue_trolley_model.queue_ready_rows()
+        strict_ready_ids = {
+            row.trolley_id
+            for row in queue_rows
+            if (
+                (aging_hours := self._parse_aging_hours(row.aging_time)) is not None
+                and min_target < aging_hours < max_target
+            )
+        }
+        queue_ids = set(self._vm.queue_trolley_model.trolley_ids())
+        precharge_ids = set(self._vm.precharge_trolley_model.trolley_ids())
+
+        resolved_ids = self._queue_alert_latched_ids & precharge_ids
+        if resolved_ids:
+            self._queue_alert_latched_ids.difference_update(resolved_ids)
+
+        stale_ids = {
+            trolley_id for trolley_id in self._queue_alert_latched_ids
+            if trolley_id not in queue_ids and trolley_id not in precharge_ids
+        }
+        if stale_ids:
+            self._queue_alert_latched_ids.difference_update(stale_ids)
+
+        new_trigger_ids = sorted(
+            strict_ready_ids - self._queue_alert_latched_ids - precharge_ids
+        )
+        if new_trigger_ids:
+            self._queue_alert_latched_ids.update(new_trigger_ids)
+
+        active_ids = self._queue_alert_latched_ids & queue_ids
+        was_active = bool(self._queue_alert_active_ids)
+        self._queue_alert_active_ids = set(active_ids)
+
+        if self._queue_alert_active_ids:
+            self._set_queue_alert_active(True)
+            if new_trigger_ids:
+                preview = ", ".join(new_trigger_ids[:3])
+                if len(new_trigger_ids) > 3:
+                    preview += f" (+{len(new_trigger_ids) - 3})"
+                self._show_status(
+                    (
+                        "Queue alert active "
+                        f"({min_target:.1f}h-{max_target:.1f}h): {preview} "
+                        "— sound/highlight will continue until moved to Precharge"
+                    ),
+                    "warning",
+                    notify=False,
+                )
+                self._scroll_queue_to_trolley(new_trigger_ids[0])
+            return
+
+        self._set_queue_alert_active(False)
+        if was_active:
+            self._show_status(
+                "Queue alert cleared: all alerted trolleys have left Queue/entered Precharge",
+                "success",
+                notify=False,
+            )
     
     def _on_updated(self, payload: dict[str, int]) -> None:
         self._last_update_time = datetime.now()
@@ -3030,6 +3202,7 @@ class _MainWindow(QMainWindow):
             f"🔋 {payload.get('precharge_cell_count', 0):,}"
         )
 
+        self._handle_queue_target_aging_alerts()
         if self._dashboard_panel is not None and self._dashboard_visible:
             self._dashboard_panel.update_data(payload)
         self._refresh_indicator.setText(f"Updated {datetime.now().strftime('%H:%M:%S')}")
@@ -3882,6 +4055,14 @@ class _MainWindow(QMainWindow):
         self._stop_window_load_monitor()
         self._clock_timer.stop()
         self._loading_overlay.stop()
+        if self._queue_alert_timer is not None:
+            self._queue_alert_timer.stop()
+        if self._queue_alert_sound_timer is not None:
+            self._queue_alert_sound_timer.stop()
+        if self._queue_alert_shadow is not None:
+            self._queue_alert_pulse_on = False
+            self._queue_alert_shadow.setBlurRadius(0)
+            self._sync_queue_alert_palette()
         toast_manager.clear_all()
         app = QApplication.instance()
         if self._event_filter_installed and app is not None:

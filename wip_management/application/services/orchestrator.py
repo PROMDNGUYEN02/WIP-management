@@ -1471,17 +1471,25 @@ class OrchestratorService:
                 {ccu_task, fpc_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            first_task = next(iter(done))
+            # Deterministic priority when both complete simultaneously:
+            # prefer CCU because it is the canonical partial snapshot source.
+            if ccu_task in done:
+                first_task = ccu_task
+                partial_source = "ccu"
+            elif fpc_task in done:
+                first_task = fpc_task
+                partial_source = "fpc"
+            else:
+                first_task = next(iter(done))
+                partial_source = "unknown"
 
             if first_task is ccu_task:
-                partial_source = "ccu"
                 ccu_rows = ccu_task.result()
                 norm_ccu = await self._normalize_signals(ccu_rows)
                 partial_result = await self._ingest.execute(
                     norm_ccu, [], previous_watermark=previous
                 )
             else:
-                partial_source = "fpc"
                 norm_fpc = await self._normalize_signals(fpc_task.result())
                 partial_result = await self._ingest.execute(
                     [], norm_fpc, previous_watermark=previous
@@ -1521,8 +1529,17 @@ class OrchestratorService:
 
         if not fpc_task.done():
             fpc_timeout = settings.fpc_initial_load_timeout_seconds
-            remaining = fpc_timeout - (time.perf_counter() - started_at)
-            remaining = max(10.0, remaining)
+            fpc_absolute_deadline = started_at + fpc_timeout
+            remaining = fpc_absolute_deadline - time.perf_counter()
+
+            if remaining <= 30.0:
+                remaining = max(60.0, remaining)
+                log.warning(
+                    "FPC timeout adjusted: CCU took longer than FPC timeout. "
+                    "Giving FPC %.0fs more",
+                    remaining,
+                )
+
             try:
                 fpc_rows = await asyncio.wait_for(fpc_task, timeout=remaining)
                 norm_fpc = await self._normalize_signals(fpc_rows)
@@ -1598,7 +1615,7 @@ class OrchestratorService:
             )
 
     # ═══════════════════════════════════════════════════════════════════════
-    # Refresh Loop (unchanged)
+    # Refresh Loop (fixed-rate cadence)
     # ═══════════════════════════════════════════════════════════════════════
     async def _refresh_loop(self) -> None:
         log.info(
@@ -1617,13 +1634,17 @@ class OrchestratorService:
             if self._stop_event.is_set():
                 break
             self._refresh_iteration += 1
+
+            loop = asyncio.get_running_loop()
+            cycle_start = loop.time()
             had_change = False
             try:
                 had_change = await self._refresh_once()
             except Exception:
                 log.exception("Refresh loop failed")
 
-            sleep_seconds = (
+            elapsed = loop.time() - cycle_start
+            target_interval = (
                 self._delta_poll_interval_seconds
                 if had_change
                 else max(
@@ -1631,6 +1652,7 @@ class OrchestratorService:
                     self._delta_poll_idle_interval_seconds,
                 )
             )
+            sleep_seconds = max(0.0, target_interval - elapsed)
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(), timeout=sleep_seconds
