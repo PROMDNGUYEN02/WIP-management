@@ -300,10 +300,18 @@ class OrchestratorService:
         self._loaded_ccu_start: datetime | None = None
         self._loaded_fpc_start: datetime | None = None
 
+        perf = settings.to_performance_summary()
         log.info(
-            "Orchestrator initialized with settings: %s",
-            settings.to_performance_summary(),
+            "Orchestrator initialized sql_timeout=%ss max_batch=%s poll=%ss "
+            "today_only=%s window_ccu_start=%s window_fpc_start=%s",
+            perf.get("sql_query_timeout_seconds"),
+            perf.get("max_fetch_batch"),
+            perf.get("delta_poll_interval_seconds"),
+            perf.get("ui_show_today_only"),
+            perf.get("load_window_ccu_start"),
+            perf.get("load_window_fpc_start"),
         )
+        log.debug("Orchestrator settings full=%s", perf)
 
     # ═══════════════════════════════════════════════════════════════════════
     # Today-Only Helpers
@@ -574,6 +582,7 @@ class OrchestratorService:
         exhausted = sum(
             1 for e in self._backfill_entries.values() if e.is_exhausted()
         )
+        ccu_cache = self._ccu_repo.cache_stats()
         return {
             "tray_detail": {
                 "size": len(self._tray_cells_cache),
@@ -600,6 +609,7 @@ class OrchestratorService:
                 "tracking_count": len(self._backfill_entries),
                 "exhausted_count": exhausted,
             },
+            "ccu_repo": ccu_cache,
         }
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1216,6 +1226,79 @@ class OrchestratorService:
         self._trim_tray_detail_cache()
         return [dict(item) for item in copied]
 
+    async def prefetch_tray_cells(
+        self,
+        tray_ids: list[str],
+        *,
+        max_items: int = 24,
+    ) -> dict[str, int]:
+        if not tray_ids:
+            return {"requested": 0, "prefetched": 0, "skipped": 0}
+
+        unique: list[str] = []
+        seen: set[str] = set()
+        safe_max_items = max(1, int(max_items))
+        for raw in tray_ids:
+            key = str(raw or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append(key)
+            if len(unique) >= safe_max_items:
+                break
+
+        requested = len(unique)
+        if requested == 0:
+            return {"requested": 0, "prefetched": 0, "skipped": 0}
+
+        if self._bootstrap_in_progress or self._bootstrap_error is not None:
+            return {"requested": requested, "prefetched": 0, "skipped": requested}
+        if not self._bootstrap_event.is_set():
+            return {"requested": requested, "prefetched": 0, "skipped": requested}
+
+        prefetched = 0
+        skipped = 0
+        per_item_timeout = max(
+            3.0,
+            min(10.0, float(settings.sql_query_timeout_seconds)),
+        )
+
+        for tray_key in unique:
+            now = self._clock.now()
+            cached = self._tray_cells_cache.get(tray_key)
+            if cached is not None:
+                cached_at, _ = cached
+                if (
+                    self._tray_cells_cache_ttl.total_seconds() <= 0
+                    or (now - cached_at) <= self._tray_cells_cache_ttl
+                ):
+                    skipped += 1
+                    continue
+
+            try:
+                rows = await asyncio.wait_for(
+                    self.fetch_tray_cells(tray_key),
+                    timeout=per_item_timeout,
+                )
+                if rows:
+                    prefetched += 1
+                else:
+                    skipped += 1
+            except Exception:
+                skipped += 1
+
+        log.debug(
+            "Tray detail prefetch requested=%s prefetched=%s skipped=%s",
+            requested,
+            prefetched,
+            skipped,
+        )
+        return {
+            "requested": requested,
+            "prefetched": prefetched,
+            "skipped": skipped,
+        }
+
     async def fetch_cell_owner(
         self, cell_id: str
     ) -> dict[str, str | None] | None:
@@ -1465,6 +1548,7 @@ class OrchestratorService:
         norm_fpc: list[TraySignal] = []
         partial_source = "none"
         fpc_timed_out = False
+        pending_missing_before_ccu: set[str] = set()
 
         try:
             done, _ = await asyncio.wait(
@@ -1494,11 +1578,11 @@ class OrchestratorService:
                 partial_result = await self._ingest.execute(
                     [], norm_fpc, previous_watermark=previous
                 )
-                self._schedule_ccu_backfill(
-                    partial_result.store_result.missing_ccu_tray_ids,
-                    allow_historical_scan=True,
-                    allow_targeted_lookup=self._ccu_backfill_allow_targeted_lookup,
-                    reason="initial-load-partial-fpc",
+                # Do not schedule CCU backfill here: CCU initial task may still be
+                # running and will resolve many "missing" rows. Backfill decisions
+                # are deferred until final ingest after both tasks complete.
+                pending_missing_before_ccu = set(
+                    partial_result.store_result.missing_ccu_tray_ids
                 )
 
             partial_projection = await self._compute_projection()
@@ -1568,8 +1652,18 @@ class OrchestratorService:
         result = await self._ingest.execute(
             norm_ccu, norm_fpc, previous_watermark=previous
         )
+        still_missing_ccu = set(result.store_result.missing_ccu_tray_ids)
+        resolved_after_ccu = pending_missing_before_ccu - still_missing_ccu
+        if pending_missing_before_ccu:
+            log.info(
+                "Initial load missing-ccu reconciliation "
+                "before_ccu=%s resolved_after_ccu=%s still_missing=%s",
+                len(pending_missing_before_ccu),
+                len(resolved_after_ccu),
+                len(still_missing_ccu),
+            )
         backfill_scheduled = self._schedule_ccu_backfill(
-            result.store_result.missing_ccu_tray_ids,
+            still_missing_ccu,
             allow_historical_scan=True,
             allow_targeted_lookup=self._ccu_backfill_allow_targeted_lookup,
             reason="initial-load-final",

@@ -36,13 +36,28 @@ class QueryStats:
 
     total_queries: int = 0
     total_time_ms: int = 0
+    total_queue_wait_ms: int = 0
+    total_db_exec_ms: int = 0
+    total_fetch_ms: int = 0
     slow_queries: int = 0
     errors: int = 0
     recent_times: deque = field(default_factory=lambda: deque(maxlen=100))
 
-    def record(self, elapsed_ms: int, is_slow: bool, is_error: bool) -> None:
+    def record(
+        self,
+        elapsed_ms: int,
+        is_slow: bool,
+        is_error: bool,
+        *,
+        queue_wait_ms: int = 0,
+        db_exec_ms: int = 0,
+        fetch_ms: int = 0,
+    ) -> None:
         self.total_queries += 1
         self.total_time_ms += elapsed_ms
+        self.total_queue_wait_ms += max(0, int(queue_wait_ms))
+        self.total_db_exec_ms += max(0, int(db_exec_ms))
+        self.total_fetch_ms += max(0, int(fetch_ms))
         self.recent_times.append(elapsed_ms)
         if is_slow:
             self.slow_queries += 1
@@ -55,12 +70,20 @@ class QueryStats:
         return sum(self.recent_times) / len(self.recent_times)
 
     def to_dict(self) -> dict[str, Any]:
+        total = max(1, self.total_queries)
         return {
             "total_queries": self.total_queries,
             "total_time_ms": self.total_time_ms,
+            "total_queue_wait_ms": self.total_queue_wait_ms,
+            "total_db_exec_ms": self.total_db_exec_ms,
+            "total_fetch_ms": self.total_fetch_ms,
             "slow_queries": self.slow_queries,
             "errors": self.errors,
             "avg_recent_ms": round(self.avg_time_ms(), 1),
+            "avg_total_ms": round(self.total_time_ms / total, 1),
+            "avg_queue_wait_ms": round(self.total_queue_wait_ms / total, 1),
+            "avg_db_exec_ms": round(self.total_db_exec_ms / total, 1),
+            "avg_fetch_ms": round(self.total_fetch_ms / total, 1),
         }
 
 
@@ -156,22 +179,30 @@ class _ConnectionLane:
         params: list[Any],
         timeout: int,
         query_name: str = "",
-    ) -> tuple[list[tuple], list[str]]:
+    ) -> tuple[list[tuple], list[str], int, int, int]:
         """Execute query on this lane with serialization."""
         if self.pool is None or self._lock is None:
             raise RuntimeError(f"Lane '{self.name}' not started")
 
+        lock_wait_started_at = time.perf_counter()
         async with self._lock:
+            lock_acquired_at = time.perf_counter()
+            lane_wait_ms = int((lock_acquired_at - lock_wait_started_at) * 1000)
             self._query_count += 1
             self._active_query = query_name or "unknown"
             try:
                 async with self.pool.acquire() as conn:
                     async with conn.cursor() as cur:
                         cur.timeout = timeout
+                        execute_started_at = time.perf_counter()
                         await cur.execute(query, params)
+                        db_exec_ms = int(
+                            (time.perf_counter() - execute_started_at) * 1000
+                        )
 
                         rows: list[tuple[Any, ...]] = []
                         cols: list[str] = []
+                        fetch_started_at = time.perf_counter()
 
                         while True:
                             if cur.description is not None:
@@ -182,7 +213,10 @@ class _ConnectionLane:
                             if not has_next:
                                 break
 
-                        return rows, cols
+                        fetch_ms = int(
+                            (time.perf_counter() - fetch_started_at) * 1000
+                        )
+                        return rows, cols, lane_wait_ms, db_exec_ms, fetch_ms
             finally:
                 self._active_query = None
 
@@ -278,6 +312,15 @@ class SQLServerConnection:
 
         self._query_semaphore: asyncio.Semaphore | None = None
         self._slow_query_threshold_ms: int = settings.sql_slow_query_threshold_ms
+        self._slow_query_threshold_fetch_range_ms: int = (
+            settings.sql_slow_query_threshold_fetch_range_ms
+        )
+        self._slow_query_threshold_peek_ms: int = (
+            settings.sql_slow_query_threshold_peek_ms
+        )
+        self._slow_query_threshold_tray_cells_ms: int = (
+            settings.sql_slow_query_threshold_tray_cells_ms
+        )
         self._configured_driver: str = settings.sql_driver
         self._active_driver: str = ""
         self._is_legacy_driver: bool = False
@@ -568,10 +611,18 @@ class SQLServerConnection:
         lane = self._lanes[min(lane_idx, len(self._lanes) - 1)]
 
         started_at = time.perf_counter()
-
-        rows, cols = await self._execute_with_timing(
-            lane, query, params, query_label, query_preview, started_at
-        )
+        async with self._query_semaphore:
+            acquired_at = time.perf_counter()
+            semaphore_wait_ms = int((acquired_at - started_at) * 1000)
+            rows, cols = await self._execute_with_timing(
+                lane,
+                query,
+                params,
+                query_label,
+                query_preview,
+                started_at,
+                semaphore_wait_ms,
+            )
 
         if not cols:
             return []
@@ -585,22 +636,31 @@ class SQLServerConnection:
         query_label: str,
         query_preview: str,
         started_at: float,
+        semaphore_wait_ms: int,
     ) -> tuple[list[tuple], list[str]]:
-        exec_started_at = time.perf_counter()
-        queue_wait_ms = int((exec_started_at - started_at) * 1000)
+        queue_wait_ms = semaphore_wait_ms
         is_error = False
 
         try:
-            rows, cols = await lane.execute(
+            rows, cols, lane_wait_ms, db_exec_ms, fetch_ms = await lane.execute(
                 query,
                 params,
                 settings.sql_query_timeout_seconds,
                 query_name=query_label,
             )
+            queue_wait_ms += lane_wait_ms
         except Exception:
             is_error = True
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-            await self._record_stats(query_label, elapsed_ms, False, True)
+            await self._record_stats(
+                query_label,
+                elapsed_ms,
+                False,
+                True,
+                queue_wait_ms=queue_wait_ms,
+                db_exec_ms=0,
+                fetch_ms=0,
+            )
             log.exception(
                 "SQL query failed name=%s lane=%s total_ms=%s "
                 "queue_wait_ms=%s sql=%s",
@@ -612,37 +672,63 @@ class SQLServerConnection:
             )
             raise
 
-        exec_done_at = time.perf_counter()
-        db_exec_ms = int((exec_done_at - exec_started_at) * 1000)
-        elapsed_ms = int((exec_done_at - started_at) * 1000)
+        elapsed_ms = queue_wait_ms + db_exec_ms + fetch_ms
         row_count = len(rows)
-        is_slow = elapsed_ms >= self._slow_query_threshold_ms
+        slow_threshold_ms = self._slow_threshold_for_query(query_label)
+        is_slow = elapsed_ms >= slow_threshold_ms
 
-        await self._record_stats(query_label, elapsed_ms, is_slow, is_error)
+        await self._record_stats(
+            query_label,
+            elapsed_ms,
+            is_slow,
+            is_error,
+            queue_wait_ms=queue_wait_ms,
+            db_exec_ms=db_exec_ms,
+            fetch_ms=fetch_ms,
+        )
 
         if is_slow:
             log.warning(
                 "SQL query slow name=%s lane=%s total_ms=%s "
-                "queue_wait_ms=%s db_exec_ms=%s rows=%s params=%s sql=%s",
+                "slow_threshold_ms=%s queue_wait_ms=%s db_exec_ms=%s fetch_ms=%s "
+                "rows=%s params=%s sql=%s",
                 query_label,
                 lane.name,
                 elapsed_ms,
+                slow_threshold_ms,
                 queue_wait_ms,
                 db_exec_ms,
+                fetch_ms,
                 row_count,
                 len(params),
                 query_preview,
             )
         else:
             log.debug(
-                "SQL query done name=%s lane=%s total_ms=%s rows=%s",
+                (
+                    "SQL query done name=%s lane=%s total_ms=%s "
+                    "queue_wait_ms=%s db_exec_ms=%s fetch_ms=%s rows=%s"
+                ),
                 query_label,
                 lane.name,
                 elapsed_ms,
+                queue_wait_ms,
+                db_exec_ms,
+                fetch_ms,
                 row_count,
             )
 
         return rows, cols
+
+    def _slow_threshold_for_query(self, query_name: str) -> int:
+        name = (query_name or "").lower()
+        if "fetch_range" in name:
+            return self._slow_query_threshold_fetch_range_ms
+        if "tray_cells" in name:
+            return self._slow_query_threshold_tray_cells_ms
+        if name.endswith(".peek") or ".peek_" in name:
+            return self._slow_query_threshold_peek_ms
+        return self._slow_query_threshold_ms
 
     # ═══════════════════════════════════════════════════════════════════
     # Stats
@@ -654,11 +740,22 @@ class SQLServerConnection:
         elapsed_ms: int,
         is_slow: bool,
         is_error: bool,
+        *,
+        queue_wait_ms: int = 0,
+        db_exec_ms: int = 0,
+        fetch_ms: int = 0,
     ) -> None:
         async with self._stats_lock:
             if query_name not in self._stats:
                 self._stats[query_name] = QueryStats()
-            self._stats[query_name].record(elapsed_ms, is_slow, is_error)
+            self._stats[query_name].record(
+                elapsed_ms,
+                is_slow,
+                is_error,
+                queue_wait_ms=queue_wait_ms,
+                db_exec_ms=db_exec_ms,
+                fetch_ms=fetch_ms,
+            )
 
     async def _log_stats(self) -> None:
         async with self._stats_lock:

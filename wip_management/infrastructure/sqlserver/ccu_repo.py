@@ -191,6 +191,10 @@ class DiskCache:
         self._index_file = self._cache_dir / "_index.json"
         self._index: dict[str, dict] = self._load_index()
         self._lock = threading.Lock()
+        self._hits = 0
+        self._misses = 0
+        self._writes = 0
+        self._read_errors = 0
 
     def _load_index(self) -> dict[str, dict]:
         try:
@@ -222,19 +226,27 @@ class DiskCache:
         with self._lock:
             entry = self._index.get(key)
             if entry is None:
+                self._misses += 1
                 return None
             created_at = entry.get("created_at", 0)
             if time.time() - created_at > self._ttl_seconds:
                 self._remove_entry(key)
+                self._misses += 1
                 return None
             filename = entry.get("filename", "")
             filepath = self._cache_dir / filename
             try:
                 if filepath.exists():
                     with open(filepath, "r", encoding="utf-8") as f:
-                        return json.load(f)
+                        data = json.load(f)
+                        self._hits += 1
+                        return data
+                self._misses += 1
+                self._remove_entry(key)
             except Exception:
                 log.debug("Disk cache read failed key=%s", key)
+                self._read_errors += 1
+                self._misses += 1
                 self._remove_entry(key)
             return None
 
@@ -253,6 +265,7 @@ class DiskCache:
                     "created_at": time.time(),
                     "size": filepath.stat().st_size,
                 }
+                self._writes += 1
                 self._save_index()
             except Exception:
                 log.warning("Disk cache write failed key=%s", key)
@@ -299,6 +312,25 @@ class DiskCache:
                     pass
             self._index.clear()
             self._save_index()
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            total = self._hits + self._misses
+            hit_rate = (self._hits / total * 100) if total > 0 else 0.0
+            total_bytes = sum(
+                int(v.get("size", 0) or 0) for v in self._index.values()
+            )
+            return {
+                "size": len(self._index),
+                "max_entries": self._max_entries,
+                "ttl_hours": round(self._ttl_seconds / 3600.0, 2),
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": f"{hit_rate:.1f}%",
+                "writes": self._writes,
+                "read_errors": self._read_errors,
+                "total_bytes": total_bytes,
+            }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -637,7 +669,7 @@ class CcuRepo:
         self._cell_owner_cache.clear()
         log.info(
             "CCU repo closed cache_stats=%s",
-            self._tray_cells_cache.stats(),
+            self.cache_stats(),
         )
 
     def register_known_tray(self, tray_id: str, data: dict[str, Any]) -> None:
@@ -808,25 +840,105 @@ class CcuRepo:
         Tier 2: last 8h  (wider window if tier 1 has <10 results)
         Tier 3: full window (fallback)
         """
-        narrow_start_1 = end_time - timedelta(hours=2)
-        if narrow_start_1 >= start_time:
-            result = await self._fetch_tray_cells_query(
-                tray_id, narrow_start_1, end_time, limit=200
-            )
-            if len(result) >= 10:
-                return result
-
-        narrow_start_2 = end_time - timedelta(hours=8)
-        if narrow_start_2 >= start_time:
-            result = await self._fetch_tray_cells_query(
-                tray_id, narrow_start_2, end_time, limit=500
-            )
-            if result:
-                return result
-
-        return await self._fetch_tray_cells_query(
-            tray_id, start_time, end_time, limit=1000
+        tier1_limit = 400
+        tier2_limit = 1200
+        tier3_limit = 5000
+        tier3_expand_limits = (
+            tier3_limit,
+            max(tier3_limit * 2, 10000),
+            max(tier3_limit * 4, 20000),
         )
+
+        def _likely_truncated(rows: list[dict[str, str | None]], limit: int) -> bool:
+            # Parsed rows can only be <= raw SQL rows. If we hit the limit, we may
+            # have clipped additional cells; continue to wider tier.
+            return len(rows) >= limit
+
+        def _tier_window(hours: float) -> datetime:
+            return max(start_time, end_time - timedelta(hours=hours))
+
+        async def _fetch_full_window_progressive() -> list[dict[str, str | None]]:
+            final_rows: list[dict[str, str | None]] = []
+            for idx, limit in enumerate(tier3_expand_limits):
+                final_rows = await self._fetch_tray_cells_query(
+                    tray_id, start_time, end_time, limit=limit
+                )
+                if len(final_rows) < limit:
+                    return final_rows
+                if idx < len(tier3_expand_limits) - 1:
+                    log.info(
+                        (
+                            "Tray cells full-window saturated tray_id=%s rows=%s "
+                            "limit=%s -> retry_limit=%s"
+                        ),
+                        tray_id,
+                        len(final_rows),
+                        limit,
+                        tier3_expand_limits[idx + 1],
+                    )
+            log.warning(
+                (
+                    "Tray cells may be truncated tray_id=%s rows=%s final_limit=%s "
+                    "start=%s end=%s"
+                ),
+                tray_id,
+                len(final_rows),
+                tier3_expand_limits[-1],
+                start_time.isoformat(),
+                end_time.isoformat(),
+            )
+            return final_rows
+
+        # Smart jump: use known tray timestamp to avoid two wasted narrow probes
+        # when data is clearly outside tier-1/tier-2 windows.
+        known = self.get_known_tray(tray_id)
+        tray_time: datetime | None = None
+        if known:
+            tray_time = _coerce_datetime(
+                known.get("end_time") or known.get("start_time")
+            )
+
+        if tray_time is not None:
+            hours_ago = max(
+                0.0, (end_time - tray_time).total_seconds() / 3600.0
+            )
+            if hours_ago <= 2.0:
+                result = await self._fetch_tray_cells_query(
+                    tray_id, _tier_window(2.0), end_time, limit=tier1_limit
+                )
+                if result and not _likely_truncated(result, tier1_limit):
+                    return result
+                result = await self._fetch_tray_cells_query(
+                    tray_id, _tier_window(8.0), end_time, limit=tier2_limit
+                )
+                if result and not _likely_truncated(result, tier2_limit):
+                    return result
+            elif hours_ago <= 8.0:
+                result = await self._fetch_tray_cells_query(
+                    tray_id, _tier_window(8.0), end_time, limit=tier2_limit
+                )
+                if result and not _likely_truncated(result, tier2_limit):
+                    return result
+            return await _fetch_full_window_progressive()
+
+        # Fallback when no reliable tray timestamp is known yet.
+        narrow_start_1 = _tier_window(2.0)
+        if narrow_start_1 < end_time:
+            result = await self._fetch_tray_cells_query(
+                tray_id, narrow_start_1, end_time, limit=tier1_limit
+            )
+            if len(result) >= 10 and not _likely_truncated(result, tier1_limit):
+                return result
+
+        narrow_start_2 = _tier_window(8.0)
+        if narrow_start_2 < end_time:
+            result = await self._fetch_tray_cells_query(
+                tray_id, narrow_start_2, end_time, limit=tier2_limit
+            )
+            if result and not _likely_truncated(result, tier2_limit):
+                return result
+
+        return await _fetch_full_window_progressive()
 
     async def _fetch_tray_cells_query(
         self,
@@ -1047,14 +1159,21 @@ class CcuRepo:
         """
 
         while True:
+            # Parameter order:
+            #   1) last_collected_time (>)
+            #   2) last_collected_time (=)
+            #   3) last_pk_id
+            #   4) end_time (upper bound)
+            # TOP uses a literal from validated settings.max_fetch_batch.
+            query_params = [
+                last_collected_time,
+                last_collected_time,
+                last_pk_id,
+                end_time,
+            ]
             chunk = await self._conn.query_rows(
                 keyset_query,
-                [
-                    last_collected_time,
-                    last_collected_time,
-                    last_pk_id,
-                    end_time,
-                ],
+                query_params,
                 query_name="ccu.fetch_range",
             )
 
@@ -1283,6 +1402,7 @@ class CcuRepo:
     def cache_stats(self) -> dict[str, Any]:
         return {
             "tray_cells": self._tray_cells_cache.stats(),
+            "disk": self._disk_cache.stats(),
             "cell_owner": self._cell_owner_cache.stats(),
             "known_trays": len(self._known_tray_data),
             "lookup_strategy": self._lookup_strategy,

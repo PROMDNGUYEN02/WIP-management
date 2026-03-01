@@ -375,8 +375,10 @@ class FpcRepo:
         # Build the WHERE filter clauses from config (Fix #1)
         self._extra_where = self._build_extra_where()
 
-        # Diagnostic: did we run the density probe yet?
-        self._density_probed = False
+        # Density probe cache/controls (startup-cost mitigation)
+        self._density_probe_lock: asyncio.Lock | None = None
+        self._density_cache: dict[str, Any] | None = None
+        self._density_cache_time: datetime | None = None
 
     # ── Fix #1: build IS_HIS / DEL_FLAG filter ───────────────────────────────
     def _build_extra_where(self) -> str:
@@ -403,49 +405,105 @@ class FpcRepo:
     async def probe_density(
         self, start_time: datetime, end_time: datetime
     ) -> None:
-        if self._density_probed:
+        if not settings.fpc_density_probe_enabled:
             return
-        self._density_probed = True
-        try:
-            query = f"""
-            SELECT
-                COUNT(*)  AS total_rows,
-                COUNT(DISTINCT {self._lot_col}) AS distinct_lots,
-                SUM(CASE WHEN [IS_HIS] = '0' THEN 1 ELSE 0 END) AS active_rows,
-                SUM(CASE WHEN [IS_HIS] = '1' THEN 1 ELSE 0 END) AS historical_rows,
-                SUM(CASE WHEN [DEL_FLAG] = '1' THEN 1 ELSE 0 END) AS deleted_rows
-            FROM {self._table} WITH (NOLOCK)
-            WHERE {self._update_col} >= ?
-              AND {self._update_col} <= ?
-            """
-            rows = await self._conn.query_rows(
-                query,
-                [start_time, end_time],
-                query_name="fpc.density_probe",
+        ttl = timedelta(seconds=settings.fpc_density_probe_cache_ttl_seconds)
+
+        cached = self._get_density_cache(ttl)
+        if cached is not None:
+            self._log_density_stats(cached, cache_hit=True)
+            return
+
+        if self._density_probe_lock is None:
+            self._density_probe_lock = asyncio.Lock()
+
+        async with self._density_probe_lock:
+            cached = self._get_density_cache(ttl)
+            if cached is not None:
+                self._log_density_stats(cached, cache_hit=True)
+                return
+
+            try:
+                query = f"""
+                SELECT
+                    COUNT(*)  AS total_rows,
+                    COUNT(DISTINCT {self._lot_col}) AS distinct_lots,
+                    SUM(CASE WHEN [IS_HIS] = '0' THEN 1 ELSE 0 END) AS active_rows,
+                    SUM(CASE WHEN [IS_HIS] = '1' THEN 1 ELSE 0 END) AS historical_rows,
+                    SUM(CASE WHEN [DEL_FLAG] = '1' THEN 1 ELSE 0 END) AS deleted_rows
+                FROM {self._table} WITH (NOLOCK)
+                WHERE {self._update_col} >= ?
+                  AND {self._update_col} <= ?
+                """
+                rows = await self._conn.query_rows(
+                    query,
+                    [start_time, end_time],
+                    query_name="fpc.density_probe",
+                )
+                if not rows:
+                    return
+
+                parsed = self._parse_density_row(rows[0])
+                self._density_cache = parsed
+                self._density_cache_time = datetime.now()
+                self._log_density_stats(parsed, cache_hit=False)
+            except Exception:
+                log.warning("FPC density probe failed (non-fatal)", exc_info=True)
+
+    def _get_density_cache(self, ttl: timedelta) -> dict[str, Any] | None:
+        if self._density_cache is None or self._density_cache_time is None:
+            return None
+        if datetime.now() - self._density_cache_time >= ttl:
+            return None
+        return dict(self._density_cache)
+
+    def _parse_density_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        total = int(row.get("total_rows", 0) or 0)
+        active = int(row.get("active_rows", 0) or 0)
+        historical = int(row.get("historical_rows", 0) or 0)
+        deleted = int(row.get("deleted_rows", 0) or 0)
+        lots = int(row.get("distinct_lots", 0) or 0)
+        filter_pct = round(active / total * 100, 1) if total else 0.0
+        return {
+            "total_rows": total,
+            "active_rows": active,
+            "historical_rows": historical,
+            "deleted_rows": deleted,
+            "distinct_lots": lots,
+            "filter_keeps_pct": filter_pct,
+        }
+
+    def _log_density_stats(self, stats: dict[str, Any], *, cache_hit: bool) -> None:
+        total = int(stats.get("total_rows", 0) or 0)
+        active = int(stats.get("active_rows", 0) or 0)
+        historical = int(stats.get("historical_rows", 0) or 0)
+        deleted = int(stats.get("deleted_rows", 0) or 0)
+        lots = int(stats.get("distinct_lots", 0) or 0)
+        filter_pct = float(stats.get("filter_keeps_pct", 0.0) or 0.0)
+        cache_tag = "cached" if cache_hit else "fresh"
+        log.info(
+            "FPC density probe (%s) total=%s active(IS_HIS=0)=%s "
+            "historical=%s deleted=%s lots=%s filter_keeps=%.1f%%",
+            cache_tag,
+            total,
+            active,
+            historical,
+            deleted,
+            lots,
+            filter_pct,
+        )
+        if total > 0 and active == 0:
+            log.warning(
+                "FPC IS_HIS filter returns 0 rows! "
+                "Consider setting fpc_filter_is_his=false in .env"
             )
-            if rows:
-                r = rows[0]
-                total = r.get("total_rows", 0)
-                active = r.get("active_rows", 0)
-                hist = r.get("historical_rows", 0)
-                deleted = r.get("deleted_rows", 0)
-                lots = r.get("distinct_lots", 0)
-                filter_pct = (
-                    round(active / total * 100, 1) if total else 0
-                )
-                log.info(
-                    "FPC density probe total=%s active(IS_HIS=0)=%s "
-                    "historical=%s deleted=%s lots=%s "
-                    "filter_keeps=%.1f%%",
-                    total, active, hist, deleted, lots, filter_pct,
-                )
-                if total > 0 and active == 0:
-                    log.warning(
-                        "FPC IS_HIS filter returns 0 rows! "
-                        "Consider setting fpc_filter_is_his=false in .env"
-                    )
-        except Exception:
-            log.warning("FPC density probe failed (non-fatal)", exc_info=True)
+        # Operational hint for long-term performance.
+        if total >= 1_000_000:
+            log.warning(
+                "FPC table is large (rows=%s). Consider nightly archive "
+                "of historical data to keep startup/delta queries fast.",
+                total,
+            )
 
     async def fetch_initial(
         self,
@@ -458,7 +516,8 @@ class FpcRepo:
             end_time.isoformat(),
             ("IS_HIS+DEL_FLAG" if self._extra_where else "none"),
         )
-        asyncio.ensure_future(self.probe_density(start_time, end_time))
+        if settings.fpc_density_probe_enabled:
+            asyncio.ensure_future(self.probe_density(start_time, end_time))
 
         t0 = time.perf_counter()
         rows = await self._fetch_range(start_time, end_time)

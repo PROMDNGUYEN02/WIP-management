@@ -126,6 +126,19 @@ class Settings(BaseSettings):
     )
     fpc_del_flag_column: str = "DEL_FLAG"
     fpc_del_flag_deleted_value: str = "1"
+    fpc_density_probe_enabled: bool = Field(
+        default=False,
+        description=(
+            "Run FPC density probe at startup. "
+            "Disabled by default to avoid expensive COUNT startup query."
+        ),
+    )
+    fpc_density_probe_cache_ttl_seconds: int = Field(
+        default=3600,
+        ge=60,
+        le=86400,
+        description="Cache TTL for density probe results.",
+    )
 
     # ═══════════════════════════════════════════════════════════════════════════
     # UI DATA WINDOW — Today Only Mode (Option B)
@@ -252,7 +265,22 @@ class Settings(BaseSettings):
         default=True,
         description="Allow parallel queries with legacy SQL Server driver.",
     )
-    sql_slow_query_threshold_ms: int = Field(default=2000, ge=100, le=30000)
+    sql_slow_query_threshold_ms: int = Field(default=10000, ge=100, le=30000)
+    sql_slow_query_threshold_fetch_range_ms: int = Field(
+        default=15000,
+        ge=500,
+        le=120000,
+    )
+    sql_slow_query_threshold_peek_ms: int = Field(
+        default=2000,
+        ge=100,
+        le=30000,
+    )
+    sql_slow_query_threshold_tray_cells_ms: int = Field(
+        default=3000,
+        ge=100,
+        le=30000,
+    )
 
     # ═══════════════════════════════════════════════════════════════════════════
     # CACHE SETTINGS
@@ -378,9 +406,9 @@ class Settings(BaseSettings):
 
     def get_tray_detail_time_tiers(self) -> list[tuple[float, int]]:
         return [
-            (self.tray_detail_narrow_window_hours, 200),
-            (self.tray_detail_medium_window_hours, 500),
-            (self.initial_load_lookback_hours, 1000),
+            (self.tray_detail_narrow_window_hours, 400),
+            (self.tray_detail_medium_window_hours, 1200),
+            (self.initial_load_lookback_hours, 5000),
         ]
 
     def get_ccu_backfill_next_delay(self, attempt: int) -> float:
@@ -403,7 +431,21 @@ class Settings(BaseSettings):
             "ui_coalesce_window_ms": self.ui_coalesce_window_ms,
             "fpc_filter_is_his": self.fpc_filter_is_his,
             "fpc_filter_del_flag": self.fpc_filter_del_flag,
+            "fpc_density_probe_enabled": self.fpc_density_probe_enabled,
+            "fpc_density_probe_cache_ttl_seconds": (
+                self.fpc_density_probe_cache_ttl_seconds
+            ),
             "fpc_initial_load_timeout_seconds": self.fpc_initial_load_timeout_seconds,
+            "sql_slow_query_threshold_ms": self.sql_slow_query_threshold_ms,
+            "sql_slow_query_threshold_fetch_range_ms": (
+                self.sql_slow_query_threshold_fetch_range_ms
+            ),
+            "sql_slow_query_threshold_peek_ms": (
+                self.sql_slow_query_threshold_peek_ms
+            ),
+            "sql_slow_query_threshold_tray_cells_ms": (
+                self.sql_slow_query_threshold_tray_cells_ms
+            ),
             "ccu_tray_id_db_column": self.ccu_tray_id_db_column or "JSON_VALUE",
             "ccu_json_tray_id_path": self.ccu_json_tray_id_path,
             "ccu_backfill_max_attempts": self.ccu_backfill_max_attempts,

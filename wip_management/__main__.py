@@ -638,6 +638,21 @@ def _configure_logging() -> None:
         def flush(self) -> None:
             self._stream.flush()
 
+    class _BoundedFormatter(logging.Formatter):
+        def __init__(self, *args, max_message_chars: int = 1200, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self._max_message_chars = max(200, int(max_message_chars))
+
+        def format(self, record: logging.LogRecord) -> str:
+            # Clone record per-handler so truncation only affects console output.
+            cloned = logging.makeLogRecord(record.__dict__.copy())
+            message = cloned.getMessage()
+            if len(message) > self._max_message_chars:
+                clipped = message[: self._max_message_chars - 3] + "..."
+                cloned.msg = clipped
+                cloned.args = ()
+            return super().format(cloned)
+
     level_name = settings.log_level.upper().strip() or "INFO"
     level = getattr(logging, level_name, logging.INFO)
     formatter = logging.Formatter(
@@ -648,7 +663,13 @@ def _configure_logging() -> None:
     root.setLevel(level)
     if settings.log_to_console:
         console_handler = logging.StreamHandler(stream=_SafeConsoleStream(sys.stdout))
-        console_handler.setFormatter(formatter)
+        console_handler.terminator = "\n"
+        console_handler.setFormatter(
+            _BoundedFormatter(
+                fmt="%(asctime)s %(levelname)s %(name)s [%(threadName)s] %(message)s",
+                max_message_chars=1200,
+            )
+        )
         root.addHandler(console_handler)
     log_path = settings.log_file.strip()
     if log_path:
@@ -953,6 +974,24 @@ class _Runtime:
             raise RuntimeError("Tray detail request timed out. Database is busy.")
         try:
             return self._submit(self._tray_cells(tray_id=tray_id))
+        finally:
+            self._tray_detail_submit_lock.release()
+
+    def prefetch_tray_cells(self, tray_ids: list[str]) -> dict[str, int]:
+        max_prefetch = 24
+        wanted_all = [str(t).strip() for t in tray_ids if str(t).strip()]
+        wanted = wanted_all[:max_prefetch]
+        if not wanted:
+            return {"requested": 0, "prefetched": 0, "skipped": 0}
+        # Never block user-facing tray detail requests for background prefetch.
+        if not self._tray_detail_submit_lock.acquire(blocking=False):
+            return {
+                "requested": len(wanted),
+                "prefetched": 0,
+                "skipped": len(wanted),
+            }
+        try:
+            return self._submit(self._prefetch_tray_cells(tray_ids=wanted))
         finally:
             self._tray_detail_submit_lock.release()
 
@@ -1356,6 +1395,10 @@ class _Runtime:
     async def _tray_cells(self, *, tray_id: str) -> list[dict[str, str | None]]:
         orchestrator = self._require_orchestrator()
         return await orchestrator.fetch_tray_cells(tray_id=tray_id)
+
+    async def _prefetch_tray_cells(self, *, tray_ids: list[str]) -> dict[str, int]:
+        orchestrator = self._require_orchestrator()
+        return await orchestrator.prefetch_tray_cells(tray_ids=tray_ids)
 
     async def _cell_owner(self, *, cell_id: str) -> dict[str, str | None] | None:
         orchestrator = self._require_orchestrator()
@@ -2646,10 +2689,19 @@ class _MainWindow(QMainWindow):
         self._queue_alert_timer: QTimer | None = None
         self._queue_alert_sound_timer: QTimer | None = None
         self._queue_alert_pulse_on = False
-        
+        self._tray_prefetch_pending_ids: list[str] = []
+        self._tray_prefetch_inflight = False
+        self._tray_prefetch_last_signature = ""
+
         self._window_status_timer = QTimer(self)
         self._window_status_timer.setInterval(2000)
         self._window_status_timer.timeout.connect(self._on_window_status_timer)
+        self._tray_prefetch_timer = QTimer(self)
+        self._tray_prefetch_timer.setSingleShot(True)
+        self._tray_prefetch_timer.setInterval(350)
+        self._tray_prefetch_timer.timeout.connect(
+            self._flush_tray_detail_prefetch
+        )
         
         self._clock_timer = QTimer(self)
         self._clock_timer.setInterval(1000)
@@ -3106,6 +3158,138 @@ class _MainWindow(QMainWindow):
             list_view.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
             return
 
+    def _collect_tray_prefetch_candidates(
+        self, *, max_items: int = 24
+    ) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        safe_limit = max(1, int(max_items))
+
+        def _add_many(values: list[str] | tuple[str, ...]) -> bool:
+            for raw in values:
+                tray_id = str(raw or "").strip()
+                if not tray_id or tray_id in seen:
+                    continue
+                seen.add(tray_id)
+                out.append(tray_id)
+                if len(out) >= safe_limit:
+                    return True
+            return False
+
+        # Prefer rows currently visible in Queue viewport.
+        list_view = self._queue_card.trolley_list
+        model = self._vm.queue_trolley_model
+        viewport = list_view.viewport()
+        viewport_rect = viewport.rect() if viewport is not None else QRect()
+        has_visible_rows = False
+        for row_idx in range(model.rowCount()):
+            index = model.index(row_idx, 0)
+            if not index.isValid():
+                continue
+            row_rect = list_view.visualRect(index)
+            if (
+                viewport is not None
+                and row_rect.isValid()
+                and row_rect.intersects(viewport_rect)
+            ):
+                has_visible_rows = True
+                tray_ids = list(
+                    model.data(index, TrolleyListModel.TrayIdsRole) or []
+                )
+                if _add_many(tray_ids):
+                    return out
+
+        if out:
+            return out
+
+        # Fallback for early layout cycle where visualRect is not ready yet.
+        if not has_visible_rows:
+            for row_idx in range(model.rowCount()):
+                index = model.index(row_idx, 0)
+                if not index.isValid():
+                    continue
+                tray_ids = list(
+                    model.data(index, TrolleyListModel.TrayIdsRole) or []
+                )
+                if _add_many(tray_ids):
+                    return out
+
+        # Final fallback: queue-ready rows.
+        for row in self._vm.queue_trolley_model.queue_ready_rows():
+            if _add_many(row.tray_ids):
+                return out
+
+        # Final fallback: selected rows.
+        selection_model = list_view.selectionModel()
+        if selection_model is not None:
+            for index in selection_model.selectedRows():
+                tray_ids = list(
+                    model.data(index, TrolleyListModel.TrayIdsRole) or []
+                )
+                if _add_many(tray_ids):
+                    return out
+
+        # Defensive fallback: all queue rows.
+        for row_idx in range(model.rowCount()):
+            index = model.index(row_idx, 0)
+            if not index.isValid():
+                continue
+            tray_ids = list(
+                model.data(index, TrolleyListModel.TrayIdsRole) or []
+            )
+            if _add_many(tray_ids):
+                return out
+
+        return out
+
+    def _schedule_tray_detail_prefetch(self) -> None:
+        if self._viewer_mode:
+            return
+        tray_ids = self._collect_tray_prefetch_candidates(max_items=24)
+        if not tray_ids:
+            return
+        signature = "|".join(tray_ids)
+        if (
+            not self._tray_prefetch_inflight
+            and not self._tray_prefetch_pending_ids
+            and signature == self._tray_prefetch_last_signature
+        ):
+            return
+        self._tray_prefetch_pending_ids = tray_ids
+        if not self._tray_prefetch_timer.isActive():
+            self._tray_prefetch_timer.start()
+
+    def _flush_tray_detail_prefetch(self) -> None:
+        if self._tray_prefetch_inflight:
+            return
+        tray_ids = list(self._tray_prefetch_pending_ids)
+        self._tray_prefetch_pending_ids = []
+        if not tray_ids:
+            return
+        self._tray_prefetch_inflight = True
+        self._tray_prefetch_last_signature = "|".join(tray_ids)
+
+        def _worker() -> None:
+            try:
+                result = self._runtime.prefetch_tray_cells(tray_ids)
+                payload = dict(result) if isinstance(result, dict) else {}
+                payload["tray_ids"] = tray_ids
+                self._action_bridge.action_done.emit(
+                    "Tray detail prefetch", payload, None
+                )
+            except Exception as exc:
+                self._action_bridge.action_done.emit(
+                    "Tray detail prefetch",
+                    {"tray_ids": tray_ids},
+                    str(exc),
+                )
+
+        threading.Thread(
+            target=_worker,
+            name="ui-prefetch-tray-detail",
+            daemon=True,
+        ).start()
+
     def _handle_queue_target_aging_alerts(self) -> None:
         min_target = max(float(settings.target_aging_hours) - float(settings.target_aging_tolerance_hours), 0.0)
         max_target = float(settings.target_aging_hours) + float(settings.target_aging_tolerance_hours)
@@ -3203,6 +3387,7 @@ class _MainWindow(QMainWindow):
         )
 
         self._handle_queue_target_aging_alerts()
+        self._schedule_tray_detail_prefetch()
         if self._dashboard_panel is not None and self._dashboard_visible:
             self._dashboard_panel.update_data(payload)
         self._refresh_indicator.setText(f"Updated {datetime.now().strftime('%H:%M:%S')}")
@@ -3384,6 +3569,7 @@ class _MainWindow(QMainWindow):
                 "UI_DATA_WINDOW_DAYS": str(settings.ui_data_window_days),
             })
         except Exception as exc:
+            log.exception("UI action failed action=Apply settings during env save")
             QMessageBox.critical(self, "Settings", f"Failed to save settings: {exc}")
             return
         
@@ -3402,6 +3588,13 @@ class _MainWindow(QMainWindow):
             if db_changed:
                 msg += " (restart required for DB changes)"
             self._show_status(msg, "success")
+            if db_changed:
+                self._show_restart_required_dialog()
+                self._pending_db_restart_notice = False
+            log.info(
+                "UI action completed action=Apply settings runtime_update=False restart_required=%s",
+                db_changed,
+            )
             return
         
         self._pending_settings_context = {
@@ -3762,6 +3955,18 @@ class _MainWindow(QMainWindow):
             else:
                 toast_manager.error(message, duration_ms=3800)
 
+    def _show_restart_required_dialog(self) -> None:
+        QMessageBox.information(
+            self,
+            "Restart Required",
+            (
+                "Database settings were saved.\n\n"
+                "Please restart WIP Management to apply SQL connection "
+                "and driver changes."
+            ),
+        )
+        log.info("Restart required dialog shown for DB setting changes")
+
     def _clear_status(self) -> None:
         self._status.setText("🟢 Ready")
         self._status.setStyleSheet(f"color: {self._theme.palette.text_secondary}; padding: 4px 12px; font-size: 12px;")
@@ -3810,6 +4015,7 @@ class _MainWindow(QMainWindow):
                 result = action()
                 self._action_bridge.action_done.emit(action_name, result, None)
             except Exception as exc:
+                log.exception("UI action failed action=%s", action_name)
                 self._action_bridge.action_done.emit(action_name, None, str(exc))
         
         threading.Thread(target=_worker, name=f"ui-action-{action_name.replace(' ', '-').lower()}", daemon=True).start()
@@ -3833,6 +4039,7 @@ class _MainWindow(QMainWindow):
                 result = action()
                 self._action_bridge.action_done.emit(action_name, result, None)
             except Exception as exc:
+                log.exception("UI action failed action=%s", action_name)
                 self._action_bridge.action_done.emit(action_name, None, str(exc))
         
         threading.Thread(target=_worker, name="ui-action-apply-settings", daemon=True).start()
@@ -3887,6 +4094,7 @@ class _MainWindow(QMainWindow):
             self._loading_overlay.stop()
             if error:
                 self._show_status(f"❌ Settings failed: {error}", "danger")
+                log.error("UI action failed action=%s error=%s", action_name, error)
                 self._pending_settings_context = None
                 return
             
@@ -3905,6 +4113,13 @@ class _MainWindow(QMainWindow):
                 days = context.get("data_window_days", settings.ui_data_window_days)
                 if payload.get("window_backfill_scheduled"):
                     self._show_status(f"⏳ Loading {days} day(s) data...", "info")
+                    if self._pending_db_restart_notice:
+                        self._show_restart_required_dialog()
+                        self._pending_db_restart_notice = False
+                    log.info(
+                        "UI action completed action=%s window_backfill_scheduled=True",
+                        action_name,
+                    )
                     self._start_window_load_monitor(days=days)
                     return
                 messages.append(f"{days} day window")
@@ -3912,12 +4127,53 @@ class _MainWindow(QMainWindow):
             msg = "✅ Settings applied"
             if messages:
                 msg += f": {', '.join(messages)}"
+            restart_required = bool(self._pending_db_restart_notice)
             if self._pending_db_restart_notice:
                 msg += " (restart for DB changes)"
-                self._pending_db_restart_notice = False
             self._show_status(msg, "success")
+            if restart_required:
+                self._show_restart_required_dialog()
+                self._pending_db_restart_notice = False
+            log.info(
+                "UI action completed action=%s window_backfill_scheduled=%s",
+                action_name,
+                bool(payload.get("window_backfill_scheduled")),
+            )
             return
-        
+
+        if action_name == "Tray detail prefetch":
+            self._tray_prefetch_inflight = False
+            payload = dict(result) if isinstance(result, dict) else {}
+            requested = int(payload.get("requested") or 0)
+            prefetched = int(payload.get("prefetched") or 0)
+            skipped = int(payload.get("skipped") or 0)
+            if error:
+                log.debug(
+                    "Tray detail prefetch skipped requested=%s error=%s",
+                    requested,
+                    error,
+                )
+            elif prefetched > 0:
+                log.info(
+                    "Tray detail prefetch completed requested=%s prefetched=%s skipped=%s",
+                    requested,
+                    prefetched,
+                    skipped,
+                )
+            else:
+                log.debug(
+                    "Tray detail prefetch completed requested=%s prefetched=%s skipped=%s",
+                    requested,
+                    prefetched,
+                    skipped,
+                )
+            if (
+                self._tray_prefetch_pending_ids
+                and not self._tray_prefetch_timer.isActive()
+            ):
+                self._tray_prefetch_timer.start(120)
+            return
+
         # Handle regular actions
         self._action_inflight = False
         if self._action_locked_ui:
@@ -4055,6 +4311,9 @@ class _MainWindow(QMainWindow):
         self._stop_window_load_monitor()
         self._clock_timer.stop()
         self._loading_overlay.stop()
+        if self._tray_prefetch_timer.isActive():
+            self._tray_prefetch_timer.stop()
+        self._tray_prefetch_pending_ids.clear()
         if self._queue_alert_timer is not None:
             self._queue_alert_timer.stop()
         if self._queue_alert_sound_timer is not None:
