@@ -65,32 +65,55 @@ class QueryStats:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Connection Lane — isolated (pool=1, executor=1) pair
+# Connection Lane — isolated pool + optional shared executor
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 class _ConnectionLane:
     """
-    An isolated (pool=1, executor=1) pair.
-    
-    Thread safety: Each lane has exactly ONE connection accessed by
-    exactly ONE dedicated thread. No cross-thread access possible.
+    A single ODBC connection behind an asyncio pool (size=1).
+
+    Thread-safety modes
+    ───────────────────
+    • **Own executor** (modern driver):
+        Each lane creates ThreadPoolExecutor(max_workers=1).
+        Different lanes → different OS threads → true parallelism.
+
+    • **Shared executor** (legacy driver):
+        All lanes share ONE ThreadPoolExecutor(max_workers=1).
+        All ODBC calls funnel through a single OS thread → safe.
+        Different lanes still provide routing / metrics separation.
     """
 
-    def __init__(self, lane_id: int, name: str = "") -> None:
+    def __init__(
+        self,
+        lane_id: int,
+        name: str = "",
+        shared_executor: ThreadPoolExecutor | None = None,
+    ) -> None:
         self.lane_id = lane_id
         self.name = name or f"lane-{lane_id}"
         self.pool: aioodbc.Pool | None = None
         self._executor: ThreadPoolExecutor | None = None
+        self._owns_executor: bool = (shared_executor is None)
+        self._shared_executor = shared_executor
         self._lock: asyncio.Lock | None = None
         self._query_count: int = 0
         self._active_query: str | None = None
 
     async def start(self, *, dsn: str) -> None:
-        self._executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix=f"pyodbc-{self.name}",
-        )
+        if self._shared_executor is not None:
+            # Legacy mode: reuse the single shared executor
+            self._executor = self._shared_executor
+            self._owns_executor = False
+        else:
+            # Modern mode: own dedicated thread
+            self._executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"pyodbc-{self.name}",
+            )
+            self._owns_executor = True
+
         self._lock = asyncio.Lock()
         self.pool = await aioodbc.create_pool(
             dsn=dsn,
@@ -99,20 +122,28 @@ class _ConnectionLane:
             maxsize=1,
             executor=self._executor,
         )
-        log.debug("Lane '%s' (id=%d) started", self.name, self.lane_id)
+        log.debug(
+            "Lane '%s' (id=%d) started shared_executor=%s",
+            self.name,
+            self.lane_id,
+            not self._owns_executor,
+        )
 
     async def close(self) -> None:
         if self.pool is not None:
             self.pool.close()
             await self.pool.wait_closed()
             self.pool = None
-        if self._executor is not None:
+        # Only shutdown executor if this lane created it
+        if self._executor is not None and self._owns_executor:
             self._executor.shutdown(wait=True, cancel_futures=False)
-            self._executor = None
+        self._executor = None
         self._lock = None
         log.debug(
             "Lane '%s' (id=%d) closed queries_executed=%d",
-            self.name, self.lane_id, self._query_count,
+            self.name,
+            self.lane_id,
+            self._query_count,
         )
 
     def is_busy(self) -> bool:
@@ -164,33 +195,25 @@ class _ConnectionLane:
 class _LaneRouter:
     """
     Routes queries to appropriate lanes based on query name.
-    
-    3-Lane legacy mode routing:
+
+    3-Lane routing:
       - Lane 0 (ccu): ccu.fetch_range, ccu.backfill_*
       - Lane 1 (fpc): fpc.fetch_range, fpc.density_probe, fpc.backfill_*
       - Lane 2 (ui):  ccu.fetch_tray_cells, dashboard.*, fallback
     """
 
-    # Query prefix → lane index mapping for 3-lane mode
     _ROUTING_3LANE: dict[str, int] = {
-        # CCU bulk operations → lane 0
         "ccu.fetch_range": 0,
         "ccu.backfill": 0,
-        
-        # FPC bulk operations → lane 1
         "fpc.fetch_range": 1,
         "fpc.density_probe": 1,
         "fpc.backfill": 1,
-        
-        # UI/interactive operations → lane 2
         "ccu.fetch_tray_cells": 2,
         "dashboard": 2,
     }
 
-    # 2-lane mode: CCU vs FPC
     _ROUTING_2LANE: dict[str, int] = {
-        "fpc.": 1,  # All FPC → lane 1
-        # Everything else → lane 0
+        "fpc.": 1,
     }
 
     @classmethod
@@ -199,21 +222,17 @@ class _LaneRouter:
         name_lower = (query_name or "").lower().strip()
 
         if lane_count >= 3:
-            # 3-lane mode: specific routing
             for prefix, lane_idx in cls._ROUTING_3LANE.items():
                 if name_lower.startswith(prefix):
                     return min(lane_idx, lane_count - 1)
-            # Default to UI lane for unknown queries
             return min(2, lane_count - 1)
 
         elif lane_count == 2:
-            # 2-lane mode: CCU vs FPC
             if name_lower.startswith("fpc."):
                 return 1
             return 0
 
         else:
-            # 1-lane mode: everything on lane 0
             return 0
 
 
@@ -224,32 +243,38 @@ class _LaneRouter:
 
 class SQLServerConnection:
     """
-    SQL Server connection with thread-safety fix for legacy ODBC driver.
+    SQL Server connection pool with thread-safety for legacy ODBC driver.
 
-    LEGACY DRIVER MODES:
-    ────────────────────
-    1. SERIALIZED (SQL_ALLOW_LEGACY_PARALLEL_QUERIES=false):
-       - 1 lane, 1 connection, 1 thread
-       - All queries run sequentially
-       - Safest but slowest
+    ARCHITECTURE — WHY MULTIPLE CONNECTIONS STILL CRASH
+    ───────────────────────────────────────────────────
+    The legacy 'SQL Server' ODBC driver (SQLSRV32.DLL) is loaded ONCE
+    into the process as a shared library.  Even with separate
+    pyodbc.Connection objects, calling the driver from different OS
+    threads simultaneously corrupts the DLL's internal state →
+    "Windows fatal exception: access violation".
 
-    2. MULTI-LANE (SQL_ALLOW_LEGACY_PARALLEL_QUERIES=true):
-       - 3 lanes: CCU + FPC + UI
-       - CCU refresh, FPC refresh, and UI queries can run in parallel
-       - Queries within each lane are serialized
-       - Much faster, but some crash risk with legacy driver
+    SOLUTION: all pyodbc calls go through ONE ThreadPoolExecutor
+    (max_workers=1) so that only ONE OS thread ever touches the DLL.
 
-    For modern drivers (ODBC Driver 17/18):
-    ───────────────────────────────────────
-    Multiple lanes with full concurrent execution.
+    MODES
+    ─────
+    1. SERIALIZED  (legacy, parallel=false):
+       1 lane · 1 connection · 1 thread.
+
+    2. MULTI-LANE SAFE  (legacy, parallel=true):
+       3 lanes · 3 connections · 1 SHARED thread.
+       Logical separation (routing + metrics) without crash risk.
+
+    3. MODERN  (ODBC Driver 17/18):
+       N lanes · N connections · N threads.  Full parallelism.
     """
 
-    # Lane count for legacy parallel mode
     _LEGACY_LANE_COUNT = 3
 
     def __init__(self) -> None:
         self._lanes: list[_ConnectionLane] | None = None
         self._lane_count: int = 0
+        self._shared_executor: ThreadPoolExecutor | None = None
 
         self._query_semaphore: asyncio.Semaphore | None = None
         self._slow_query_threshold_ms: int = settings.sql_slow_query_threshold_ms
@@ -294,16 +319,26 @@ class SQLServerConnection:
 
                 if is_legacy:
                     allow_parallel = bool(
-                        getattr(settings, "sql_allow_legacy_parallel_queries", False)
+                        getattr(
+                            settings,
+                            "sql_allow_legacy_parallel_queries",
+                            False,
+                        )
                     )
                     self._legacy_parallel_enabled = allow_parallel
 
                     if allow_parallel:
-                        await self._start_legacy_multi_lane(dsn=dsn, driver=driver)
+                        await self._start_legacy_multi_lane(
+                            dsn=dsn, driver=driver
+                        )
                     else:
-                        await self._start_legacy_serialized(dsn=dsn, driver=driver)
+                        await self._start_legacy_serialized(
+                            dsn=dsn, driver=driver
+                        )
                 else:
-                    concurrency = max(1, int(settings.sql_max_concurrent_queries))
+                    concurrency = max(
+                        1, int(settings.sql_max_concurrent_queries)
+                    )
                     await self._start_modern_lanes(
                         dsn=dsn, driver=driver, concurrency=concurrency
                     )
@@ -326,17 +361,19 @@ class SQLServerConnection:
             f"Attempted: {tried}. Installed: {installed}"
         ) from last_error
 
+    # ───────────────────────────────────────────────────────────────────
+    # Legacy driver — serialized (1 lane)
+    # ───────────────────────────────────────────────────────────────────
+
     async def _start_legacy_serialized(
         self, *, dsn: str, driver: str
     ) -> None:
-        """
-        LEGACY DRIVER - SERIALIZED MODE: 1 lane, fully sequential.
-        """
         log.warning(
             "Legacy SQL driver '%s' detected. Using SERIALIZED mode "
             "(1 connection, 1 thread, no parallelism). "
-            "Set SQL_ALLOW_LEGACY_PARALLEL_QUERIES=true for 3-lane mode. "
-            "Install 'ODBC Driver 17 for SQL Server' for best performance.",
+            "Set SQL_ALLOW_LEGACY_PARALLEL_QUERIES=true for 3-lane mode "
+            "(better query routing, same ODBC serialization). "
+            "Install 'ODBC Driver 17 for SQL Server' for true parallelism.",
             driver,
         )
 
@@ -356,47 +393,62 @@ class SQLServerConnection:
             "lanes=1 pool_maxsize=1 executor_workers=1 is_legacy=True",
         )
 
+    # ───────────────────────────────────────────────────────────────────
+    # Legacy driver — 3-lane safe (shared single executor)
+    # ───────────────────────────────────────────────────────────────────
+
     async def _start_legacy_multi_lane(
         self, *, dsn: str, driver: str
     ) -> None:
         """
-        LEGACY DRIVER - 3-LANE MODE: CCU + FPC + UI lanes.
-        
-        Lane routing:
-          - Lane 0 (ccu): ccu.fetch_range, ccu.backfill_*
-          - Lane 1 (fpc): fpc.fetch_range, fpc.density_probe
-          - Lane 2 (ui):  ccu.fetch_tray_cells, dashboard.*, user queries
-        
-        This allows:
-          - CCU and FPC initial load to run in parallel
-          - UI tray detail to run without waiting for refresh
-          - Dashboard writes to not block data fetches
-        
-        WARNING: 3 concurrent connections with legacy driver has some crash risk.
-        If crashes occur, set SQL_ALLOW_LEGACY_PARALLEL_QUERIES=false.
+        3 logical lanes, 3 connections, but ONE shared OS thread.
+
+        Why not 3 threads?
+        ──────────────────
+        SQLSRV32.DLL is loaded once per process.  Its internal state
+        is not protected by any lock.  Two OS threads calling into
+        the DLL at the same time corrupt memory → access violation.
+
+        Having 3 *connections* on 1 *thread* is safe: each connection
+        object is independent, and single-threaded access means the
+        DLL never sees concurrent calls.
         """
         lane_count = self._LEGACY_LANE_COUNT
 
         log.warning(
-            "Legacy SQL driver '%s' detected. Using 3-LANE mode "
-            "(3 connections: ccu + fpc + ui). "
-            "Queries can run in parallel across lanes. "
-            "If crashes occur, set SQL_ALLOW_LEGACY_PARALLEL_QUERIES=false. "
-            "Install 'ODBC Driver 17 for SQL Server' for best performance.",
+            "Legacy SQL driver '%s' detected. Using 3-LANE SAFE mode "
+            "(3 connections: ccu + fpc + ui, 1 shared ODBC thread). "
+            "All ODBC calls serialised through a single OS thread to "
+            "prevent access-violation crashes from the non-thread-safe "
+            "driver DLL. "
+            "Install 'ODBC Driver 17 for SQL Server' for true parallelism.",
             driver,
         )
+
+        # ── single shared executor for ALL lanes ──────────────────────
+        shared_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="pyodbc-legacy",
+        )
+        self._shared_executor = shared_executor
 
         lane_names = ["ccu", "fpc", "ui"]
         lanes: list[_ConnectionLane] = []
 
         try:
             for i in range(lane_count):
-                lane = _ConnectionLane(lane_id=i, name=lane_names[i])
+                lane = _ConnectionLane(
+                    lane_id=i,
+                    name=lane_names[i],
+                    shared_executor=shared_executor,
+                )
                 await lane.start(dsn=dsn)
                 lanes.append(lane)
         except Exception:
             for lane in lanes:
                 await lane.close()
+            shared_executor.shutdown(wait=False)
+            self._shared_executor = None
             raise
 
         self._lanes = lanes
@@ -409,19 +461,20 @@ class SQLServerConnection:
             driver,
         )
         log.info(
-            "SQL query concurrency: 3-LANE mode "
-            "lanes=[ccu(bulk), fpc(bulk), ui(interactive)] "
-            "pool_maxsize=1/lane executor_workers=1/lane is_legacy=True",
+            "SQL query concurrency: 3-LANE SAFE mode "
+            "lanes=[ccu, fpc, ui] connections=3 "
+            "shared_executor_threads=1 is_legacy=True "
+            "(all ODBC calls serialised through 1 OS thread)",
         )
+
+    # ───────────────────────────────────────────────────────────────────
+    # Modern driver — full parallelism
+    # ───────────────────────────────────────────────────────────────────
 
     async def _start_modern_lanes(
         self, *, dsn: str, driver: str, concurrency: int
     ) -> None:
-        """
-        MODERN DRIVER: Multiple lanes with full parallelism.
-        """
-        lane_count = min(concurrency, 8)
-        lane_count = max(lane_count, 2)
+        lane_count = max(2, min(concurrency, 8))
 
         log.info(
             "Modern SQL driver '%s': creating %d lanes.",
@@ -451,16 +504,23 @@ class SQLServerConnection:
         )
         log.info(
             "SQL query concurrency: MODERN mode "
-            "lanes=%d pool_maxsize=1/lane executor_workers=1/lane is_legacy=False",
+            "lanes=%d pool_maxsize=1/lane executor_workers=1/lane "
+            "is_legacy=False",
             lane_count,
         )
 
+    # ───────────────────────────────────────────────────────────────────
+    # Cleanup
+    # ───────────────────────────────────────────────────────────────────
+
     async def _cleanup_on_failure(self) -> None:
-        """Clean up partially-created resources on startup failure."""
         if self._lanes is not None:
             for lane in self._lanes:
                 await lane.close()
             self._lanes = None
+        if self._shared_executor is not None:
+            self._shared_executor.shutdown(wait=False)
+            self._shared_executor = None
 
     async def close(self) -> None:
         if self._lanes is None:
@@ -469,17 +529,23 @@ class SQLServerConnection:
 
         await self._log_stats()
 
+        # Close all lanes first (releases connections)
         for lane in self._lanes:
             await lane.close()
         self._lanes = None
+
+        # Then shutdown shared executor (lanes don't own it)
+        if self._shared_executor is not None:
+            self._shared_executor.shutdown(wait=True)
+            self._shared_executor = None
 
         self._query_semaphore = None
         self._active_driver = ""
         log.info("SQL pool closed")
 
-    # ═══════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════
     # Query Execution
-    # ═══════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════
 
     async def query_rows(
         self,
@@ -488,7 +554,6 @@ class SQLServerConnection:
         *,
         query_name: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Execute query with timing, lane selection, and stats."""
         if self._lanes is None:
             raise RuntimeError("SQL connection has not started")
         if self._query_semaphore is None:
@@ -499,7 +564,6 @@ class SQLServerConnection:
         )
         query_label = (query_name or "sql.query").strip() or "sql.query"
 
-        # Route query to appropriate lane
         lane_idx = _LaneRouter.route(query_label, self._lane_count)
         lane = self._lanes[min(lane_idx, len(self._lanes) - 1)]
 
@@ -522,7 +586,6 @@ class SQLServerConnection:
         query_preview: str,
         started_at: float,
     ) -> tuple[list[tuple], list[str]]:
-        """Execute query with timing, logging, and stats."""
         exec_started_at = time.perf_counter()
         queue_wait_ms = int((exec_started_at - started_at) * 1000)
         is_error = False
@@ -559,8 +622,8 @@ class SQLServerConnection:
 
         if is_slow:
             log.warning(
-                "SQL query slow name=%s lane=%s total_ms=%s queue_wait_ms=%s "
-                "db_exec_ms=%s rows=%s params=%s sql=%s",
+                "SQL query slow name=%s lane=%s total_ms=%s "
+                "queue_wait_ms=%s db_exec_ms=%s rows=%s params=%s sql=%s",
                 query_label,
                 lane.name,
                 elapsed_ms,
@@ -581,9 +644,9 @@ class SQLServerConnection:
 
         return rows, cols
 
-    # ═══════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════
     # Stats
-    # ═══════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════
 
     async def _record_stats(
         self,
