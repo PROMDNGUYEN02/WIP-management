@@ -3436,6 +3436,12 @@ class _MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════════════
     
     def _run_action(self, *, action_name: str, action: Callable[[], Any], lock_ui: bool = True) -> None:
+        if self._viewer_mode:
+            if action_name == "Auto group":
+                self._set_auto_group_checkbox_safely(self._auto_group_last_state)
+            self._show_status("⚠️ Viewer mode: use leader instance for actions", "warning")
+            log.warning("UI action blocked in viewer mode action=%s", action_name)
+            return
         if self._action_inflight:
             self._show_status("⏳ Another action is running...", "warning")
             return
@@ -3457,6 +3463,10 @@ class _MainWindow(QMainWindow):
     
     def _run_settings_action(self, *, action: Callable[[], Any]) -> None:
         action_name = "Apply settings"
+        if self._viewer_mode:
+            self._show_status("⚠️ Viewer mode: settings can only be changed on leader instance", "warning")
+            log.warning("UI action blocked in viewer mode action=%s", action_name)
+            return
         if self._settings_inflight:
             self._show_status("⏳ Settings update in progress...", "warning")
             return
@@ -3582,12 +3592,14 @@ class _MainWindow(QMainWindow):
         # Handle errors
         if error:
             error_text = str(error)
+            if "Viewer mode - use leader instance for actions" in error_text:
+                if action_name == "Auto group":
+                    self._set_auto_group_checkbox_safely(self._auto_group_last_state)
+                self._show_status("⚠️ Viewer mode: use leader instance for actions", "warning")
+                log.warning("UI action blocked in viewer mode action=%s", action_name)
+                return
             if action_name == "Auto group":
                 self._set_auto_group_checkbox_safely(self._auto_group_last_state)
-                if "Viewer mode - use leader instance for actions" in error_text:
-                    self._show_status("⚠️ Viewer mode: Auto group can only be changed on leader instance", "warning")
-                    log.warning("UI action blocked in viewer mode action=%s", action_name)
-                    return
             self._show_status(f"❌ {action_name} failed: {error}", "danger")
             log.error("UI action failed action=%s error=%s", action_name, error)
             return
