@@ -30,10 +30,7 @@ class Settings(BaseSettings):
 
     # Shared state for multi-instance coordination
     shared_state_enabled: bool = True
-    shared_state_dir: str = (
-        r"C:\Users\PROMDNGUYEN02\OneDrive - Techtronic Industries Co. Ltd"
-        r"\AES_Mass production - WIP Management"
-    )
+    shared_state_dir: str = str(Path(tempfile.gettempdir()) / "wip_management_state")
     shared_state_file: str = "grouping_state.json"
     grouping_sync_interval_seconds: float = Field(default=3.0, ge=0.5, le=120.0)
 

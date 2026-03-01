@@ -97,6 +97,7 @@ class MetricCard(AnimatedCard):
     ) -> None:
         super().__init__(parent, clickable=True)
         self.setObjectName("metricCard")
+        self.setMinimumHeight(104)
         self._color = color or get_theme().palette.primary
         self._current_value = 0
         self._target_value = 0
@@ -111,60 +112,66 @@ class MetricCard(AnimatedCard):
     
     def _setup_ui(self, title: str, icon: str) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(8)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         # Top row: icon + trend
         top_row = QHBoxLayout()
-        top_row.setSpacing(0)
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(6)
+        top_row.addStretch(1)
         
         # Icon with colored background
         icon_container = QFrame()
-        icon_container.setFixedSize(44, 44)
+        icon_container.setFixedSize(34, 34)
         icon_container.setStyleSheet(f"""
             background: {self._color}15;
-            border-radius: 12px;
+            border-radius: 10px;
         """)
         icon_layout = QVBoxLayout(icon_container)
         icon_layout.setContentsMargins(0, 0, 0, 0)
         icon_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         self._icon = QLabel(icon)
-        self._icon.setFont(QFont("Segoe UI Emoji", 18))
+        self._icon.setFont(QFont("Segoe UI Emoji", 15))
         self._icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_layout.addWidget(self._icon)
-        
+
         top_row.addWidget(icon_container)
-        top_row.addStretch()
-        
+
         # Trend indicator
         if self._show_trend:
             self._trend = QLabel("")
             self._trend.setObjectName("metricTrend")
             self._trend.setVisible(False)
             top_row.addWidget(self._trend)
+        top_row.addStretch(1)
         
         layout.addLayout(top_row)
         
         # Value
         self._value_label = QLabel("0")
         self._value_label.setObjectName("metricValue")
+        self._value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._value_label)
         
         # Title
         self._title_label = QLabel(title)
         self._title_label.setObjectName("metricTitle")
+        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._title_label)
         
         # Sparkline (if enabled)
         if self._show_sparkline:
             self._sparkline = SparklineWidget(color=self._color)
-            self._sparkline.setFixedHeight(30)
+            self._sparkline.setFixedHeight(20)
             layout.addWidget(self._sparkline)
         
         # Subtitle (optional)
         self._subtitle = QLabel("")
         self._subtitle.setObjectName("metricSubtitle")
+        self._subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._subtitle.setVisible(False)
         layout.addWidget(self._subtitle)
     

@@ -387,13 +387,13 @@ class ThemeManager(QObject):
         }}
         
         QLabel#metricIcon {{
-            font-size: 28px;
+            font-size: 20px;
             color: {p.text_secondary};
         }}
-        
+
         QLabel#metricValue {{
             color: {p.text_primary};
-            font-size: 36px;
+            font-size: 28px;
             font-weight: 700;
             letter-spacing: -1.5px;
         }}
@@ -409,18 +409,18 @@ class ThemeManager(QObject):
         QLabel#metricTrend {{
             font-size: 12px;
             font-weight: 600;
-            padding: 4px 8px;
-            border-radius: 8px;
+            padding: 0;
+            background: transparent;
         }}
         
         QLabel#metricTrendUp {{
             color: {p.success};
-            background: {p.success_bg};
+            background: transparent;
         }}
         
         QLabel#metricTrendDown {{
             color: {p.danger};
-            background: {p.danger_bg};
+            background: transparent;
         }}
         
         QLabel#metricSubtitle {{
@@ -435,7 +435,7 @@ class ThemeManager(QObject):
         QFrame#columnCard {{
             background: {p.surface};
             border: 1px solid {p.border};
-            border-radius: 16px;
+            border-radius: 16px 16px 0 0;
         }}
         
         QLabel#columnHeader {{

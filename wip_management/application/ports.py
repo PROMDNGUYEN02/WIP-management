@@ -70,6 +70,8 @@ class NotifierPort(Protocol):
 class GroupingStateRepoPort(Protocol):
     async def load_manual_assignments(self) -> dict[str, tuple[str, str, str]]: ...
 
+    async def load_projection(self) -> dict[str, Any]: ...
+
     async def set_manual_assignment(
         self,
         tray_id: str,

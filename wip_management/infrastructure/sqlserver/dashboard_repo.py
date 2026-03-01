@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import datetime
@@ -567,6 +568,296 @@ SELECT 1 AS ok;
             params,
             query_name="dashboard.upsert_tray_map_chunk",
         )
+
+
+class GroupingStateDbRepo:
+    _MANUAL_ASSIGNMENTS_KEY = "manual_assignments"
+    _LAST_PROJECTION_KEY = "last_projection"
+
+    def __init__(self, connection: SQLServerConnection) -> None:
+        self._conn = connection
+        self._state_table = SQLServerConnection.table_name(
+            settings.sql_schema, "WIP_GROUPING_STATE"
+        )
+        self._state_obj = f"{settings.sql_schema}.WIP_GROUPING_STATE"
+        self._write_enabled = True
+        self._schema_available = True
+
+    async def start(self) -> None:
+        await self._conn.start()
+        is_read_only = await self._is_database_read_only()
+        if is_read_only:
+            self._write_enabled = False
+            self._schema_available = await self._check_schema_available()
+            log.warning(
+                "Grouping state DB repo detected read-only database; "
+                "schema_available=%s",
+                self._schema_available,
+            )
+            return
+        try:
+            await self._ensure_schema()
+            self._write_enabled = True
+            self._schema_available = True
+            return
+        except Exception as exc:  # noqa: BLE001
+            if not _is_read_only_error(exc):
+                raise
+            self._write_enabled = False
+            self._schema_available = await self._check_schema_available()
+            log.warning(
+                "Grouping state DB repo switched to read-only mode "
+                "schema_available=%s reason=%s",
+                self._schema_available,
+                exc,
+            )
+
+    async def close(self) -> None:
+        await self._conn.close()
+
+    async def load_manual_assignments(
+        self,
+    ) -> dict[str, tuple[str, str, str]]:
+        raw = await self._read_state_json(self._MANUAL_ASSIGNMENTS_KEY)
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, tuple[str, str, str]] = {}
+        for tray_id, item in raw.items():
+            if not isinstance(item, dict):
+                continue
+            tray_key = str(tray_id).strip()
+            column = str(item.get("column", "")).strip()
+            trolley_id = str(item.get("trolley_id", "")).strip()
+            mode = str(item.get("mode", "manual")).strip().lower() or "manual"
+            if not tray_key or not column or not trolley_id:
+                continue
+            out[tray_key] = (column, trolley_id, mode)
+        return out
+
+    async def load_projection(self) -> dict[str, Any]:
+        raw = await self._read_state_json(self._LAST_PROJECTION_KEY)
+        if not isinstance(raw, dict):
+            return {}
+        return dict(raw)
+
+    async def set_manual_assignment(
+        self,
+        tray_id: str,
+        column: str,
+        trolley_id: str,
+        mode: str = "manual",
+    ) -> None:
+        tray_key = str(tray_id).strip()
+        column_key = str(column).strip()
+        trolley_key = str(trolley_id).strip()
+        mode_key = str(mode).strip().lower() or "manual"
+        if not tray_key or not column_key or not trolley_key:
+            raise ValueError("tray_id, column, trolley_id must not be empty")
+        current = await self._read_state_json(self._MANUAL_ASSIGNMENTS_KEY)
+        manual_assignments = current if isinstance(current, dict) else {}
+        manual_assignments[tray_key] = {
+            "column": column_key,
+            "trolley_id": trolley_key,
+            "mode": mode_key,
+        }
+        await self._write_state_json(
+            self._MANUAL_ASSIGNMENTS_KEY, manual_assignments
+        )
+
+    async def remove_manual_assignment(self, tray_id: str) -> None:
+        tray_key = str(tray_id).strip()
+        if not tray_key:
+            return
+        current = await self._read_state_json(self._MANUAL_ASSIGNMENTS_KEY)
+        manual_assignments = current if isinstance(current, dict) else {}
+        manual_assignments.pop(tray_key, None)
+        await self._write_state_json(
+            self._MANUAL_ASSIGNMENTS_KEY, manual_assignments
+        )
+
+    async def replace_manual_assignments(
+        self, assignments: dict[str, tuple[str, str, str]]
+    ) -> None:
+        payload: dict[str, dict[str, str]] = {}
+        for tray_id, item in assignments.items():
+            tray_key = str(tray_id).strip()
+            column, trolley_id, mode = item
+            column_key = str(column).strip()
+            trolley_key = str(trolley_id).strip()
+            mode_key = str(mode).strip().lower() or "manual"
+            if not tray_key or not column_key or not trolley_key:
+                continue
+            payload[tray_key] = {
+                "column": column_key,
+                "trolley_id": trolley_key,
+                "mode": mode_key,
+            }
+        await self._write_state_json(self._MANUAL_ASSIGNMENTS_KEY, payload)
+
+    async def save_projection(self, projection: dict[str, Any]) -> None:
+        payload = projection if isinstance(projection, dict) else {}
+        await self._write_state_json(self._LAST_PROJECTION_KEY, payload)
+
+    async def _read_state_json(self, state_key: str) -> dict[str, Any]:
+        if not self._schema_available:
+            return {}
+        query = (
+            f"SELECT TOP 1 state_json FROM {self._state_table} "
+            "WHERE state_key = ?"
+        )
+        try:
+            rows = await self._conn.query_rows(
+                query,
+                [state_key],
+                query_name="grouping_state.load",
+            )
+        except Exception as exc:  # noqa: BLE001
+            if _is_missing_object_error(exc):
+                self._schema_available = False
+                log.warning(
+                    "Grouping state table missing while loading key=%s",
+                    state_key,
+                )
+                return {}
+            raise
+        if not rows:
+            return {}
+        raw_json = str(rows[0].get("state_json") or "").strip()
+        if not raw_json:
+            return {}
+        try:
+            loaded = json.loads(raw_json)
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "Grouping state JSON parse failed key=%s", state_key
+            )
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+
+    async def _write_state_json(
+        self, state_key: str, payload: dict[str, Any]
+    ) -> None:
+        if not self._write_enabled:
+            return
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        query = (
+            "IF EXISTS ("
+            f"SELECT 1 FROM {self._state_table} WHERE state_key = ?"
+            ") "
+            "BEGIN "
+            f"UPDATE {self._state_table} "
+            "SET state_json = ?, updated_at = SYSUTCDATETIME() "
+            "WHERE state_key = ?; "
+            "END "
+            "ELSE "
+            "BEGIN "
+            f"INSERT INTO {self._state_table}(state_key, state_json, updated_at) "
+            "VALUES (?, ?, SYSUTCDATETIME()); "
+            "END; "
+            "SELECT 1 AS ok;"
+        )
+        for attempt in range(2):
+            if not self._schema_available:
+                try:
+                    await self._ensure_schema()
+                    self._schema_available = True
+                except Exception as exc:  # noqa: BLE001
+                    if _is_read_only_error(exc):
+                        self._write_enabled = False
+                        log.warning(
+                            "Grouping state write disabled due to read-only error key=%s",
+                            state_key,
+                        )
+                        return
+                    raise
+            try:
+                await self._conn.query_rows(
+                    query,
+                    [state_key, serialized, state_key, state_key, serialized],
+                    query_name="grouping_state.upsert",
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                if _is_missing_object_error(exc):
+                    self._schema_available = False
+                    if attempt == 0:
+                        continue
+                    log.warning(
+                        "Grouping state table missing during write key=%s",
+                        state_key,
+                    )
+                    return
+                if _is_read_only_error(exc):
+                    self._write_enabled = False
+                    log.warning(
+                        "Grouping state write disabled due to read-only error key=%s",
+                        state_key,
+                    )
+                    return
+                raise
+
+    async def _ensure_schema(self) -> None:
+        query = f"""
+IF OBJECT_ID('{self._state_obj}', 'U') IS NULL
+BEGIN
+    CREATE TABLE {self._state_table} (
+        state_key NVARCHAR(64) NOT NULL PRIMARY KEY,
+        state_json NVARCHAR(MAX) NOT NULL,
+        updated_at DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME()
+    );
+END;
+
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.indexes
+    WHERE object_id = OBJECT_ID('{self._state_obj}')
+      AND name = 'IX_WIP_GROUPING_STATE_UPDATED'
+)
+BEGIN
+    CREATE INDEX [IX_WIP_GROUPING_STATE_UPDATED]
+        ON {self._state_table}(updated_at DESC);
+END;
+
+SELECT 1 AS ok;
+"""
+        await self._conn.query_rows(
+            query,
+            [],
+            query_name="grouping_state.ensure_schema",
+        )
+
+    async def _check_schema_available(self) -> bool:
+        query = (
+            "SELECT CASE WHEN OBJECT_ID(?, 'U') IS NOT NULL THEN 1 ELSE 0 END "
+            "AS has_state"
+        )
+        rows = await self._conn.query_rows(
+            query,
+            [self._state_obj],
+            query_name="grouping_state.check_schema_available",
+        )
+        if not rows:
+            return False
+        return _as_int(rows[0].get("has_state")) == 1
+
+    async def _is_database_read_only(self) -> bool:
+        query = (
+            "SELECT CONVERT(NVARCHAR(60), DATABASEPROPERTYEX(DB_NAME(), "
+            "'Updateability')) AS updateability"
+        )
+        rows = await self._conn.query_rows(
+            query,
+            [],
+            query_name="grouping_state.db_updateability",
+        )
+        if not rows:
+            return False
+        updateability = str(rows[0].get("updateability") or "").strip().upper()
+        return updateability == "READ_ONLY"
 
 
 def _normalize_tray_id(raw_value: str) -> str:

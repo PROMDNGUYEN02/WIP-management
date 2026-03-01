@@ -82,7 +82,7 @@ from wip_management.infrastructure.sqlserver.connection import SQLServerConnecti
 from wip_management.infrastructure.sqlserver.dashboard_repo import DashboardRepo
 from wip_management.infrastructure.sqlserver.delta_tracker import InMemoryDeltaTracker
 from wip_management.infrastructure.sqlserver.fpc_repo import FpcRepo
-from wip_management.presentation.ui.charts import BarChart, DonutChart, GaugeChart, LineChart
+from wip_management.presentation.ui.charts import BarChart, DonutChart, LineChart
 from wip_management.presentation.ui.components import (
     Divider,
     EmptyState,
@@ -109,6 +109,7 @@ log = logging.getLogger(__name__)
 _MAX_UI_WINDOW_DAYS = 365
 _GRACEFUL_STOP_TIMEOUT_SECONDS = 150.0
 _FORCE_STOP_TIMEOUT_SECONDS = 10.0
+_AGV_ICON = "🤖"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # THEME SYSTEM
@@ -1552,6 +1553,7 @@ class _TrolleyItemDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p = get_theme().palette
         
         rect = option.rect
         is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
@@ -1559,14 +1561,14 @@ class _TrolleyItemDelegate(QStyledItemDelegate):
         
         # Background
         if is_selected:
-            bg_color = QColor(ThemeColors.PRIMARY_LIGHT)
-            border_color = QColor(ThemeColors.PRIMARY)
+            bg_color = QColor(p.primary_light)
+            border_color = QColor(p.primary)
         elif is_hovered:
-            bg_color = QColor(ThemeColors.SURFACE_HOVER)
-            border_color = QColor(ThemeColors.BORDER)
+            bg_color = QColor(p.surface_hover)
+            border_color = QColor(p.border)
         else:
-            bg_color = QColor(ThemeColors.SURFACE)
-            border_color = QColor(ThemeColors.BORDER_LIGHT)
+            bg_color = QColor(p.surface)
+            border_color = QColor(p.border_light)
         
         # Draw rounded rectangle
         from PySide6.QtGui import QPainterPath
@@ -1596,7 +1598,7 @@ class _TrolleyItemDelegate(QStyledItemDelegate):
         
         # Trolley ID (main text)
         painter.setFont(QFont("Segoe UI", 13, QFont.Weight.DemiBold))
-        painter.setPen(QColor(ThemeColors.TEXT))
+        painter.setPen(QColor(p.text_primary))
         painter.drawText(
             QRectF(inner_rect.left(), inner_rect.top(), inner_rect.width() * 0.5, 20),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
@@ -1605,10 +1607,10 @@ class _TrolleyItemDelegate(QStyledItemDelegate):
         
         # State badge (top right)
         state_colors = {
-            "Stacking": (ThemeColors.INFO_BG, ThemeColors.INFO),
-            "Aging": (ThemeColors.WARNING_BG, ThemeColors.WARNING),
-            "Waiting": (ThemeColors.BORDER_LIGHT, ThemeColors.TEXT_MUTED),
-            "Completed": (ThemeColors.SUCCESS_BG, ThemeColors.SUCCESS),
+            "Stacking": (p.info_bg, p.info),
+            "Aging": (p.warning_bg, p.warning),
+            "Waiting": (p.border_light, p.text_muted),
+            "Completed": (p.success_bg, p.success),
         }
         if state in state_colors:
             bg, fg = state_colors[state]
@@ -1619,12 +1621,12 @@ class _TrolleyItemDelegate(QStyledItemDelegate):
         painter.setFont(QFont("Segoe UI", 11))
         
         # Mode badge
-        mode_bg = ThemeColors.PRIMARY_LIGHT if mode == "manual" else ThemeColors.BORDER_LIGHT
-        mode_fg = ThemeColors.PRIMARY if mode == "manual" else ThemeColors.TEXT_MUTED
+        mode_bg = p.primary_light if mode == "manual" else p.border_light
+        mode_fg = p.primary if mode == "manual" else p.text_muted
         self._draw_badge(painter, inner_rect.left(), bottom_y, mode.upper(), mode_bg, mode_fg, small=True)
         
         # Counts
-        painter.setPen(QColor(ThemeColors.TEXT_SECONDARY))
+        painter.setPen(QColor(p.text_secondary))
         count_text = f"📦 {tray_count}  •  🔋 {cell_count:,}"
         painter.drawText(
             QRectF(inner_rect.left() + 75, bottom_y, 150, 20),
@@ -1635,11 +1637,11 @@ class _TrolleyItemDelegate(QStyledItemDelegate):
         # Aging (if applicable)
         if aging_time != "-":
             aging_colors = {
-                "waiting": (ThemeColors.WARNING_BG, ThemeColors.WARNING),
-                "ready": (ThemeColors.SUCCESS_BG, ThemeColors.SUCCESS),
-                "exceed": (ThemeColors.DANGER_BG, ThemeColors.DANGER),
+                "waiting": (p.warning_bg, p.warning),
+                "ready": (p.success_bg, p.success),
+                "exceed": (p.danger_bg, p.danger),
             }
-            ag_bg, ag_fg = aging_colors.get(aging_state, (ThemeColors.BORDER_LIGHT, ThemeColors.TEXT_MUTED))
+            ag_bg, ag_fg = aging_colors.get(aging_state, (p.border_light, p.text_muted))
             self._draw_badge(painter, inner_rect.right() - 95, bottom_y, f"⏱ {aging_time}", ag_bg, ag_fg, small=True)
         
         painter.restore()
@@ -1673,7 +1675,7 @@ class _TrolleyItemDelegate(QStyledItemDelegate):
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
     
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
-        return QSize(option.rect.width(), 76)
+        return QSize(option.rect.width(), 64)
 
 
 class _TraySelectIconPainter:
@@ -1681,8 +1683,9 @@ class _TraySelectIconPainter:
     def draw(painter: QPainter, rect, state: str) -> None:
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p = get_theme().palette
         
-        color = QColor(ThemeColors.TEXT_MUTED)
+        color = QColor(p.text_muted)
         pen = QPen(color)
         pen.setWidth(2)
         painter.setPen(pen)
@@ -1697,13 +1700,13 @@ class _TraySelectIconPainter:
         
         if state == "on":
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(ThemeColors.PRIMARY))
+            painter.setBrush(QColor(p.primary))
             inner_d = max(4.0, diameter - 6.0)
             inner_r = inner_d / 2.0
             inner_rect = QRectF(cx - inner_r, cy - inner_r, inner_d, inner_d)
             painter.drawEllipse(inner_rect)
         elif state == "partial":
-            painter.setBrush(QColor(ThemeColors.PRIMARY))
+            painter.setBrush(QColor(p.primary))
             half = max(3.0, diameter * 0.3)
             painter.drawRect(QRectF(cx - half, cy - 1.5, half * 2, 3))
         
@@ -1753,6 +1756,7 @@ class _ModernColumnCard(QFrame):
         on_trolley_double_click: Callable[[QListView, QModelIndex], None] | None = None,
         on_trolley_click: Callable[[QListView, QModelIndex], None] | None = None,
         on_tray_header_click: Callable[[int], None] | None = None,
+        on_tray_double_click: Callable[[QTableView, QModelIndex], None] | None = None,
     ) -> None:
         super().__init__()
         self.setObjectName("columnCard")
@@ -1765,7 +1769,13 @@ class _ModernColumnCard(QFrame):
         self._interaction_release_timer: QTimer | None = None
         
         self._setup_ui(title, icon, trolley_model, tray_model, tray_title, tray_actions_widget)
-        self._setup_connections(on_trolley_context, on_trolley_double_click, on_trolley_click, on_tray_header_click)
+        self._setup_connections(
+            on_trolley_context,
+            on_trolley_double_click,
+            on_trolley_click,
+            on_tray_header_click,
+            on_tray_double_click,
+        )
         self._setup_shortcuts()
     
     def _setup_ui(
@@ -1873,16 +1883,15 @@ class _ModernColumnCard(QFrame):
         self.tray_table = QTableView()
         self.tray_table.setModel(tray_model)
         tray_model.modelReset.connect(self._schedule_resize_tray_columns)
+        tray_model.rowsInserted.connect(self._schedule_resize_tray_columns)
+        tray_model.rowsRemoved.connect(self._schedule_resize_tray_columns)
+        tray_model.dataChanged.connect(self._schedule_resize_tray_columns)
         self.tray_table.setAlternatingRowColors(True)
-        self.tray_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        self.tray_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tray_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.tray_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.CurrentChanged |
-            QAbstractItemView.EditTrigger.SelectedClicked |
-            QAbstractItemView.EditTrigger.DoubleClicked
-        )
+        self.tray_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tray_table.verticalHeader().setVisible(False)
-        self.tray_table.verticalHeader().setDefaultSectionSize(36)
+        self.tray_table.verticalHeader().setDefaultSectionSize(30)
         self.tray_table.setShowGrid(False)
         
         header = _TraySelectHeaderView(Qt.Orientation.Horizontal, self.tray_table)
@@ -1893,6 +1902,7 @@ class _ModernColumnCard(QFrame):
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
         
         self.tray_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.tray_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.tray_table.setWordWrap(False)
         self.tray_table.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.tray_table.setMouseTracking(True)
@@ -1922,6 +1932,7 @@ class _ModernColumnCard(QFrame):
         on_trolley_double_click,
         on_trolley_click,
         on_tray_header_click,
+        on_tray_double_click,
     ) -> None:
         self._on_trolley_context_cb = on_trolley_context
         
@@ -1939,6 +1950,10 @@ class _ModernColumnCard(QFrame):
             self.tray_table.clicked.connect(self._on_tray_table_clicked)
             if on_tray_header_click is not None:
                 self.tray_table.horizontalHeader().sectionClicked.connect(on_tray_header_click)
+            if on_tray_double_click is not None:
+                self.tray_table.doubleClicked.connect(
+                    lambda idx: on_tray_double_click(self.tray_table, idx)
+                )
     
     def _setup_shortcuts(self) -> None:
         # Trolley list shortcuts
@@ -2151,36 +2166,44 @@ class _ModernColumnCard(QFrame):
         header.setStretchLastSection(False)
         row_count = model.rowCount()
         column_count = model.columnCount()
+        if column_count <= 0:
+            return
         
         for col in range(column_count):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
-        
-        # Base widths for columns
-        base_widths = {1: 50, 2: 130, 3: 60, 4: 150, 5: 150, 6: 90, 7: 90, 8: 90}
-        for col, width in base_widths.items():
-            if col < column_count:
-                header.resizeSection(col, width)
-        
-        # Auto-size tray ID column
-        if row_count > 0 and column_count > 2:
-            fm: QFontMetrics = self.tray_table.fontMetrics()
-            max_tray_width = 0
-            sample_limit = min(row_count, 50)
+
+        fm: QFontMetrics = self.tray_table.fontMetrics()
+        sample_limit = min(row_count, 120)
+        widths: dict[int, int] = {}
+        viewport_width = max(0, self.tray_table.viewport().width())
+
+        row_height = max(20, self.tray_table.verticalHeader().defaultSectionSize())
+        icon_width = max(24, min(28, row_height - 8))
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.resizeSection(0, icon_width)
+        widths[0] = icon_width
+
+        for col in range(1, column_count):
+            header_text = str(
+                model.headerData(col, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or ""
+            )
+            max_width = fm.horizontalAdvance(header_text) + 26
             for row_idx in range(sample_limit):
-                idx = model.index(row_idx, 2)
+                idx = model.index(row_idx, col)
                 text = str(model.data(idx, Qt.ItemDataRole.DisplayRole) or "")
-                w = fm.horizontalAdvance(text) + 20
-                if w > max_tray_width:
-                    max_tray_width = w
-            if max_tray_width > 0:
-                header.resizeSection(2, max(110, min(max_tray_width, 260)))
-        
-        # Fixed size for checkbox column
-        if column_count > 0:
-            row_height = max(20, self.tray_table.verticalHeader().defaultSectionSize())
-            icon_width = max(24, min(28, row_height - 8))
-            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-            header.resizeSection(0, icon_width)
+                max_width = max(max_width, fm.horizontalAdvance(text) + 24)
+            limit = 300 if col == 2 else 240
+            widths[col] = max(56, min(max_width, limit))
+
+        if viewport_width > 0 and column_count > 1:
+            used = sum(widths.values())
+            extra = viewport_width - used
+            if extra > 0:
+                grow_col = 2 if 2 < column_count else 1
+                widths[grow_col] = widths.get(grow_col, 0) + extra
+
+        for col in range(1, column_count):
+            header.resizeSection(col, widths[col])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2737,23 +2760,23 @@ class _MainWindow(QMainWindow):
         root = QWidget(self)
         self._root_widget = root
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(20)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
         p = self._theme.palette
         
         # ═══════════════════════════════════════════════════════════════
         # TOP SECTION: Metrics
         # ═══════════════════════════════════════════════════════════════
         metrics_row = QHBoxLayout()
-        metrics_row.setSpacing(16)
+        metrics_row.setSpacing(10)
         
         self._metric_boxes = {
             "tray_count": MetricCard("Total Trays", "📦", self._theme.palette.chart_1, show_sparkline=True),
             "group_count": MetricCard("Grouped", "✓", self._theme.palette.success, show_sparkline=True),
             "assembly_ungroup_count": MetricCard("Ungrouped", "⏳", self._theme.palette.warning),
-            "assembly_trolley_count": MetricCard("Assembly", "🏭", self._theme.palette.chart_2),
-            "queue_trolley_count": MetricCard("Queue", "📋", self._theme.palette.chart_6),
-            "precharge_trolley_count": MetricCard("Precharge", "⚡", self._theme.palette.chart_4),
+            "assembly_trolley_count": MetricCard("Assembly", _AGV_ICON, self._theme.palette.chart_2),
+            "queue_trolley_count": MetricCard("Queue", _AGV_ICON, self._theme.palette.chart_6),
+            "precharge_trolley_count": MetricCard("Precharge", _AGV_ICON, self._theme.palette.chart_4),
         }
         
         for key in ["tray_count", "group_count", "assembly_ungroup_count", 
@@ -2780,12 +2803,12 @@ class _MainWindow(QMainWindow):
         toolbar = QFrame()
         toolbar.setObjectName("card")
         toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(16, 12, 16, 12)
-        toolbar_layout.setSpacing(12)
+        toolbar_layout.setContentsMargins(12, 8, 12, 8)
+        toolbar_layout.setSpacing(10)
         
         # Search
         self._search_bar = SearchBar("Search Tray/Cell ID...", show_button=True)
-        self._search_bar.setMinimumWidth(320)
+        self._search_bar.setMinimumWidth(280)
         toolbar_layout.addWidget(self._search_bar)
         toolbar_layout.addStretch()
         
@@ -2831,19 +2854,6 @@ class _MainWindow(QMainWindow):
         sep2.setMaximumWidth(1)
         toolbar_layout.addWidget(sep2)
         
-        gauge_container = QFrame()
-        gauge_container.setObjectName("card")
-        gauge_layout = QVBoxLayout(gauge_container)
-        gauge_layout.setContentsMargins(8, 4, 8, 4)
-        gauge_layout.setSpacing(2)
-        gauge_title = QLabel("Grouped %")
-        gauge_title.setStyleSheet(f"font-size: 11px; color: {p.text_muted};")
-        gauge_layout.addWidget(gauge_title, alignment=Qt.AlignmentFlag.AlignCenter)
-        self._grouping_gauge = GaugeChart(value=0.0, max_value=100.0, label="", color=p.primary)
-        self._grouping_gauge.setFixedSize(120, 70)
-        gauge_layout.addWidget(self._grouping_gauge, alignment=Qt.AlignmentFlag.AlignCenter)
-        toolbar_layout.addWidget(gauge_container)
-        
         # Settings button
         self._settings_btn = IconButton("⚙")
         self._settings_btn.setToolTip("Settings (Ctrl+,)")
@@ -2859,24 +2869,27 @@ class _MainWindow(QMainWindow):
         ungroup_actions = QWidget()
         ungroup_actions_layout = QHBoxLayout(ungroup_actions)
         ungroup_actions_layout.setContentsMargins(0, 0, 0, 0)
-        ungroup_actions_layout.setSpacing(8)
+        ungroup_actions_layout.setSpacing(6)
         
         self._add_trolley_input = QLineEdit()
         self._add_trolley_input.setPlaceholderText("Trolley ID")
-        self._add_trolley_input.setMaximumWidth(120)
+        self._add_trolley_input.setMaximumWidth(112)
+        self._add_trolley_input.setFixedHeight(34)
         self._refresh_suggested_trolley_id(force=True)
         ungroup_actions_layout.addWidget(self._add_trolley_input)
         
         self._add_trolley_btn = QPushButton("+ Add")
-        self._add_trolley_btn.setObjectName("successBtn")
-        self._add_trolley_btn.setMaximumWidth(80)
+        self._add_trolley_btn.setObjectName("addTrolleyBtn")
+        self._add_trolley_btn.setMaximumWidth(86)
+        self._add_trolley_btn.setFixedHeight(34)
         ungroup_actions_layout.addWidget(self._add_trolley_btn)
+        self._style_add_trolley_button()
         
         # Board with 3 columns + dashboard sidebar
         board_widget = QWidget()
         board = QHBoxLayout(board_widget)
         board.setContentsMargins(0, 0, 0, 0)
-        board.setSpacing(16)
+        board.setSpacing(10)
         
         self._assembly_card = _ModernColumnCard(
             "Assembly", "🏭", "#8b5cf6",
@@ -2888,6 +2901,7 @@ class _MainWindow(QMainWindow):
             on_trolley_double_click=self._on_trolley_item_double_click,
             on_trolley_click=self._on_trolley_item_clicked,
             on_tray_header_click=self._on_ungroup_header_clicked,
+            on_tray_double_click=self._on_ungroup_tray_double_click,
         )
         
         self._queue_card = _ModernColumnCard(
@@ -2916,7 +2930,7 @@ class _MainWindow(QMainWindow):
         self._analytics_panel = self._dashboard_panel
         
         board_row = QHBoxLayout()
-        board_row.setSpacing(12)
+        board_row.setSpacing(8)
         board_row.addWidget(board_widget, 1)
         board_row.addWidget(self._dashboard_panel)
         layout.addLayout(board_row, 1)
@@ -3012,6 +3026,7 @@ class _MainWindow(QMainWindow):
         self._theme_btn.setText("☀️" if is_dark else "🌙")
         self._status.setStyleSheet(f"color: {self._theme.palette.text_secondary}; padding: 4px 12px;")
         self._clock_label.setStyleSheet(f"color: {self._theme.palette.text_muted}; padding: 4px 12px;")
+        self._style_add_trolley_button()
         self._refresh_connection_badge()
         self._sync_queue_alert_palette()
         if self.isVisible():
@@ -3019,6 +3034,40 @@ class _MainWindow(QMainWindow):
                 f"Switched to {'dark' if is_dark else 'light'} mode",
                 duration_ms=2000,
             )
+
+    def _style_add_trolley_button(self) -> None:
+        if not hasattr(self, "_add_trolley_btn"):
+            return
+        p = self._theme.palette
+        is_dark = self._theme.is_dark
+        bg = "#000000" if is_dark else p.background_secondary
+        hover_bg = "#111111" if is_dark else p.surface_hover
+        pressed_bg = "#1a1a1a" if is_dark else p.surface
+        fg = "#f8fafc" if is_dark else p.text_primary
+        self._add_trolley_btn.setStyleSheet(
+            f"""
+            QPushButton#addTrolleyBtn {{
+                background: {bg};
+                color: {fg};
+                border: 1px solid {p.border};
+                border-radius: 10px;
+                padding: 6px 12px;
+                font-weight: 600;
+            }}
+            QPushButton#addTrolleyBtn:hover {{
+                background: {hover_bg};
+                border-color: {p.primary};
+            }}
+            QPushButton#addTrolleyBtn:pressed {{
+                background: {pressed_bg};
+            }}
+            QPushButton#addTrolleyBtn:disabled {{
+                background: {p.background_secondary};
+                color: {p.text_muted};
+                border-color: {p.border_light};
+            }}
+            """
+        )
 
     def _toggle_dashboard(self, visible: bool) -> None:
         if self._dashboard_panel is not None:
@@ -3364,24 +3413,20 @@ class _MainWindow(QMainWindow):
         # Update metric cards
         for key, box in self._metric_boxes.items():
             box.set_value(int(payload.get(key, 0)))
-        grouped = int(payload.get("group_count", 0))
-        total_trays = int(payload.get("tray_count", 0))
-        grouped_pct = (100.0 * grouped / total_trays) if total_trays > 0 else 0.0
-        self._grouping_gauge.set_value(grouped_pct)
 
         # Update column stats
         self._assembly_card.set_stats_text(
-            f"🚗 {payload.get('assembly_trolley_count', 0)} • "
+            f"{_AGV_ICON} {payload.get('assembly_trolley_count', 0)} • "
             f"📦 {payload.get('assembly_tray_count', 0)} • "
             f"🔋 {payload.get('assembly_cell_count', 0):,}"
         )
         self._queue_card.set_stats_text(
-            f"🚗 {payload.get('queue_trolley_count', 0)} • "
+            f"{_AGV_ICON} {payload.get('queue_trolley_count', 0)} • "
             f"📦 {payload.get('queue_tray_count', 0)} • "
             f"🔋 {payload.get('queue_cell_count', 0):,}"
         )
         self._precharge_card.set_stats_text(
-            f"🚗 {payload.get('precharge_trolley_count', 0)} • "
+            f"{_AGV_ICON} {payload.get('precharge_trolley_count', 0)} • "
             f"📦 {payload.get('precharge_tray_count', 0)} • "
             f"🔋 {payload.get('precharge_cell_count', 0):,}"
         )
@@ -3487,6 +3532,38 @@ class _MainWindow(QMainWindow):
     def _on_ungroup_header_clicked(self, section: int) -> None:
         if section == 0:
             self._vm.assembly_ungrouped_model.toggle_all_checked()
+
+    def _on_ungroup_tray_double_click(self, table: QTableView, index: QModelIndex) -> None:
+        if not index.isValid():
+            return
+        model = table.model()
+        if model is None:
+            return
+        if model.columnCount() <= 2:
+            return
+        tray_index = model.index(index.row(), 2)
+        tray_id = str(model.data(tray_index, Qt.ItemDataRole.DisplayRole) or "").strip()
+        if not tray_id:
+            return
+
+        tray_payload = self._vm.tray_payload_by_id(tray_id)
+        if tray_payload is None:
+            self._show_status(f"⚠️ No tray data available for {tray_id}", "warning")
+            return
+        rows = self._build_tray_summary_rows([tray_payload])
+        if not rows:
+            self._show_status(f"⚠️ No tray data available for {tray_id}", "warning")
+            return
+
+        location, trolley_id = self._find_tray_location(tray_id)
+        dialog_trolley_id = trolley_id or f"Ungrouped ({location})"
+        dialog = TrolleyDetailDialog(
+            runtime=self._runtime,
+            trolley_id=dialog_trolley_id,
+            tray_rows=rows,
+            parent=self,
+        )
+        dialog.exec()
     
     def _selected_ungroup_tray_ids(self) -> list[str]:
         tray_ids = self._vm.assembly_ungrouped_model.checked_tray_ids()
@@ -3553,6 +3630,7 @@ class _MainWindow(QMainWindow):
         settings.delta_poll_interval_seconds = float(payload["refresh_interval_seconds"])
         settings.ui_data_window_days = int(payload["data_window_days"])
         _sync_data_window_settings()
+        self._handle_queue_target_aging_alerts()
         
         # Save to .env
         try:

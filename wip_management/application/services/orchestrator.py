@@ -421,8 +421,10 @@ class OrchestratorService:
             await _maybe_start(self._ccu_repo)
             await _maybe_start(self._fpc_repo)
             await _maybe_start(self._dashboard_repo)
+            await _maybe_start(self._grouping_state_repo)
         except Exception:
             log.exception("Orchestrator start failed while starting repositories")
+            await _maybe_close(self._grouping_state_repo)
             await _maybe_close(self._dashboard_repo)
             await _maybe_close(self._fpc_repo)
             await _maybe_close(self._ccu_repo)
@@ -490,6 +492,7 @@ class OrchestratorService:
         self._clear_all_caches()
 
         await self._store.stop()
+        await _maybe_close(self._grouping_state_repo)
         await _maybe_close(self._dashboard_repo)
         await _maybe_close(self._ccu_repo)
         await _maybe_close(self._fpc_repo)
