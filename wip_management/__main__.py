@@ -18,7 +18,7 @@ if os.name == "nt":
     import msvcrt
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen, QShortcut
+from PySide6.QtGui import QColor, QFontMetrics, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -34,6 +34,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListView,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -58,7 +60,7 @@ from wip_management.domain.models.trolley import Column
 from wip_management.infrastructure.messaging.event_bus import AsyncEventBus
 from wip_management.infrastructure.persistence.state_repo import SharedGroupingStateRepository
 from wip_management.infrastructure.sqlserver.ccu_repo import CcuRepo
-from wip_management.infrastructure.sqlserver.connection import SQLServerConnection
+from wip_management.infrastructure.sqlserver.connection import SQLServerConnection, build_driver_candidates
 from wip_management.infrastructure.sqlserver.dashboard_repo import DashboardRepo
 from wip_management.infrastructure.sqlserver.delta_tracker import InMemoryDeltaTracker
 from wip_management.infrastructure.sqlserver.fpc_repo import FpcRepo
@@ -66,6 +68,13 @@ from wip_management.presentation.ui.viewmodels import BoardViewModel, TrolleyLis
 from wip_management.presentation.ui.mapper import parse_datetime
 
 log = logging.getLogger(__name__)
+_MAX_UI_WINDOW_DAYS = 365
+
+# ── Shutdown timeout ─────────────────────────────────────────────────────────
+# Must be longer than worst-case SQL query time observed (~120s).
+# We give 150s graceful + 10s force window.
+_GRACEFUL_STOP_TIMEOUT_SECONDS = 150.0
+_FORCE_STOP_TIMEOUT_SECONDS = 10.0
 
 
 def _configure_logging() -> None:
@@ -110,7 +119,10 @@ def _configure_logging() -> None:
 
 def _install_crash_hooks() -> None:
     def _global_excepthook(exc_type, exc_value, exc_traceback) -> None:
-        log.critical("Unhandled exception on main thread", exc_info=(exc_type, exc_value, exc_traceback))
+        log.critical(
+            "Unhandled exception on main thread",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
 
     def _thread_excepthook(args) -> None:
         log.critical(
@@ -131,20 +143,34 @@ class _SystemClock:
 
 
 def _lookback_hours_for_days(days: int) -> float:
-    normalized_days = max(1, min(3, int(days)))
-    return float((normalized_days + 1) * 24)
+    normalized_days = max(1, min(_MAX_UI_WINDOW_DAYS, int(days)))
+    return float(normalized_days * 24 + 2)
 
 
 def _sync_data_window_settings() -> None:
     days = int(getattr(settings, "ui_data_window_days", 1))
-    if days < 1:
-        days = 1
-    if days > 3:
-        days = 3
+    days = max(1, min(_MAX_UI_WINDOW_DAYS, days))
     settings.ui_data_window_days = days
-    lookback_hours = _lookback_hours_for_days(days)
-    settings.initial_load_lookback_hours = lookback_hours
-    settings.ccu_backfill_lookback_hours = lookback_hours
+
+    current = float(getattr(settings, "initial_load_lookback_hours", 0.0))
+    min_reasonable = float(days * 24)
+    max_reasonable = float(days * 24 + 4)
+
+    if not (min_reasonable <= current <= max_reasonable):
+        lookback = _lookback_hours_for_days(days)
+        settings.initial_load_lookback_hours = lookback
+        settings.ccu_backfill_lookback_hours = lookback
+        log.debug(
+            "Sync data window: days=%s recalculated lookback_hours=%.1f (was %.1f)",
+            days, lookback, current,
+        )
+    else:
+        settings.ccu_backfill_lookback_hours = current
+        log.debug(
+            "Sync data window: days=%s keeping existing lookback_hours=%.1f",
+            days, current,
+        )
+
 
 
 class _UiBridge(QObject):
@@ -176,11 +202,12 @@ class _LeaderFileLock:
                 msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl  # type: ignore
-
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             fh.seek(0)
             fh.truncate()
-            fh.write(f"pid={os.getpid()} ts={time.time():.3f}\n".encode("ascii", errors="ignore"))
+            fh.write(
+                f"pid={os.getpid()} ts={time.time():.3f}\n".encode("ascii", errors="ignore")
+            )
             fh.flush()
             self._fh = fh
             return True
@@ -200,7 +227,6 @@ class _LeaderFileLock:
                 msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 import fcntl  # type: ignore
-
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
         with contextlib.suppress(Exception):
             fh.close()
@@ -226,7 +252,9 @@ class _Runtime:
             return
         self._started.clear()
         self._start_error = None
-        self._thread = threading.Thread(target=self._thread_main, name="wip-runtime", daemon=True)
+        self._thread = threading.Thread(
+            target=self._thread_main, name="wip-runtime", daemon=True
+        )
         self._thread.start()
         if not self._started.wait(timeout=20):
             log.error("Runtime bootstrap wait timed out after 20s")
@@ -236,46 +264,105 @@ class _Runtime:
             raise RuntimeError("Failed to start runtime") from self._start_error
         log.info("Runtime thread bootstrapped successfully")
 
-    def stop(self, timeout: float = 60.0) -> None:
+    def stop(self) -> None:
+        """
+        Signal the async runtime to stop and wait for the thread to exit.
+
+        Strategy:
+          1. Signal stop_event so the async _run() coroutine begins its
+             finally-block teardown (orchestrator.stop, task cancellation, etc.)
+          2. Wait up to _GRACEFUL_STOP_TIMEOUT_SECONDS for the thread to
+             finish naturally — long enough for any in-flight SQL query to
+             complete or time out on its own.
+          3. If still alive, force-stop the event loop and wait a short
+             extra window for the thread to notice.
+        """
         log.info("Runtime stop requested")
         if self._thread is None:
             log.debug("Runtime stop ignored because thread is None")
             return
-        if self._loop is not None and self._stop_event is not None:
-            self._loop.call_soon_threadsafe(self._stop_event.set)
-        self._thread.join(timeout=timeout)
+
+        # ── Step 1: Signal cooperative shutdown ──────────────────────────────
+        if self._loop is not None and not self._loop.is_closed():
+            if self._stop_event is not None:
+                self._loop.call_soon_threadsafe(self._stop_event.set)
+
+        # ── Step 2: Wait gracefully ───────────────────────────────────────────
+        self._thread.join(timeout=_GRACEFUL_STOP_TIMEOUT_SECONDS)
+
+        if not self._thread.is_alive():
+            log.info("Runtime thread stopped (graceful)")
+            self._thread = None
+            return
+
+        # ── Step 3: Force-stop the loop (last resort) ─────────────────────────
+        log.warning(
+            "Runtime thread still running after %.0fs graceful wait — forcing loop stop",
+            _GRACEFUL_STOP_TIMEOUT_SECONDS,
+        )
+        if self._loop is not None and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+
+        self._thread.join(timeout=_FORCE_STOP_TIMEOUT_SECONDS)
         if self._thread.is_alive():
-            log.warning("Runtime thread did not stop within timeout=%ss", timeout)
+            log.error(
+                "Runtime thread did not stop within %.0fs + %.0fs total",
+                _GRACEFUL_STOP_TIMEOUT_SECONDS,
+                _FORCE_STOP_TIMEOUT_SECONDS,
+            )
         else:
-            log.info("Runtime thread stopped")
+            log.info("Runtime thread stopped (forced)")
+
         self._thread = None
+
+    # ── Public action methods (unchanged) ─────────────────────────────────────
 
     def manual_refresh(self, *, full_scan: bool) -> dict[str, object]:
         log.info("Manual refresh requested full_scan=%s", full_scan)
         return self._submit(self._manual_refresh(full_scan=full_scan))
 
     def manual_group(self, tray_id: str, trolley_id: str, column: Column) -> None:
-        log.info("Manual group requested tray_id=%s trolley_id=%s column=%s", tray_id, trolley_id, column.value)
-        self._submit(self._manual_group(tray_id=tray_id, trolley_id=trolley_id, column=column))
+        log.info(
+            "Manual group requested tray_id=%s trolley_id=%s column=%s",
+            tray_id, trolley_id, column.value,
+        )
+        self._submit(
+            self._manual_group(tray_id=tray_id, trolley_id=trolley_id, column=column)
+        )
 
-    def manual_group_many(self, tray_ids: list[str], trolley_id: str, column: Column) -> dict[str, object]:
+    def manual_group_many(
+        self, tray_ids: list[str], trolley_id: str, column: Column
+    ) -> dict[str, object]:
         log.info(
             "Manual group many requested tray_count=%s trolley_id=%s column=%s",
-            len(tray_ids),
-            trolley_id,
-            column.value,
+            len(tray_ids), trolley_id, column.value,
         )
         return self._submit(
-            self._manual_group_many(tray_ids=tray_ids, trolley_id=trolley_id, column=column),
+            self._manual_group_many(
+                tray_ids=tray_ids, trolley_id=trolley_id, column=column
+            ),
         )
 
     def manual_ungroup(self, tray_id: str) -> None:
         log.info("Manual ungroup requested tray_id=%s", tray_id)
         self._submit(self._manual_ungroup(tray_id=tray_id))
 
-    def rename_trolley(self, old_trolley_id: str, new_trolley_id: str) -> dict[str, object]:
-        log.info("Rename trolley requested old=%s new=%s", old_trolley_id, new_trolley_id)
-        return self._submit(self._rename_trolley(old_trolley_id=old_trolley_id, new_trolley_id=new_trolley_id))
+    def manual_ungroup_many(self, tray_ids: list[str]) -> dict[str, object]:
+        log.info("Manual ungroup many requested tray_count=%s", len(tray_ids))
+        return self._submit(self._manual_ungroup_many(tray_ids=tray_ids))
+
+    def rename_trolley(
+        self, old_trolley_id: str, new_trolley_id: str
+    ) -> dict[str, object]:
+        log.info(
+            "Rename trolley requested old=%s new=%s",
+            old_trolley_id, new_trolley_id,
+        )
+        return self._submit(
+            self._rename_trolley(
+                old_trolley_id=old_trolley_id, new_trolley_id=new_trolley_id
+            )
+        )
 
     def clear_trolley(self, trolley_id: str) -> dict[str, object]:
         log.info("Clear trolley requested trolley_id=%s", trolley_id)
@@ -284,6 +371,10 @@ class _Runtime:
     def delete_trolley(self, trolley_id: str) -> dict[str, object]:
         log.info("Delete trolley requested trolley_id=%s", trolley_id)
         return self._submit(self._delete_trolley(trolley_id=trolley_id))
+
+    def delete_trolleys(self, trolley_ids: list[str]) -> dict[str, object]:
+        log.info("Delete trolleys requested trolley_count=%s", len(trolley_ids))
+        return self._submit(self._delete_trolleys(trolley_ids=trolley_ids))
 
     def set_auto_group_enabled(self, enabled: bool) -> dict[str, object]:
         log.info("Set auto group requested enabled=%s", enabled)
@@ -298,11 +389,11 @@ class _Runtime:
         data_window_days: int,
     ) -> dict[str, object]:
         log.info(
-            "Update grouping settings requested max_trays_per_trolley=%s total_trolley_count=%s refresh_interval_seconds=%s data_window_days=%s",
-            max_trays_per_trolley,
-            total_trolley_count,
-            refresh_interval_seconds,
-            data_window_days,
+            "Update grouping settings requested max_trays_per_trolley=%s "
+            "total_trolley_count=%s refresh_interval_seconds=%s "
+            "data_window_days=%s",
+            max_trays_per_trolley, total_trolley_count,
+            refresh_interval_seconds, data_window_days,
         )
         return self._submit(
             self._update_grouping_settings(
@@ -313,15 +404,25 @@ class _Runtime:
             )
         )
 
-    def data_window_loading_status(self, *, data_window_days: int | None = None) -> dict[str, object]:
-        return self._submit(self._data_window_loading_status(data_window_days=data_window_days))
+    def data_window_loading_status(
+        self, *, data_window_days: int | None = None
+    ) -> dict[str, object]:
+        return self._submit(
+            self._data_window_loading_status(data_window_days=data_window_days)
+        )
 
     def tray_cells(self, tray_id: str) -> list[dict[str, str | None]]:
         log.info("Tray detail requested tray_id=%s", tray_id)
-        if not self._tray_detail_submit_lock.acquire(blocking=False):
-            raise RuntimeError("Tray detail is busy. Please wait for current request.")
+        
+        if not self._tray_detail_submit_lock.acquire(timeout=120.0):
+            raise RuntimeError(
+                "Tray detail request timed out. Database is busy with other operations."
+            )
         try:
             return self._submit(self._tray_cells(tray_id=tray_id))
+        except Exception as exc:
+            log.error("Tray detail failed tray_id=%s error=%r", tray_id, exc)
+            raise
         finally:
             self._tray_detail_submit_lock.release()
 
@@ -332,7 +433,10 @@ class _Runtime:
     def _submit(self, coroutine: Any) -> Any:
         if self._loop is None:
             raise RuntimeError("Runtime loop is not available")
-        log.debug("Submitting coroutine to runtime loop coroutine=%s", getattr(coroutine, "__qualname__", type(coroutine)))
+        log.debug(
+            "Submitting coroutine to runtime loop coroutine=%s",
+            getattr(coroutine, "__qualname__", type(coroutine)),
+        )
         future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
         return future.result(timeout=300)
 
@@ -342,13 +446,31 @@ class _Runtime:
         asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_until_complete(self._run())
+        except RuntimeError as exc:
+            # "Event loop stopped before Future completed" is expected when
+            # we force-stop the loop as a last resort — don't treat it as a
+            # crash if the stop_event was already set.
+            stop_was_set = (
+                self._stop_event is not None and self._stop_event.is_set()
+            )
+            if "Event loop stopped before Future completed" in str(exc) and stop_was_set:
+                log.info(
+                    "Runtime loop force-stopped after graceful timeout (expected)"
+                )
+            else:
+                self._start_error = exc
+                log.exception("Runtime crashed")
+                self._started.set()
         except BaseException as exc:  # noqa: BLE001
             self._start_error = exc
             log.exception("Runtime crashed")
             self._started.set()
         finally:
+            # Close the loop — suppress errors from aioodbc cleanup that
+            # happens after force-stop (event loop already closed).
             if self._loop is not None:
-                self._loop.close()
+                with contextlib.suppress(Exception):
+                    self._loop.close()
             self._loop = None
             log.info("Runtime thread main exited")
 
@@ -357,6 +479,7 @@ class _Runtime:
         _sync_data_window_settings()
         self._stop_event = asyncio.Event()
         grouping_state_repo = None
+
         if settings.shared_state_enabled:
             grouping_state_repo = SharedGroupingStateRepository(
                 directory=settings.shared_state_dir,
@@ -371,6 +494,7 @@ class _Runtime:
 
         self._runtime_role = "leader"
         self._leader_lock = None
+
         if grouping_state_repo is not None:
             lock_path = Path(settings.shared_state_dir) / ".leader.lock"
             lock = _LeaderFileLock(lock_path)
@@ -381,7 +505,10 @@ class _Runtime:
                 log.info("Runtime role=leader lock_path=%s", lock_path)
             else:
                 self._runtime_role = "viewer"
-                log.info("Runtime role=viewer leader lock already held lock_path=%s", lock_path)
+                log.info(
+                    "Runtime role=viewer leader lock already held lock_path=%s",
+                    lock_path,
+                )
         else:
             log.info("Runtime role=leader (shared state disabled)")
 
@@ -404,12 +531,17 @@ class _Runtime:
         event_bus = AsyncEventBus(default_queue_size=settings.event_queue_size)
         state_store = SingleWriterStateStore(queue_size=settings.event_queue_size)
 
-        legacy_driver = settings.sql_driver.strip().lower() == "sql server"
+        driver_candidates = build_driver_candidates(settings.sql_driver)
+        preview_driver = (
+            driver_candidates[0] if driver_candidates else settings.sql_driver
+        )
+        legacy_driver = preview_driver.strip().lower() == "sql server"
         refresh_peek_enabled = bool(settings.refresh_peek_enabled)
         if settings.refresh_peek_disable_for_legacy_driver and legacy_driver:
             refresh_peek_enabled = False
             log.info(
-                "Refresh peek disabled for legacy SQL driver=%s",
+                "Refresh peek disabled for legacy SQL driver=%s configured=%s",
+                preview_driver,
                 settings.sql_driver,
             )
 
@@ -441,10 +573,18 @@ class _Runtime:
         self._orchestrator = orchestrator
 
         queue = await event_bus.subscribe(maxsize=settings.event_queue_size)
-        log.info("Runtime subscribed to event bus queue_size=%s", settings.event_queue_size)
-        ui_task = asyncio.create_task(self._ui_event_loop(queue), name="ui-event-coalescer")
+        log.info(
+            "Runtime subscribed to event bus queue_size=%s",
+            settings.event_queue_size,
+        )
+
+        ui_task = asyncio.create_task(
+            self._ui_event_loop(queue), name="ui-event-coalescer"
+        )
+
         self._started.set()
         log.info("Runtime bootstrap signal emitted to UI thread")
+
         try:
             log.info("Starting orchestrator service")
             await orchestrator.start()
@@ -453,26 +593,44 @@ class _Runtime:
             log.info("Stop event received")
         finally:
             log.info("Runtime shutdown sequence started")
+
+            # ── Cancel ui_task first (it only reads from queue) ───────────────
+            if not ui_task.done():
+                ui_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await ui_task
+
+            # ── Stop orchestrator (cancels SQL tasks, closes pool) ─────────────
             with contextlib.suppress(Exception):
                 await orchestrator.stop()
             self._orchestrator = None
-            ui_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await ui_task
+
+            # ── Unsubscribe queue ─────────────────────────────────────────────
             with contextlib.suppress(Exception):
                 await event_bus.unsubscribe(queue)
+
+            # ── Release leader lock ───────────────────────────────────────────
             if self._leader_lock is not None:
                 self._leader_lock.release()
                 self._leader_lock = None
+
             log.info("Runtime shutdown sequence completed")
 
-    async def _viewer_loop(self, grouping_state_repo: SharedGroupingStateRepository | None) -> None:
+    async def _viewer_loop(
+        self,
+        grouping_state_repo: SharedGroupingStateRepository | None,
+    ) -> None:
         if grouping_state_repo is None:
-            log.warning("Viewer loop skipped because shared grouping repo is unavailable")
+            log.warning(
+                "Viewer loop skipped because shared grouping repo is unavailable"
+            )
             if self._stop_event is not None:
                 await self._stop_event.wait()
             return
-        log.info("Viewer loop started sync_interval_seconds=%s", settings.grouping_sync_interval_seconds)
+        log.info(
+            "Viewer loop started sync_interval_seconds=%s",
+            settings.grouping_sync_interval_seconds,
+        )
         last_signature: Any = None
         emit_seq = 0
         poll_seconds = max(0.5, float(settings.grouping_sync_interval_seconds))
@@ -482,7 +640,9 @@ class _Runtime:
                 projection = await grouping_state_repo.load_projection()
                 payload = self._shared_projection_to_ui_payload(projection)
             except Exception:  # noqa: BLE001
-                log.exception("Viewer loop failed to load projection from shared state")
+                log.exception(
+                    "Viewer loop failed to load projection from shared state"
+                )
             if payload is not None:
                 payload_signature = _signature(payload)
                 if payload_signature != last_signature:
@@ -492,12 +652,16 @@ class _Runtime:
                     self._bridge.event_ready.emit(event_payload)
                     last_signature = payload_signature
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=poll_seconds)
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=poll_seconds
+                )
             except asyncio.TimeoutError:
                 continue
         log.info("Viewer loop stopped")
 
-    def _shared_projection_to_ui_payload(self, projection: dict[str, Any]) -> dict[str, Any] | None:
+    def _shared_projection_to_ui_payload(
+        self, projection: dict[str, Any]
+    ) -> dict[str, Any] | None:
         if not projection:
             return None
         assembly = projection.get("assembly_trolleys")
@@ -505,22 +669,35 @@ class _Runtime:
         precharge = projection.get("precharge_trolleys")
         ungrouped = projection.get("assembly_ungrouped")
         trays = projection.get("trays")
-        if not isinstance(assembly, list) or not isinstance(queue, list) or not isinstance(precharge, list):
+        if (
+            not isinstance(assembly, list)
+            or not isinstance(queue, list)
+            or not isinstance(precharge, list)
+        ):
             return None
         payload: dict[str, Any] = {
-            "assembly_trolleys": [row for row in assembly if isinstance(row, dict)],
-            "queue_trolleys": [row for row in queue if isinstance(row, dict)],
-            "precharge_trolleys": [row for row in precharge if isinstance(row, dict)],
-            "assembly_ungrouped": [row for row in (ungrouped or []) if isinstance(row, dict)],
+            "assembly_trolleys": [r for r in assembly if isinstance(r, dict)],
+            "queue_trolleys": [r for r in queue if isinstance(r, dict)],
+            "precharge_trolleys": [r for r in precharge if isinstance(r, dict)],
+            "assembly_ungrouped": [
+                r for r in (ungrouped or []) if isinstance(r, dict)
+            ],
         }
         if isinstance(trays, list):
             payload["type"] = "snapshot"
-            payload["trays"] = [row for row in trays if isinstance(row, dict)]
+            payload["trays"] = [r for r in trays if isinstance(r, dict)]
         else:
             payload["type"] = "projection"
         return payload
 
     async def _ui_event_loop(self, queue: asyncio.Queue[Any]) -> None:
+        """
+        UI event coalescer loop.
+
+        FIX: The loop now handles asyncio.CancelledError explicitly so that
+        cancellation (via ui_task.cancel()) propagates cleanly without
+        leaving the task in a "pending" state.
+        """
         log.info("UI event coalescer loop started")
         pending: dict[str, dict[str, Any]] = {}
         pending_signatures: dict[str, Any] = {}
@@ -539,78 +716,17 @@ class _Runtime:
             event_payload["seq"] = emit_seq
             self._bridge.event_ready.emit(event_payload)
 
-        while True:
-            timeout = window_seconds if pending else None
-            try:
-                if timeout is None:
-                    event = await queue.get()
-                else:
-                    event = await asyncio.wait_for(queue.get(), timeout=timeout)
-            except asyncio.TimeoutError:
-                self._flush_pending(
-                    pending,
-                    pending_signatures=pending_signatures,
-                    emitted_tray_signatures=emitted_tray_signatures,
-                    emit_event=_emit,
-                )
-                last_flush = datetime.now()
-                continue
-
-            if isinstance(event, SnapshotReady):
-                if pending:
-                    log.debug("UI snapshot superseded pending tray updates count=%s", len(pending))
-                    pending.clear()
-                    pending_signatures.clear()
-                snapshot_payload = {
-                    "type": "snapshot",
-                    "trays": [tray.to_dict() for tray in event.trays],
-                    "assembly_trolleys": [t.to_dict() for t in event.assembly_trolleys],
-                    "queue_trolleys": [t.to_dict() for t in event.queue_trolleys],
-                    "precharge_trolleys": [t.to_dict() for t in event.precharge_trolleys],
-                    "assembly_ungrouped": [tray.to_dict() for tray in event.assembly_ungrouped],
-                }
-                snapshot_signature = _signature(snapshot_payload)
-                if snapshot_signature == last_snapshot_signature:
-                    log.debug("UI snapshot skipped because payload is unchanged")
-                    last_flush = datetime.now()
-                    continue
-                last_snapshot_signature = snapshot_signature
-                projection_payload = {
-                    "type": "projection",
-                    "assembly_trolleys": snapshot_payload["assembly_trolleys"],
-                    "queue_trolleys": snapshot_payload["queue_trolleys"],
-                    "precharge_trolleys": snapshot_payload["precharge_trolleys"],
-                    "assembly_ungrouped": snapshot_payload["assembly_ungrouped"],
-                }
-                last_projection_signature = _signature(projection_payload)
-                emitted_tray_signatures = {
-                    str(row.get("tray_id", "")).strip(): _signature(row)
-                    for row in snapshot_payload["trays"]
-                    if str(row.get("tray_id", "")).strip()
-                }
-                log.info(
-                    "UI snapshot event trays=%s assembly=%s queue=%s precharge=%s",
-                    len(event.trays),
-                    len(event.assembly_trolleys),
-                    len(event.queue_trolleys),
-                    len(event.precharge_trolleys),
-                )
-                _emit(snapshot_payload)
-                last_flush = datetime.now()
-                continue
-
-            if isinstance(event, TrayUpdated):
-                row = event.tray.to_dict()
-                tray_id = str(row.get("tray_id", "")).strip()
-                if not tray_id:
-                    continue
-                row_signature = _signature(row)
-                if emitted_tray_signatures.get(tray_id) == row_signature:
-                    continue
-                pending[tray_id] = row
-                pending_signatures[tray_id] = row_signature
-                if len(pending) >= max_batch:
-                    log.debug("UI pending tray batch reached max_batch=%s", max_batch)
+        try:
+            while True:
+                timeout = window_seconds if pending else None
+                try:
+                    if timeout is None:
+                        event = await queue.get()
+                    else:
+                        event = await asyncio.wait_for(
+                            queue.get(), timeout=timeout
+                        )
+                except asyncio.TimeoutError:
                     self._flush_pending(
                         pending,
                         pending_signatures=pending_signatures,
@@ -618,47 +734,155 @@ class _Runtime:
                         emit_event=_emit,
                     )
                     last_flush = datetime.now()
-                continue
+                    continue
+                # ── CancelledError propagates out of wait_for/get ─────────────
+                # We do NOT catch it here — let it fall through to the outer
+                # try/except CancelledError block below.
 
-            if isinstance(event, TrolleyUpdated):
-                self._flush_pending(
-                    pending,
-                    pending_signatures=pending_signatures,
-                    emitted_tray_signatures=emitted_tray_signatures,
-                    emit_event=_emit,
-                )
-                projection_payload = {
-                    "type": "projection",
-                    "assembly_trolleys": [t.to_dict() for t in event.assembly_trolleys],
-                    "queue_trolleys": [t.to_dict() for t in event.queue_trolleys],
-                    "precharge_trolleys": [t.to_dict() for t in event.precharge_trolleys],
-                    "assembly_ungrouped": [tray.to_dict() for tray in event.assembly_ungrouped],
-                }
-                projection_signature = _signature(projection_payload)
-                if projection_signature == last_projection_signature:
-                    log.debug("UI projection skipped because payload is unchanged")
+                if isinstance(event, SnapshotReady):
+                    if pending:
+                        log.debug(
+                            "UI snapshot superseded pending tray updates count=%s",
+                            len(pending),
+                        )
+                        pending.clear()
+                        pending_signatures.clear()
+                    snapshot_payload = {
+                        "type": "snapshot",
+                        "trays": [tray.to_dict() for tray in event.trays],
+                        "assembly_trolleys": [
+                            t.to_dict() for t in event.assembly_trolleys
+                        ],
+                        "queue_trolleys": [
+                            t.to_dict() for t in event.queue_trolleys
+                        ],
+                        "precharge_trolleys": [
+                            t.to_dict() for t in event.precharge_trolleys
+                        ],
+                        "assembly_ungrouped": [
+                            tray.to_dict() for tray in event.assembly_ungrouped
+                        ],
+                    }
+                    snapshot_signature = _signature(snapshot_payload)
+                    if snapshot_signature == last_snapshot_signature:
+                        log.debug(
+                            "UI snapshot skipped because payload is unchanged"
+                        )
+                        last_flush = datetime.now()
+                        continue
+                    last_snapshot_signature = snapshot_signature
+                    projection_payload = {
+                        "type": "projection",
+                        "assembly_trolleys": snapshot_payload["assembly_trolleys"],
+                        "queue_trolleys": snapshot_payload["queue_trolleys"],
+                        "precharge_trolleys": snapshot_payload["precharge_trolleys"],
+                        "assembly_ungrouped": snapshot_payload["assembly_ungrouped"],
+                    }
+                    last_projection_signature = _signature(projection_payload)
+                    emitted_tray_signatures = {
+                        str(row.get("tray_id", "")).strip(): _signature(row)
+                        for row in snapshot_payload["trays"]
+                        if str(row.get("tray_id", "")).strip()
+                    }
+                    log.info(
+                        "UI snapshot event trays=%s assembly=%s queue=%s precharge=%s",
+                        len(event.trays),
+                        len(event.assembly_trolleys),
+                        len(event.queue_trolleys),
+                        len(event.precharge_trolleys),
+                    )
+                    _emit(snapshot_payload)
                     last_flush = datetime.now()
                     continue
-                last_projection_signature = projection_signature
-                log.info(
-                    "UI projection event assembly=%s queue=%s precharge=%s ungrouped=%s",
-                    len(event.assembly_trolleys),
-                    len(event.queue_trolleys),
-                    len(event.precharge_trolleys),
-                    len(event.assembly_ungrouped),
-                )
-                _emit(projection_payload)
-                last_flush = datetime.now()
-                continue
 
-            if pending and (datetime.now() - last_flush).total_seconds() >= window_seconds:
-                self._flush_pending(
-                    pending,
-                    pending_signatures=pending_signatures,
-                    emitted_tray_signatures=emitted_tray_signatures,
-                    emit_event=_emit,
-                )
-                last_flush = datetime.now()
+                if isinstance(event, TrayUpdated):
+                    row = event.tray.to_dict()
+                    tray_id = str(row.get("tray_id", "")).strip()
+                    if not tray_id:
+                        continue
+                    row_signature = _signature(row)
+                    if emitted_tray_signatures.get(tray_id) == row_signature:
+                        continue
+                    pending[tray_id] = row
+                    pending_signatures[tray_id] = row_signature
+                    if len(pending) >= max_batch:
+                        log.debug(
+                            "UI pending tray batch reached max_batch=%s", max_batch
+                        )
+                        self._flush_pending(
+                            pending,
+                            pending_signatures=pending_signatures,
+                            emitted_tray_signatures=emitted_tray_signatures,
+                            emit_event=_emit,
+                        )
+                        last_flush = datetime.now()
+                    continue
+
+                if isinstance(event, TrolleyUpdated):
+                    self._flush_pending(
+                        pending,
+                        pending_signatures=pending_signatures,
+                        emitted_tray_signatures=emitted_tray_signatures,
+                        emit_event=_emit,
+                    )
+                    projection_payload = {
+                        "type": "projection",
+                        "assembly_trolleys": [
+                            t.to_dict() for t in event.assembly_trolleys
+                        ],
+                        "queue_trolleys": [
+                            t.to_dict() for t in event.queue_trolleys
+                        ],
+                        "precharge_trolleys": [
+                            t.to_dict() for t in event.precharge_trolleys
+                        ],
+                        "assembly_ungrouped": [
+                            tray.to_dict() for tray in event.assembly_ungrouped
+                        ],
+                    }
+                    projection_signature = _signature(projection_payload)
+                    if projection_signature == last_projection_signature:
+                        log.debug(
+                            "UI projection skipped because payload is unchanged"
+                        )
+                        last_flush = datetime.now()
+                        continue
+                    last_projection_signature = projection_signature
+                    log.info(
+                        "UI projection event assembly=%s queue=%s "
+                        "precharge=%s ungrouped=%s",
+                        len(event.assembly_trolleys),
+                        len(event.queue_trolleys),
+                        len(event.precharge_trolleys),
+                        len(event.assembly_ungrouped),
+                    )
+                    _emit(projection_payload)
+                    last_flush = datetime.now()
+                    continue
+
+                if pending and (
+                    datetime.now() - last_flush
+                ).total_seconds() >= window_seconds:
+                    self._flush_pending(
+                        pending,
+                        pending_signatures=pending_signatures,
+                        emitted_tray_signatures=emitted_tray_signatures,
+                        emit_event=_emit,
+                    )
+                    last_flush = datetime.now()
+
+        except asyncio.CancelledError:
+            # Clean cancellation — flush any remaining pending events then exit.
+            log.info("UI event coalescer loop cancelled — flushing pending=%s", len(pending))
+            if pending:
+                with contextlib.suppress(Exception):
+                    self._flush_pending(
+                        pending,
+                        pending_signatures=pending_signatures,
+                        emitted_tray_signatures=emitted_tray_signatures,
+                        emit_event=_emit,
+                    )
+            raise  # Re-raise so the task is properly marked cancelled
 
     def _flush_pending(
         self,
@@ -696,7 +920,9 @@ class _Runtime:
         if not filtered_rows:
             log.debug("UI flush skipped because tray deltas are unchanged")
             return
-        log.debug("UI flush pending tray updates count=%s", len(filtered_rows))
+        log.debug(
+            "UI flush pending tray updates count=%s", len(filtered_rows)
+        )
         payload = {"type": "trays_delta", "rows": filtered_rows}
         if emit_event is not None:
             emit_event(payload)
@@ -707,21 +933,35 @@ class _Runtime:
         if self._orchestrator is not None:
             return self._orchestrator
         if self._runtime_role == "viewer":
-            raise RuntimeError("This instance is viewer mode. Use the leader instance for refresh/group actions.")
+            raise RuntimeError(
+                "This instance is viewer mode. "
+                "Use the leader instance for refresh/group actions."
+            )
         raise RuntimeError("Runtime is not started")
 
     async def _manual_refresh(self, *, full_scan: bool) -> dict[str, object]:
         orchestrator = self._require_orchestrator()
         result = await orchestrator.manual_refresh(full_scan=full_scan)
-        log.info("Manual refresh completed full_scan=%s result=%s", full_scan, result)
+        log.info(
+            "Manual refresh completed full_scan=%s result=%s", full_scan, result
+        )
         return result
 
-    async def _manual_group(self, *, tray_id: str, trolley_id: str, column: Column) -> None:
+    async def _manual_group(
+        self, *, tray_id: str, trolley_id: str, column: Column
+    ) -> None:
         orchestrator = self._require_orchestrator()
-        await orchestrator.group_tray_manual(tray_id=tray_id, trolley_id=trolley_id, column=column)
-        log.info("Manual group completed tray_id=%s trolley_id=%s column=%s", tray_id, trolley_id, column.value)
+        await orchestrator.group_tray_manual(
+            tray_id=tray_id, trolley_id=trolley_id, column=column
+        )
+        log.info(
+            "Manual group completed tray_id=%s trolley_id=%s column=%s",
+            tray_id, trolley_id, column.value,
+        )
 
-    async def _manual_group_many(self, *, tray_ids: list[str], trolley_id: str, column: Column) -> dict[str, object]:
+    async def _manual_group_many(
+        self, *, tray_ids: list[str], trolley_id: str, column: Column
+    ) -> dict[str, object]:
         orchestrator = self._require_orchestrator()
         result = await orchestrator.group_trays_manual(
             tray_ids=tray_ids,
@@ -729,11 +969,9 @@ class _Runtime:
             column=column,
         )
         log.info(
-            "Manual group many completed tray_count=%s trolley_id=%s column=%s result=%s",
-            len(tray_ids),
-            trolley_id,
-            column.value,
-            result,
+            "Manual group many completed tray_count=%s trolley_id=%s "
+            "column=%s result=%s",
+            len(tray_ids), trolley_id, column.value, result,
         )
         return result
 
@@ -742,28 +980,65 @@ class _Runtime:
         await orchestrator.ungroup_tray_manual(tray_id=tray_id)
         log.info("Manual ungroup completed tray_id=%s", tray_id)
 
-    async def _rename_trolley(self, *, old_trolley_id: str, new_trolley_id: str) -> dict[str, object]:
+    async def _manual_ungroup_many(
+        self, *, tray_ids: list[str]
+    ) -> dict[str, object]:
         orchestrator = self._require_orchestrator()
-        result = await orchestrator.rename_trolley_manual(old_trolley_id, new_trolley_id)
-        log.info("Rename trolley completed old=%s new=%s result=%s", old_trolley_id, new_trolley_id, result)
+        result = await orchestrator.ungroup_trays_manual(tray_ids=tray_ids)
+        log.info(
+            "Manual ungroup many completed tray_count=%s result=%s",
+            len(tray_ids), result,
+        )
+        return result
+
+    async def _rename_trolley(
+        self, *, old_trolley_id: str, new_trolley_id: str
+    ) -> dict[str, object]:
+        orchestrator = self._require_orchestrator()
+        result = await orchestrator.rename_trolley_manual(
+            old_trolley_id, new_trolley_id
+        )
+        log.info(
+            "Rename trolley completed old=%s new=%s result=%s",
+            old_trolley_id, new_trolley_id, result,
+        )
         return result
 
     async def _clear_trolley(self, *, trolley_id: str) -> dict[str, object]:
         orchestrator = self._require_orchestrator()
         result = await orchestrator.clear_trolley_manual(trolley_id)
-        log.info("Clear trolley completed trolley_id=%s result=%s", trolley_id, result)
+        log.info(
+            "Clear trolley completed trolley_id=%s result=%s", trolley_id, result
+        )
         return result
 
     async def _delete_trolley(self, *, trolley_id: str) -> dict[str, object]:
         orchestrator = self._require_orchestrator()
         result = await orchestrator.delete_trolley_manual(trolley_id)
-        log.info("Delete trolley completed trolley_id=%s result=%s", trolley_id, result)
+        log.info(
+            "Delete trolley completed trolley_id=%s result=%s", trolley_id, result
+        )
         return result
 
-    async def _set_auto_group_enabled(self, *, enabled: bool) -> dict[str, object]:
+    async def _delete_trolleys(
+        self, *, trolley_ids: list[str]
+    ) -> dict[str, object]:
+        orchestrator = self._require_orchestrator()
+        result = await orchestrator.delete_trolleys_manual(trolley_ids)
+        log.info(
+            "Delete trolleys completed trolley_count=%s result=%s",
+            len(trolley_ids), result,
+        )
+        return result
+
+    async def _set_auto_group_enabled(
+        self, *, enabled: bool
+    ) -> dict[str, object]:
         orchestrator = self._require_orchestrator()
         result = await orchestrator.set_auto_group_enabled(enabled=enabled)
-        log.info("Set auto group completed enabled=%s result=%s", enabled, result)
+        log.info(
+            "Set auto group completed enabled=%s result=%s", enabled, result
+        )
         return result
 
     async def _update_grouping_settings(
@@ -784,37 +1059,54 @@ class _Runtime:
         log.info("Update grouping settings completed result=%s", result)
         return result
 
-    async def _data_window_loading_status(self, *, data_window_days: int | None = None) -> dict[str, object]:
+    async def _data_window_loading_status(
+        self, *, data_window_days: int | None = None
+    ) -> dict[str, object]:
         orchestrator = self._require_orchestrator()
-        return await orchestrator.data_window_loading_status(data_window_days=data_window_days)
+        return await orchestrator.data_window_loading_status(
+            data_window_days=data_window_days
+        )
 
-    async def _tray_cells(self, *, tray_id: str) -> list[dict[str, str | None]]:
+    async def _tray_cells(
+        self, *, tray_id: str
+    ) -> list[dict[str, str | None]]:
         orchestrator = self._require_orchestrator()
         rows = await orchestrator.fetch_tray_cells(tray_id=tray_id)
         return rows
 
-    async def _cell_owner(self, *, cell_id: str) -> dict[str, str | None] | None:
+    async def _cell_owner(
+        self, *, cell_id: str
+    ) -> dict[str, str | None] | None:
         orchestrator = self._require_orchestrator()
         row = await orchestrator.fetch_cell_owner(cell_id=cell_id)
         return row
+
+
+# ── UI Widgets (unchanged from original) ─────────────────────────────────────
 
 
 class _MetricBox(QFrame):
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("metricBox")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(2)
 
         self._title = QLabel(title, self)
         self._title.setObjectName("metricTitle")
-        self._title.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        self._title.setAlignment(
+            Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+        )
         self._title.setWordWrap(True)
         self._value = QLabel("0", self)
         self._value.setObjectName("metricValue")
-        self._value.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        self._value.setAlignment(
+            Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+        )
 
         layout.addWidget(self._title)
         layout.addWidget(self._value)
@@ -848,33 +1140,53 @@ class _TraySelectIconPainter:
             painter.drawEllipse(inner_rect)
         elif state == "partial":
             half = max(2.0, diameter * 0.24)
-            painter.drawLine(QPointF(cx - half, cy), QPointF(cx + half, cy))
+            painter.drawLine(
+                QPointF(cx - half, cy), QPointF(cx + half, cy)
+            )
         painter.restore()
 
 
 class _TraySelectItemDelegate(QStyledItemDelegate):
-    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+    def paint(
+        self,
+        painter: QPainter,
+        option: QStyleOptionViewItem,
+        index: QModelIndex,
+    ) -> None:
         if index.column() != 0:
             super().paint(painter, option, index)
             return
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         opt.text = ""
-        style = opt.widget.style() if opt.widget is not None else QApplication.style()
-        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+        style = (
+            opt.widget.style()
+            if opt.widget is not None
+            else QApplication.style()
+        )
+        style.drawControl(
+            QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget
+        )
         state = str(index.data(UNGROUP_CHECK_VISUAL_ROLE) or "off")
         _TraySelectIconPainter.draw(painter, option.rect, state)
 
 
 class _TraySelectHeaderView(QHeaderView):
-    def paintSection(self, painter: QPainter, rect, logical_index: int) -> None:  # noqa: N802
+    def paintSection(  # noqa: N802
+        self, painter: QPainter, rect, logical_index: int
+    ) -> None:
         super().paintSection(painter, rect, logical_index)
         if logical_index != 0:
             return
         model = self.model()
         if model is None:
             return
-        state = str(model.headerData(logical_index, self.orientation(), UNGROUP_CHECK_VISUAL_ROLE) or "off")
+        state = str(
+            model.headerData(
+                logical_index, self.orientation(), UNGROUP_CHECK_VISUAL_ROLE
+            )
+            or "off"
+        )
         _TraySelectIconPainter.draw(painter, rect, state)
 
 
@@ -888,8 +1200,12 @@ class _ColumnCard(QWidget):
         tray_title: str | None = None,
         tray_actions_widget: QWidget | None = None,
         on_trolley_context: Callable[[QListView, QModelIndex], None] | None = None,
-        on_trolley_double_click: Callable[[QListView, QModelIndex], None] | None = None,
-        on_trolley_click: Callable[[QListView, QModelIndex], None] | None = None,
+        on_trolley_double_click: (
+            Callable[[QListView, QModelIndex], None] | None
+        ) = None,
+        on_trolley_click: (
+            Callable[[QListView, QModelIndex], None] | None
+        ) = None,
         on_tray_header_click: Callable[[int], None] | None = None,
     ) -> None:
         super().__init__()
@@ -901,8 +1217,10 @@ class _ColumnCard(QWidget):
         self._trolley_select_all_shortcut: QShortcut | None = None
         self._tray_resize_pending = False
         self._last_tray_resize_at: datetime | None = None
+        self._last_tray_resize_shape: tuple[int, int] | None = None
         self._interaction_release_timer: QTimer | None = None
         self._interaction_hold_active = False
+        self._tray_table_font_pending = False
         self.trolley_list = QListView(self)
         self._on_trolley_context_cb = on_trolley_context
         root = QVBoxLayout(self)
@@ -910,7 +1228,9 @@ class _ColumnCard(QWidget):
         root.setSpacing(6)
 
         heading = QLabel(title, self)
-        heading.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        heading.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
         heading.setStyleSheet("font-weight: 600;")
         root.addWidget(heading)
 
@@ -920,19 +1240,37 @@ class _ColumnCard(QWidget):
 
         self.trolley_list.setModel(trolley_model)
         self.trolley_list.setAlternatingRowColors(True)
-        self.trolley_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self._trolley_copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self.trolley_list)
-        self._trolley_copy_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        self._trolley_copy_shortcut.activated.connect(self._copy_selected_trolley_rows)
-        self._trolley_select_all_shortcut = QShortcut(QKeySequence.StandardKey.SelectAll, self.trolley_list)
-        self._trolley_select_all_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        self._trolley_select_all_shortcut.activated.connect(self._select_all_trolley_rows)
+        self.trolley_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self._trolley_copy_shortcut = QShortcut(
+            QKeySequence.StandardKey.Copy, self.trolley_list
+        )
+        self._trolley_copy_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self._trolley_copy_shortcut.activated.connect(
+            self._copy_selected_trolley_rows
+        )
+        self._trolley_select_all_shortcut = QShortcut(
+            QKeySequence.StandardKey.SelectAll, self.trolley_list
+        )
+        self._trolley_select_all_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self._trolley_select_all_shortcut.activated.connect(
+            self._select_all_trolley_rows
+        )
         self.trolley_list.installEventFilter(self)
         self.trolley_list.viewport().installEventFilter(self)
         root.addWidget(self.trolley_list, 1)
         if on_trolley_context is not None:
-            self.trolley_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            self.trolley_list.customContextMenuRequested.connect(self._handle_trolley_context)
+            self.trolley_list.setContextMenuPolicy(
+                Qt.ContextMenuPolicy.CustomContextMenu
+            )
+            self.trolley_list.customContextMenuRequested.connect(
+                self._handle_trolley_context
+            )
         if on_trolley_click is not None:
             self.trolley_list.clicked.connect(
                 lambda idx: on_trolley_click(self.trolley_list, idx),
@@ -960,8 +1298,12 @@ class _ColumnCard(QWidget):
             self.tray_table.setModel(tray_model)
             tray_model.modelReset.connect(self._schedule_resize_tray_columns)
             self.tray_table.setAlternatingRowColors(True)
-            self.tray_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
-            self.tray_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+            self.tray_table.setSelectionBehavior(
+                QAbstractItemView.SelectionBehavior.SelectItems
+            )
+            self.tray_table.setSelectionMode(
+                QAbstractItemView.SelectionMode.ExtendedSelection
+            )
             self.tray_table.setEditTriggers(
                 QAbstractItemView.EditTrigger.CurrentChanged
                 | QAbstractItemView.EditTrigger.SelectedClicked
@@ -969,22 +1311,27 @@ class _ColumnCard(QWidget):
             )
             self.tray_table.verticalHeader().setVisible(False)
             self.tray_table.verticalHeader().setDefaultSectionSize(30)
-            header = _TraySelectHeaderView(Qt.Orientation.Horizontal, self.tray_table)
+            header = _TraySelectHeaderView(
+                Qt.Orientation.Horizontal, self.tray_table
+            )
             self.tray_table.setHorizontalHeader(header)
             header.setSectionsClickable(True)
-            header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
             with contextlib.suppress(AttributeError):
                 header.setMinimumSectionSize(20)
-            header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
-            table_font = self.tray_table.font()
-            table_font.setPointSize(max(table_font.pointSize(), 10))
-            self.tray_table.setFont(table_font)
-            header.setFont(table_font)
-            self.tray_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+            header.setDefaultAlignment(
+                Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+            )
+            self._tray_table_font_pending = True
+            self.tray_table.setHorizontalScrollMode(
+                QAbstractItemView.ScrollMode.ScrollPerPixel
+            )
             self.tray_table.setWordWrap(False)
             self.tray_table.setTextElideMode(Qt.TextElideMode.ElideNone)
             self.tray_table.setMouseTracking(True)
-            self.tray_table.setItemDelegateForColumn(0, _TraySelectItemDelegate(self.tray_table))
+            self.tray_table.setItemDelegateForColumn(
+                0, _TraySelectItemDelegate(self.tray_table)
+            )
             self.tray_table.setContentsMargins(0, 0, 0, 0)
             self.tray_table.setViewportMargins(0, 0, 0, 0)
             self.tray_table.setFrameShape(QFrame.Shape.NoFrame)
@@ -1002,28 +1349,71 @@ class _ColumnCard(QWidget):
                 "QHeaderView::section { padding: 0px; margin: 0px; border: 0px; } "
                 "QTableCornerButton::section { padding: 0px; margin: 0px; border: 0px; }"
             )
-            self._tray_copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self.tray_table)
-            self._tray_copy_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            self._tray_copy_shortcut.activated.connect(self._copy_selected_tray_cells)
-            self._tray_select_all_shortcut = QShortcut(QKeySequence.StandardKey.SelectAll, self.tray_table)
-            self._tray_select_all_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            self._tray_select_all_shortcut.activated.connect(self._select_all_tray_cells)
+            self._tray_copy_shortcut = QShortcut(
+                QKeySequence.StandardKey.Copy, self.tray_table
+            )
+            self._tray_copy_shortcut.setContext(
+                Qt.ShortcutContext.WidgetWithChildrenShortcut
+            )
+            self._tray_copy_shortcut.activated.connect(
+                self._copy_selected_tray_cells
+            )
+            self._tray_select_all_shortcut = QShortcut(
+                QKeySequence.StandardKey.SelectAll, self.tray_table
+            )
+            self._tray_select_all_shortcut.setContext(
+                Qt.ShortcutContext.WidgetWithChildrenShortcut
+            )
+            self._tray_select_all_shortcut.activated.connect(
+                self._select_all_tray_cells
+            )
             self._interaction_release_timer = QTimer(self)
             self._interaction_release_timer.setSingleShot(True)
-            self._interaction_release_timer.timeout.connect(self._release_tray_interaction_hold)
+            self._interaction_release_timer.timeout.connect(
+                self._release_tray_interaction_hold
+            )
             self.tray_table.viewport().installEventFilter(self)
             self.tray_table.installEventFilter(self)
             vbar = self.tray_table.verticalScrollBar()
             hbar = self.tray_table.horizontalScrollBar()
-            vbar.sliderPressed.connect(lambda: self._set_tray_interaction_hold(True))
-            vbar.sliderReleased.connect(lambda: self._queue_tray_interaction_release(80))
-            hbar.sliderPressed.connect(lambda: self._set_tray_interaction_hold(True))
-            hbar.sliderReleased.connect(lambda: self._queue_tray_interaction_release(80))
+            vbar.sliderPressed.connect(
+                lambda: self._set_tray_interaction_hold(True)
+            )
+            vbar.sliderReleased.connect(
+                lambda: self._queue_tray_interaction_release(80)
+            )
+            hbar.sliderPressed.connect(
+                lambda: self._set_tray_interaction_hold(True)
+            )
+            hbar.sliderReleased.connect(
+                lambda: self._queue_tray_interaction_release(80)
+            )
             self._schedule_resize_tray_columns()
             root.addWidget(self.tray_table, 1)
 
     def set_stats_text(self, text: str) -> None:
         self._stats.setText(text)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if self._tray_table_font_pending and self.tray_table is not None:
+            self._tray_table_font_pending = False
+            self._apply_tray_table_font()
+
+    def _apply_tray_table_font(self) -> None:
+        if self.tray_table is None:
+            return
+        header = self.tray_table.horizontalHeader()
+        resolved_font = self.tray_table.font()
+        pt = resolved_font.pointSize()
+        if pt < 1:
+            pt = 10
+        else:
+            pt = max(pt, 10)
+        resolved_font.setPointSize(pt)
+        self.tray_table.setFont(resolved_font)
+        if header is not None:
+            header.setFont(resolved_font)
 
     def _handle_trolley_context(self, pos: QPoint) -> None:
         if self._on_trolley_context_cb is None:
@@ -1039,7 +1429,6 @@ class _ColumnCard(QWidget):
         model = self.tray_table.model()
         if model is None:
             return
-        # Only click in check column toggles check state.
         if index.column() != 0:
             return
         toggle_row = getattr(model, "toggle_row", None)
@@ -1048,9 +1437,14 @@ class _ColumnCard(QWidget):
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         trolley_list = self.trolley_list
-        if watched in {trolley_list, trolley_list.viewport()} and event.type() == QEvent.Type.KeyPress:
+        if watched in {
+            trolley_list, trolley_list.viewport()
+        } and event.type() == QEvent.Type.KeyPress:
             key = getattr(event, "key", lambda: None)()
-            modifiers = getattr(event, "modifiers", lambda: Qt.KeyboardModifier.NoModifier)()
+            modifiers = getattr(
+                event, "modifiers",
+                lambda: Qt.KeyboardModifier.NoModifier,
+            )()
             if modifiers & Qt.KeyboardModifier.ControlModifier:
                 if key == Qt.Key.Key_A:
                     self._select_all_trolley_rows()
@@ -1059,7 +1453,9 @@ class _ColumnCard(QWidget):
                     self._copy_selected_trolley_rows()
                     return True
         tray_table = self.tray_table
-        if tray_table is not None and watched in {tray_table, tray_table.viewport()}:
+        if tray_table is not None and watched in {
+            tray_table, tray_table.viewport()
+        }:
             event_type = event.type()
             if event_type in {
                 QEvent.Type.Wheel,
@@ -1068,7 +1464,10 @@ class _ColumnCard(QWidget):
             }:
                 self._set_tray_interaction_hold(True)
                 self._queue_tray_interaction_release(220)
-            elif event_type in {QEvent.Type.MouseButtonRelease, QEvent.Type.Leave}:
+            elif event_type in {
+                QEvent.Type.MouseButtonRelease,
+                QEvent.Type.Leave,
+            }:
                 self._queue_tray_interaction_release(100)
         return super().eventFilter(watched, event)
 
@@ -1117,7 +1516,9 @@ class _ColumnCard(QWidget):
                 selected_indexes = [current]
         if not selected_indexes:
             return
-        row_ids = sorted({index.row() for index in selected_indexes if index.isValid()})
+        row_ids = sorted(
+            {index.row() for index in selected_indexes if index.isValid()}
+        )
         lines: list[str] = []
         for row in row_ids:
             index = model.index(row, 0)
@@ -1147,7 +1548,9 @@ class _ColumnCard(QWidget):
         col_max = max(index.column() for index in selected_indexes)
         for index in selected_indexes:
             value = model.data(index, Qt.ItemDataRole.DisplayRole)
-            values_by_cell[(index.row(), index.column())] = "" if value is None else str(value)
+            values_by_cell[(index.row(), index.column())] = (
+                "" if value is None else str(value)
+            )
 
         lines: list[str] = []
         for row in range(row_min, row_max + 1):
@@ -1169,10 +1572,13 @@ class _ColumnCard(QWidget):
         if self.tray_table is None:
             self._tray_resize_pending = False
             return
+        model = self.tray_table.model()
+        if model is None:
+            self._tray_resize_pending = False
+            return
         if self._interaction_hold_active:
             QTimer.singleShot(220, self._flush_resize_tray_columns)
             return
-        # Avoid heavy resize while user is actively interacting with the table.
         vbar = self.tray_table.verticalScrollBar()
         hbar = self.tray_table.horizontalScrollBar()
         if (
@@ -1183,11 +1589,25 @@ class _ColumnCard(QWidget):
             QTimer.singleShot(220, self._flush_resize_tray_columns)
             return
         now = datetime.now()
-        if self._last_tray_resize_at is not None and (now - self._last_tray_resize_at).total_seconds() < 1.0:
+        row_count = model.rowCount()
+        column_count = model.columnCount()
+        current_shape = (row_count, column_count)
+        if (
+            self._last_tray_resize_shape == current_shape
+            and self._last_tray_resize_at is not None
+            and (now - self._last_tray_resize_at).total_seconds() < 6.0
+        ):
+            self._tray_resize_pending = False
+            return
+        if (
+            self._last_tray_resize_at is not None
+            and (now - self._last_tray_resize_at).total_seconds() < 0.8
+        ):
             QTimer.singleShot(220, self._flush_resize_tray_columns)
             return
         self._tray_resize_pending = False
         self._last_tray_resize_at = now
+        self._last_tray_resize_shape = current_shape
         self._resize_tray_columns()
 
     def _resize_tray_columns(self, *_args) -> None:
@@ -1196,35 +1616,52 @@ class _ColumnCard(QWidget):
         model = self.tray_table.model()
         if model is None:
             return
+
         started_at = time.perf_counter()
         header = self.tray_table.horizontalHeader()
         header.setStretchLastSection(False)
-        base_precision = min(max(model.rowCount(), 80), 240)
-        with contextlib.suppress(AttributeError):
-            # Balance completeness (Tray_ID not cut) and responsiveness during frequent refreshes.
-            header.setResizeContentsPrecision(base_precision)
+        row_count = model.rowCount()
         column_count = model.columnCount()
-        self.tray_table.resizeColumnsToContents()
+
         for col in range(column_count):
-            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
-        if column_count > 2:
-            # Tray_ID is business-critical; give it a deeper auto-fit pass so long IDs are visible.
-            with contextlib.suppress(AttributeError):
-                header.setResizeContentsPrecision(min(max(model.rowCount(), 300), 1200))
-            self.tray_table.resizeColumnToContents(2)
-            with contextlib.suppress(AttributeError):
-                header.setResizeContentsPrecision(base_precision)
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+
+        base_widths = {
+            1: 48, 2: 140, 3: 64, 4: 158,
+            5: 158, 6: 86, 7: 94, 8: 92,
+        }
+        for col, width in base_widths.items():
+            if col < column_count:
+                header.resizeSection(col, width)
+
+        if row_count > 0 and column_count > 2:
+            fm: QFontMetrics = self.tray_table.fontMetrics()
+            max_tray_width = 0
+            sample_limit = min(row_count, 50)
+            for row_idx in range(sample_limit):
+                idx = model.index(row_idx, 2)
+                text = str(
+                    model.data(idx, Qt.ItemDataRole.DisplayRole) or ""
+                )
+                w = fm.horizontalAdvance(text) + 16
+                if w > max_tray_width:
+                    max_tray_width = w
+            if max_tray_width > 0:
+                header.resizeSection(2, max(110, min(max_tray_width, 260)))
+
         if column_count > 0:
-            row_height = max(20, self.tray_table.verticalHeader().defaultSectionSize())
+            row_height = max(
+                20, self.tray_table.verticalHeader().defaultSectionSize()
+            )
             icon_width = max(18, min(22, row_height - 10))
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
             header.resizeSection(0, icon_width)
+
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
         if elapsed_ms >= 35:
             log.warning(
                 "Tray table resize slow elapsed_ms=%s rows=%s cols=%s",
-                elapsed_ms,
-                model.rowCount(),
-                column_count,
+                elapsed_ms, row_count, column_count,
             )
 
 
@@ -1237,7 +1674,9 @@ class _SettingsDialog(QDialog):
 
         root = QVBoxLayout(self)
         form = QFormLayout()
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
 
         self._host_input = QLineEdit(self)
         self._host_input.setText(settings.sql_server)
@@ -1259,12 +1698,16 @@ class _SettingsDialog(QDialog):
 
         self._total_trolley_input = QSpinBox(self)
         self._total_trolley_input.setRange(1, 999)
-        self._total_trolley_input.setValue(int(getattr(settings, "total_trolley_count", 99)))
+        self._total_trolley_input.setValue(
+            int(getattr(settings, "total_trolley_count", 99))
+        )
         form.addRow("Total Trolley", self._total_trolley_input)
 
         self._auto_group_gap_input = QSpinBox(self)
         self._auto_group_gap_input.setRange(0, 240)
-        self._auto_group_gap_input.setValue(int(getattr(settings, "auto_group_gap_minutes", 10)))
+        self._auto_group_gap_input.setValue(
+            int(getattr(settings, "auto_group_gap_minutes", 10))
+        )
         self._auto_group_gap_input.setSuffix(" min")
         form.addRow("Auto Group Gap", self._auto_group_gap_input)
 
@@ -1293,26 +1736,32 @@ class _SettingsDialog(QDialog):
         form.addRow("Refresh Interval", self._refresh_interval_input)
 
         self._data_window_days_input = QSpinBox(self)
-        self._data_window_days_input.setRange(1, 3)
-        self._data_window_days_input.setValue(int(getattr(settings, "ui_data_window_days", 1)))
+        self._data_window_days_input.setRange(1, _MAX_UI_WINDOW_DAYS)
+        self._data_window_days_input.setValue(
+            int(getattr(settings, "ui_data_window_days", 1))
+        )
         self._data_window_days_input.setSuffix(" day(s)")
         form.addRow("UI Data Window", self._data_window_days_input)
 
         self._lookback_label = QLabel(self)
-        self._data_window_days_input.valueChanged.connect(self._on_data_window_days_changed)
+        self._data_window_days_input.valueChanged.connect(
+            self._on_data_window_days_changed
+        )
         self._on_data_window_days_changed(self._data_window_days_input.value())
         form.addRow("Data Lookback", self._lookback_label)
         root.addLayout(form)
 
         hint = QLabel(
-            "Refresh/Data-window apply immediately. Database host/user/password still require restart.",
+            "Refresh/Data-window apply immediately. "
+            "Database host/user/password still require restart.",
             self,
         )
         hint.setStyleSheet("color: #666; font-size: 12px;")
         root.addWidget(hint)
 
         button_box = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel,
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel,
             parent=self,
         )
         button_box.accepted.connect(self.accept)
@@ -1330,16 +1779,22 @@ class _SettingsDialog(QDialog):
             "total_trolley_count": int(self._total_trolley_input.value()),
             "auto_group_gap_minutes": int(self._auto_group_gap_input.value()),
             "target_aging_hours": float(self._target_aging_input.value()),
-            "target_aging_tolerance_hours": float(self._aging_tolerance_input.value()),
-            "refresh_interval_seconds": float(self._refresh_interval_input.value()),
+            "target_aging_tolerance_hours": float(
+                self._aging_tolerance_input.value()
+            ),
+            "refresh_interval_seconds": float(
+                self._refresh_interval_input.value()
+            ),
             "data_window_days": days,
             "initial_load_lookback_hours": lookback_hours,
         }
 
     def _on_data_window_days_changed(self, value: int) -> None:
-        days = max(1, min(3, int(value)))
+        days = max(1, min(_MAX_UI_WINDOW_DAYS, int(value)))
         lookback_hours = int(_lookback_hours_for_days(days))
-        self._lookback_label.setText(f"{lookback_hours} hours ({days} day window)")
+        self._lookback_label.setText(
+            f"{lookback_hours} hours ({days} day window)"
+        )
 
 
 class _TrayDetailBridge(QObject):
@@ -1348,8 +1803,15 @@ class _TrayDetailBridge(QObject):
 
 class _TrolleyDetailDialog(QDialog):
     _worker_lock = threading.Lock()
+    _global_sql_busy = threading.Event()
 
-    def __init__(self, runtime: _Runtime, trolley_id: str, tray_rows: list[dict[str, str]], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        runtime: _Runtime,
+        trolley_id: str,
+        tray_rows: list[dict[str, str]],
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._runtime = runtime
         self._bridge = _TrayDetailBridge()
@@ -1378,13 +1840,21 @@ class _TrolleyDetailDialog(QDialog):
         self._summary_table.setHorizontalHeaderLabels(
             ["Tray_ID", "Start_Time", "End_Time", "Aging_Time", "Status"],
         )
-        self._summary_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._summary_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._summary_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._summary_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self._summary_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self._summary_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
         self._summary_table.verticalHeader().setVisible(False)
         summary_header = self._summary_table.horizontalHeader()
         summary_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        summary_header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        summary_header.setDefaultAlignment(
+            Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+        )
         root.addWidget(self._summary_table, 3)
 
         self._cell_label = QLabel("Cell Detail", self)
@@ -1393,21 +1863,33 @@ class _TrolleyDetailDialog(QDialog):
 
         self._cell_table = QTableWidget(self)
         self._cell_table.setColumnCount(3)
-        self._cell_table.setHorizontalHeaderLabels(["Cell_ID", "Start_Time", "End_Time"])
-        self._cell_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._cell_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._cell_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._cell_table.setHorizontalHeaderLabels(
+            ["Cell_ID", "Start_Time", "End_Time"]
+        )
+        self._cell_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self._cell_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self._cell_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
         self._cell_table.verticalHeader().setVisible(False)
         cell_header = self._cell_table.horizontalHeader()
         cell_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        cell_header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        cell_header.setDefaultAlignment(
+            Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+        )
         root.addWidget(self._cell_table, 2)
 
         self._status = QLabel("", self)
         root.addWidget(self._status)
 
         self._fill_summary(tray_rows)
-        self._summary_table.itemSelectionChanged.connect(self._on_summary_selection_changed)
+        self._summary_table.itemSelectionChanged.connect(
+            self._on_summary_selection_changed
+        )
         if self._summary_table.rowCount() > 0:
             self._summary_table.selectRow(0)
 
@@ -1415,13 +1897,25 @@ class _TrolleyDetailDialog(QDialog):
         self._summary_table.setRowCount(len(tray_rows))
         for row_idx, row in enumerate(tray_rows):
             tray_item = QTableWidgetItem(row.get("tray_id", ""))
-            tray_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
-            tray_item.setData(Qt.ItemDataRole.UserRole, row.get("tray_id", ""))
+            tray_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+            )
+            tray_item.setData(
+                Qt.ItemDataRole.UserRole, row.get("tray_id", "")
+            )
             self._summary_table.setItem(row_idx, 0, tray_item)
-            self._summary_table.setItem(row_idx, 1, self._center_item(row.get("start_time", "-")))
-            self._summary_table.setItem(row_idx, 2, self._center_item(row.get("end_time", "-")))
-            self._summary_table.setItem(row_idx, 3, self._center_item(row.get("aging_time", "-")))
-            self._summary_table.setItem(row_idx, 4, self._center_item(row.get("status", "-")))
+            self._summary_table.setItem(
+                row_idx, 1, self._center_item(row.get("start_time", "-"))
+            )
+            self._summary_table.setItem(
+                row_idx, 2, self._center_item(row.get("end_time", "-"))
+            )
+            self._summary_table.setItem(
+                row_idx, 3, self._center_item(row.get("aging_time", "-"))
+            )
+            self._summary_table.setItem(
+                row_idx, 4, self._center_item(row.get("status", "-"))
+            )
 
     def _on_summary_selection_changed(self) -> None:
         if self._closed or not self.isVisible():
@@ -1433,7 +1927,9 @@ class _TrolleyDetailDialog(QDialog):
         item = self._summary_table.item(row, 0)
         if item is None:
             return
-        tray_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        tray_id = str(
+            item.data(Qt.ItemDataRole.UserRole) or ""
+        ).strip()
         if not tray_id:
             return
         if self._loading and tray_id == self._active_tray_id:
@@ -1444,11 +1940,15 @@ class _TrolleyDetailDialog(QDialog):
         if cached is not None:
             self._active_tray_id = tray_id
             self._render_cells(tray_id, cached)
-            self._status.setText(f"Loaded {len(cached)} cells for tray {tray_id} (cache)")
+            self._status.setText(
+                f"Loaded {len(cached)} cells for tray {tray_id} (cache)"
+            )
             return
         if self._loading:
             self._pending_tray_id = tray_id
-            self._status.setText(f"Queued cell detail for tray {tray_id} ...")
+            self._status.setText(
+                f"Queued cell detail for tray {tray_id} ..."
+            )
             return
         self._start_tray_cells_query(tray_id)
 
@@ -1463,19 +1963,24 @@ class _TrolleyDetailDialog(QDialog):
         self._cell_table.setRowCount(0)
 
         def _worker() -> None:
-            if not type(self)._worker_lock.acquire(blocking=False):
+            acquired = type(self)._worker_lock.acquire(timeout=60.0)
+            if not acquired:
                 self._bridge.loaded.emit(
-                    tray_id,
-                    request_id,
-                    None,
-                    "Another tray detail request is running. Please wait.",
+                    tray_id, request_id, None,
+                    "Tray detail request timed out. Database may be busy.",
                 )
                 return
             try:
                 rows = self._runtime.tray_cells(tray_id)
                 self._bridge.loaded.emit(tray_id, request_id, rows, None)
             except Exception as exc:  # noqa: BLE001
-                self._bridge.loaded.emit(tray_id, request_id, None, str(exc))
+                error_msg = str(exc)
+                if "access violation" in error_msg.lower():
+                    error_msg = (
+                        "Database driver error. Please wait a moment and retry. "
+                        "Consider installing 'ODBC Driver 17 for SQL Server'."
+                    )
+                self._bridge.loaded.emit(tray_id, request_id, None, error_msg)
             finally:
                 type(self)._worker_lock.release()
 
@@ -1485,21 +1990,40 @@ class _TrolleyDetailDialog(QDialog):
             daemon=True,
         ).start()
 
-    def _render_cells(self, tray_id: str, rows: list[dict[str, str | None]]) -> None:
+    def _render_cells(
+        self, tray_id: str, rows: list[dict[str, str | None]]
+    ) -> None:
         self._cell_table.setRowCount(len(rows))
         for row_idx, row_data in enumerate(rows):
-            self._cell_table.setItem(row_idx, 0, self._center_item(str(row_data.get("cell_id", ""))))
-            self._cell_table.setItem(row_idx, 1, self._center_item(str(row_data.get("start_time") or "-")))
-            self._cell_table.setItem(row_idx, 2, self._center_item(str(row_data.get("end_time") or "-")))
+            self._cell_table.setItem(
+                row_idx, 0,
+                self._center_item(str(row_data.get("cell_id", ""))),
+            )
+            self._cell_table.setItem(
+                row_idx, 1,
+                self._center_item(str(row_data.get("start_time") or "-")),
+            )
+            self._cell_table.setItem(
+                row_idx, 2,
+                self._center_item(str(row_data.get("end_time") or "-")),
+            )
         self._status.setText(f"Loaded {len(rows)} cells for tray {tray_id}")
 
     @staticmethod
     def _center_item(text: str) -> QTableWidgetItem:
         item = QTableWidgetItem(text)
-        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        item.setTextAlignment(
+            Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+        )
         return item
 
-    def _on_cells_loaded(self, tray_id: str, request_id: int, rows: object, error: object) -> None:
+    def _on_cells_loaded(
+        self,
+        tray_id: str,
+        request_id: int,
+        rows: object,
+        error: object,
+    ) -> None:
         if self._closed:
             return
         if request_id != self._active_request_id:
@@ -1517,7 +2041,8 @@ class _TrolleyDetailDialog(QDialog):
         self._render_cells(tray_id, self._tray_cells_cache[tray_id])
         if not values:
             self._status.setText(
-                "No cell detail in local cache for this tray. Wait for refresh or reopen after data sync.",
+                "No cell detail in local cache for this tray. "
+                "Wait for refresh or reopen after data sync.",
             )
         pending = self._pending_tray_id
         self._pending_tray_id = None
@@ -1528,6 +2053,8 @@ class _TrolleyDetailDialog(QDialog):
         self._closed = True
         super().closeEvent(event)
 
+
+# ── _MainWindow (unchanged from original) ─────────────────────────────────────
 
 class _MainWindow(QMainWindow):
     def __init__(self, vm: BoardViewModel, runtime: _Runtime) -> None:
@@ -1574,12 +2101,8 @@ class _MainWindow(QMainWindow):
             "precharge_trolley_count": _MetricBox("Precharge Trolley", self),
         }
         for key in (
-            "tray_count",
-            "group_count",
-            "assembly_ungroup_count",
-            "assembly_trolley_count",
-            "queue_trolley_count",
-            "precharge_trolley_count",
+            "tray_count", "group_count", "assembly_ungroup_count",
+            "assembly_trolley_count", "queue_trolley_count", "precharge_trolley_count",
         ):
             summary_layout.addWidget(self._metric_boxes[key], 1)
         layout.addWidget(summary_row)
@@ -1596,7 +2119,9 @@ class _MainWindow(QMainWindow):
         self._settings_btn = QPushButton("Settings", self)
         self._search_input = QLineEdit(self)
         self._search_input.setPlaceholderText("Tray/Cell ID")
-        search_width = self._search_input.fontMetrics().horizontalAdvance("VB050002596") + 36
+        search_width = (
+            self._search_input.fontMetrics().horizontalAdvance("VB050002596") + 36
+        )
         self._search_input.setFixedWidth(max(140, min(190, search_width)))
         self._search_btn = QPushButton("Search", self)
         self._pending_search_query = ""
@@ -1690,7 +2215,9 @@ class _MainWindow(QMainWindow):
         max_width = max(640, int(available.width() * 0.96))
         max_height = max(480, int(available.height() * 0.90))
         if self.width() > max_width or self.height() > max_height:
-            self.resize(min(self.width(), max_width), min(self.height(), max_height))
+            self.resize(
+                min(self.width(), max_width), min(self.height(), max_height)
+            )
         frame = self.frameGeometry()
         frame.moveCenter(available.center())
         top_left = frame.topLeft()
@@ -1704,19 +2231,16 @@ class _MainWindow(QMainWindow):
         for key, box in self._metric_boxes.items():
             box.set_value(int(payload.get(key, 0)))
         self._assembly_card.set_stats_text(
-            "Trolley={assembly_trolley_count} | Tray={assembly_tray_count} | Cell={assembly_cell_count} | Ungroup={assembly_ungroup_count}".format(
-                **payload
-            )
+            "Trolley={assembly_trolley_count} | Tray={assembly_tray_count} | "
+            "Cell={assembly_cell_count} | Ungroup={assembly_ungroup_count}".format(**payload)
         )
         self._queue_card.set_stats_text(
-            "Trolley={queue_trolley_count} | Tray={queue_tray_count} | Cell={queue_cell_count}".format(
-                **payload
-            )
+            "Trolley={queue_trolley_count} | Tray={queue_tray_count} | "
+            "Cell={queue_cell_count}".format(**payload)
         )
         self._precharge_card.set_stats_text(
-            "Trolley={precharge_trolley_count} | Tray={precharge_tray_count} | Cell={precharge_cell_count}".format(
-                **payload
-            )
+            "Trolley={precharge_trolley_count} | Tray={precharge_tray_count} | "
+            "Cell={precharge_cell_count}".format(**payload)
         )
         self._refresh_suggested_trolley_id(force=False)
 
@@ -1728,7 +2252,9 @@ class _MainWindow(QMainWindow):
         width = max(2, len(str(safe_total)))
         return f"TRO-{safe_seq:0{width}d}"
 
-    def _parse_tro_seq_for_ui(self, trolley_id: str, *, total_count: int) -> int | None:
+    def _parse_tro_seq_for_ui(
+        self, trolley_id: str, *, total_count: int
+    ) -> int | None:
         text = str(trolley_id).strip().upper()
         if not text:
             return None
@@ -1750,16 +2276,27 @@ class _MainWindow(QMainWindow):
             *self._vm.precharge_trolley_model.trolley_ids(),
         ]
 
-    def _refresh_suggested_trolley_id(self, *, force: bool = False, used_trolley_id: str | None = None) -> None:
-        total_count = max(1, int(getattr(settings, "total_trolley_count", 99)))
+    def _refresh_suggested_trolley_id(
+        self, *, force: bool = False, used_trolley_id: str | None = None
+    ) -> None:
+        total_count = max(
+            1, int(getattr(settings, "total_trolley_count", 99))
+        )
         previous_suggestion = self._suggested_trolley_id
 
-        base_seq = self._parse_tro_seq_for_ui(str(used_trolley_id or ""), total_count=total_count)
+        base_seq = self._parse_tro_seq_for_ui(
+            str(used_trolley_id or ""), total_count=total_count
+        )
         if base_seq is None:
             parsed_sequences = [
                 parsed
                 for trolley_id in self._all_visible_trolley_ids()
-                if (parsed := self._parse_tro_seq_for_ui(trolley_id, total_count=total_count)) is not None
+                if (
+                    parsed := self._parse_tro_seq_for_ui(
+                        trolley_id, total_count=total_count
+                    )
+                )
+                is not None
             ]
             if parsed_sequences:
                 base_seq = max(parsed_sequences)
@@ -1769,11 +2306,17 @@ class _MainWindow(QMainWindow):
         else:
             next_seq = (base_seq % total_count) + 1
 
-        next_suggestion = self._format_tro_id_for_ui(next_seq, total_count=total_count)
+        next_suggestion = self._format_tro_id_for_ui(
+            next_seq, total_count=total_count
+        )
         self._suggested_trolley_id = next_suggestion
 
         current_text = self._add_trolley_input.text().strip()
-        if force or not current_text or current_text.upper() == previous_suggestion.upper():
+        if (
+            force
+            or not current_text
+            or current_text.upper() == previous_suggestion.upper()
+        ):
             self._add_trolley_input.setText(next_suggestion)
 
     def _on_quick_refresh(self) -> None:
@@ -1798,7 +2341,9 @@ class _MainWindow(QMainWindow):
         lookup = raw.upper()
         tray_payload = self._vm.tray_payload_by_id(lookup)
         if tray_payload is not None:
-            self._status.setText(self._format_tray_search_result(lookup, tray_payload))
+            self._status.setText(
+                self._format_tray_search_result(lookup, tray_payload)
+            )
             return
         self._pending_search_query = lookup
         self._run_action(
@@ -1806,14 +2351,20 @@ class _MainWindow(QMainWindow):
             action=lambda: self._runtime.cell_owner(lookup),
         )
 
-    def _format_tray_search_result(self, tray_id: str, tray_payload: dict[str, Any]) -> str:
+    def _format_tray_search_result(
+        self, tray_id: str, tray_payload: dict[str, Any]
+    ) -> str:
         location, trolley_id = self._find_tray_location(tray_id)
         ccu_payload = tray_payload.get("ccu_payload") or {}
         fpc_payload = tray_payload.get("fpc_payload") or {}
         start_dt = parse_datetime(ccu_payload.get("start_time"))
         ccu_end_dt = parse_datetime(ccu_payload.get("end_time"))
         end_dt = ccu_end_dt
-        qty_raw = ccu_payload.get("quantity") if ccu_payload else fpc_payload.get("cell_count")
+        qty_raw = (
+            ccu_payload.get("quantity")
+            if ccu_payload
+            else fpc_payload.get("cell_count")
+        )
         try:
             qty = int(str(qty_raw).strip()) if qty_raw is not None else 0
         except Exception:  # noqa: BLE001
@@ -1821,19 +2372,27 @@ class _MainWindow(QMainWindow):
         aging_text = "-"
         if ccu_end_dt is not None:
             ref_dt = datetime.now()
-            precharge_start_dt = parse_datetime(fpc_payload.get("precharge_start_time"))
+            precharge_start_dt = parse_datetime(
+                fpc_payload.get("precharge_start_time")
+            )
             if ccu_payload and fpc_payload and precharge_start_dt is not None:
                 ref_dt = precharge_start_dt
             aging_text = _format_timedelta(ref_dt - ccu_end_dt)
-        start_text = start_dt.isoformat(sep=" ", timespec="seconds") if start_dt else "-"
-        end_text = end_dt.isoformat(sep=" ", timespec="seconds") if end_dt else "-"
+        start_text = (
+            start_dt.isoformat(sep=" ", timespec="seconds") if start_dt else "-"
+        )
+        end_text = (
+            end_dt.isoformat(sep=" ", timespec="seconds") if end_dt else "-"
+        )
         trolley_text = trolley_id if trolley_id else "-"
         return (
             f"Tray_ID {tray_id} | Trolley {trolley_text} | {location} | "
             f"Qty {qty} | Start {start_text} | End {end_text} | Aging {aging_text}"
         )
 
-    def _format_cell_search_result(self, cell_id: str, payload: dict[str, str | None]) -> str:
+    def _format_cell_search_result(
+        self, cell_id: str, payload: dict[str, str | None]
+    ) -> str:
         tray_id = str(payload.get("tray_id") or "").strip()
         if not tray_id:
             return f"Cell {cell_id} not found."
@@ -1866,14 +2425,18 @@ class _MainWindow(QMainWindow):
     def _on_add_trolley(self) -> None:
         tray_ids = self._selected_ungroup_tray_ids()
         if not tray_ids:
-            self._status.setText("Please check at least one tray in Ungroup list.")
+            self._status.setText(
+                "Please check at least one tray in Ungroup list."
+            )
             return
         trolley_id = self._add_trolley_input.text().strip()
         if not trolley_id:
             self._refresh_suggested_trolley_id(force=True)
             trolley_id = self._add_trolley_input.text().strip()
             if not trolley_id:
-                self._status.setText("Please input trolley ID for Add Trolley.")
+                self._status.setText(
+                    "Please input trolley ID for Add Trolley."
+                )
                 return
         self._run_action(
             action_name="Add trolley",
@@ -1896,21 +2459,33 @@ class _MainWindow(QMainWindow):
         tray_table = self._assembly_card.tray_table
         if tray_table is None or tray_table.selectionModel() is None:
             return []
-        selected_rows = {index.row() for index in tray_table.selectionModel().selectedIndexes()}
+        selected_rows = {
+            index.row()
+            for index in tray_table.selectionModel().selectedIndexes()
+        }
         out: list[str] = []
         for row in sorted(selected_rows):
             tray_index = self._vm.assembly_ungrouped_model.index(row, 2)
-            tray_id = str(self._vm.assembly_ungrouped_model.data(tray_index, Qt.ItemDataRole.DisplayRole) or "").strip()
+            tray_id = str(
+                self._vm.assembly_ungrouped_model.data(
+                    tray_index, Qt.ItemDataRole.DisplayRole
+                )
+                or ""
+            ).strip()
             if tray_id:
                 out.append(tray_id)
         return out
 
-    def _on_trolley_item_clicked(self, list_view: QListView, index: QModelIndex) -> None:
+    def _on_trolley_item_clicked(
+        self, list_view: QListView, index: QModelIndex
+    ) -> None:
         if not index.isValid():
             return
         self._clear_trolley_selection_except(list_view)
 
-    def _clear_trolley_selection_except(self, active_list: QListView) -> None:
+    def _clear_trolley_selection_except(
+        self, active_list: QListView
+    ) -> None:
         for list_view in (
             self._assembly_card.trolley_list,
             self._queue_card.trolley_list,
@@ -1934,7 +2509,9 @@ class _MainWindow(QMainWindow):
 
         if fallback_index is not None and fallback_index.isValid():
             fallback_row = fallback_index.row()
-            has_fallback_selected = any(index.row() == fallback_row for index in selected_rows)
+            has_fallback_selected = any(
+                index.row() == fallback_row for index in selected_rows
+            )
             if selected_rows and not has_fallback_selected:
                 selected_rows = [fallback_index]
                 with contextlib.suppress(Exception):
@@ -1957,46 +2534,70 @@ class _MainWindow(QMainWindow):
             out.append(payload)
         return out
 
-    def _delete_trolleys_action(self, trolley_ids: list[str]) -> dict[str, object]:
-        requested_ids = [trolley_id.strip() for trolley_id in trolley_ids if trolley_id.strip()]
-        deleted = 0
-        errors: list[str] = []
-        for trolley_id in requested_ids:
-            try:
-                self._runtime.delete_trolley(trolley_id=trolley_id)
-                deleted += 1
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{trolley_id}: {exc}")
+    def _delete_trolleys_action(
+        self, trolley_ids: list[str]
+    ) -> dict[str, object]:
+        requested_ids = [
+            trolley_id.strip()
+            for trolley_id in trolley_ids
+            if trolley_id.strip()
+        ]
+        if not requested_ids:
+            return {"requested": 0, "deleted": 0, "failed": 0, "errors": []}
+        result = self._runtime.delete_trolleys(trolley_ids=requested_ids)
+        payload = dict(result) if isinstance(result, dict) else {}
+        requested = int(payload.get("requested") or len(requested_ids))
+        deleted = int(payload.get("deleted") or 0)
+        not_found = list(payload.get("not_found_trolley_ids") or [])
+        failed = max(0, requested - deleted)
         return {
-            "requested": len(requested_ids),
+            "requested": requested,
             "deleted": deleted,
-            "failed": len(errors),
-            "errors": errors[:5],
+            "failed": failed,
+            "not_found": not_found[:20],
         }
 
-    def _on_trolley_item_context(self, list_view: QListView, index: QModelIndex) -> None:
-        selected_trolleys = self._selected_trolley_payloads(list_view, fallback_index=index)
+    def _on_trolley_item_context(
+        self, list_view: QListView, index: QModelIndex
+    ) -> None:
+        selected_trolleys = self._selected_trolley_payloads(
+            list_view, fallback_index=index
+        )
         if not selected_trolleys:
             return
-        global_pos = list_view.viewport().mapToGlobal(list_view.visualRect(index).bottomRight())
-        self._show_trolley_menu(selected_trolleys[0], selected_trolleys, global_pos)
+        global_pos = list_view.viewport().mapToGlobal(
+            list_view.visualRect(index).bottomRight()
+        )
+        self._show_trolley_menu(
+            selected_trolleys[0], selected_trolleys, global_pos
+        )
 
-    def _on_trolley_item_double_click(self, _: QListView, index: QModelIndex) -> None:
+    def _on_trolley_item_double_click(
+        self, _: QListView, index: QModelIndex
+    ) -> None:
         payload = self._trolley_payload_from_index(index)
         if payload is None:
             return
         self._show_trolley_detail_dialog(payload)
 
-    def _trolley_payload_from_index(self, index: QModelIndex) -> dict[str, Any] | None:
+    def _trolley_payload_from_index(
+        self, index: QModelIndex
+    ) -> dict[str, Any] | None:
         if not index.isValid():
             return None
         model = index.model()
         if model is None:
             return None
-        trolley_role = getattr(model, "TrolleyIdRole", TrolleyListModel.TrolleyIdRole)
-        tray_ids_role = getattr(model, "TrayIdsRole", TrolleyListModel.TrayIdsRole)
+        trolley_role = getattr(
+            model, "TrolleyIdRole", TrolleyListModel.TrolleyIdRole
+        )
+        tray_ids_role = getattr(
+            model, "TrayIdsRole", TrolleyListModel.TrayIdsRole
+        )
         mode_role = getattr(model, "ModeRole", TrolleyListModel.ModeRole)
-        column_role = getattr(model, "ColumnRole", TrolleyListModel.ColumnRole)
+        column_role = getattr(
+            model, "ColumnRole", TrolleyListModel.ColumnRole
+        )
         state_role = getattr(model, "StateRole", TrolleyListModel.StateRole)
         trolley_id = str(index.data(trolley_role) or "").strip()
         if not trolley_id:
@@ -2020,20 +2621,27 @@ class _MainWindow(QMainWindow):
             return
         mode = str(trolley.get("mode", "")).strip().lower()
         is_manual = mode == "manual"
-        tray_ids = [str(item).strip() for item in trolley.get("tray_ids", []) if str(item).strip()]
+        auto_group_enabled = bool(self._auto_group_checkbox.isChecked())
+        is_editable_single = is_manual or (not auto_group_enabled)
+        tray_ids = [
+            str(item).strip()
+            for item in trolley.get("tray_ids", [])
+            if str(item).strip()
+        ]
         selected_rows = list(selected_trolleys) if selected_trolleys else [trolley]
-        selected_manual_ids: list[str] = []
-        has_auto_selected = False
+        selected_deletable_ids: list[str] = []
+        has_non_deletable_selected = False
         for row in selected_rows:
             row_id = str(row.get("trolley_id", "")).strip()
             if not row_id:
                 continue
             row_mode = str(row.get("mode", "")).strip().lower()
-            if row_mode == "manual":
-                selected_manual_ids.append(row_id)
+            row_is_deletable = row_mode == "manual" or (not auto_group_enabled)
+            if row_is_deletable:
+                selected_deletable_ids.append(row_id)
             else:
-                has_auto_selected = True
-        selected_manual_ids = list(dict.fromkeys(selected_manual_ids))
+                has_non_deletable_selected = True
+        selected_deletable_ids = list(dict.fromkeys(selected_deletable_ids))
         multi_selected = len(selected_rows) > 1
 
         menu = QMenu(self)
@@ -2044,7 +2652,9 @@ class _MainWindow(QMainWindow):
         menu.addSeparator()
         clear_action = menu.addAction("Clear Trolley")
         if multi_selected:
-            delete_action = menu.addAction(f"Delete Selected Trolleys ({len(selected_rows)})")
+            delete_action = menu.addAction(
+                f"Delete Selected Trolleys ({len(selected_rows)})"
+            )
         else:
             delete_action = menu.addAction("Delete Trolley")
 
@@ -2053,8 +2663,10 @@ class _MainWindow(QMainWindow):
             add_action.setEnabled(False)
             remove_action.setEnabled(False)
             clear_action.setEnabled(False)
-            delete_action.setEnabled(bool(selected_manual_ids) and (not has_auto_selected))
-        elif not is_manual:
+            delete_action.setEnabled(
+                bool(selected_deletable_ids) and (not has_non_deletable_selected)
+            )
+        elif not is_editable_single:
             add_action.setEnabled(False)
             remove_action.setEnabled(False)
             clear_action.setEnabled(False)
@@ -2065,11 +2677,8 @@ class _MainWindow(QMainWindow):
             return
         if chosen == rename_action:
             new_trolley_id, ok = QInputDialog.getText(
-                self,
-                "Edit Trolley",
-                "Trolley ID",
-                QLineEdit.EchoMode.Normal,
-                trolley_id,
+                self, "Edit Trolley", "Trolley ID",
+                QLineEdit.EchoMode.Normal, trolley_id,
             )
             if not ok:
                 return
@@ -2082,28 +2691,37 @@ class _MainWindow(QMainWindow):
                 return
             self._run_action(
                 action_name="Rename trolley",
-                action=lambda: self._runtime.rename_trolley(old_trolley_id=trolley_id, new_trolley_id=new_id),
+                action=lambda: self._runtime.rename_trolley(
+                    old_trolley_id=trolley_id, new_trolley_id=new_id
+                ),
             )
             return
         if multi_selected:
-            if has_auto_selected:
-                self._status.setText("Only manual trolleys can be deleted in multi-select mode.")
+            if has_non_deletable_selected:
+                self._status.setText(
+                    "Disable Auto Group to delete AUTO trolleys "
+                    "in multi-select mode."
+                )
                 return
-            if not selected_manual_ids:
-                self._status.setText("No manual trolley selected to delete.")
+            if not selected_deletable_ids:
+                self._status.setText("No trolley selected to delete.")
                 return
             self._run_action(
                 action_name="Delete trolleys",
-                action=lambda: self._delete_trolleys_action(selected_manual_ids),
+                action=lambda: self._delete_trolleys_action(
+                    selected_deletable_ids
+                ),
             )
             return
-        if not is_manual:
-            self._status.setText("Auto trolley only supports rename.")
+        if not is_editable_single:
+            self._status.setText("Disable Auto Group to edit AUTO trolley.")
             return
         if chosen == add_action:
             tray_ids_to_add = self._selected_ungroup_tray_ids()
             if not tray_ids_to_add:
-                self._status.setText("Please select trays in Ungroup list first.")
+                self._status.setText(
+                    "Please select trays in Ungroup list first."
+                )
                 return
             self._run_action(
                 action_name="Edit trolley add trays",
@@ -2116,46 +2734,54 @@ class _MainWindow(QMainWindow):
             return
         if chosen == remove_action:
             if not tray_ids:
-                self._status.setText("No tray available in trolley to remove.")
+                self._status.setText(
+                    "No tray available in trolley to remove."
+                )
                 return
-            tray_id, ok = QInputDialog.getItem(
-                self,
-                "Edit Trolley",
-                "Select tray to remove",
-                tray_ids,
-                0,
-                False,
-            )
-            if not ok or not tray_id:
+            selected_trays = self._pick_trays_for_delete(tray_ids)
+            if not selected_trays:
                 return
-            selected_tray = str(tray_id).strip()
             self._run_action(
                 action_name="Edit trolley delete tray",
-                action=lambda: self._runtime.manual_ungroup(tray_id=selected_tray),
+                action=lambda: self._runtime.manual_ungroup_many(
+                    tray_ids=selected_trays
+                ),
             )
             return
         if chosen == clear_action:
             self._run_action(
                 action_name="Clear trolley",
-                action=lambda: self._runtime.clear_trolley(trolley_id=trolley_id),
+                action=lambda: self._runtime.clear_trolley(
+                    trolley_id=trolley_id
+                ),
             )
             return
         if chosen == delete_action:
             self._run_action(
                 action_name="Delete trolley",
-                action=lambda: self._runtime.delete_trolley(trolley_id=trolley_id),
+                action=lambda: self._runtime.delete_trolley(
+                    trolley_id=trolley_id
+                ),
             )
             return
 
     def _show_trolley_detail_dialog(self, trolley: dict[str, Any]) -> None:
-        tray_ids = [str(item).strip() for item in trolley.get("tray_ids", []) if str(item).strip()]
+        tray_ids = [
+            str(item).strip()
+            for item in trolley.get("tray_ids", [])
+            if str(item).strip()
+        ]
         if not tray_ids:
-            self._status.setText("Trolley has no tray data to show detail.")
+            self._status.setText(
+                "Trolley has no tray data to show detail."
+            )
             return
         tray_payloads = self._vm.tray_payloads(tray_ids)
         rows = self._build_tray_summary_rows(tray_payloads)
         if not rows:
-            self._status.setText("No tray summary available for selected trolley.")
+            self._status.setText(
+                "No tray summary available for selected trolley."
+            )
             return
         dialog = _TrolleyDetailDialog(
             runtime=self._runtime,
@@ -2165,7 +2791,56 @@ class _MainWindow(QMainWindow):
         )
         dialog.exec()
 
-    def _build_tray_summary_rows(self, tray_payloads: list[dict[str, Any]]) -> list[dict[str, str]]:
+    def _pick_trays_for_delete(self, tray_ids: list[str]) -> list[str]:
+        normalized = [
+            str(item).strip() for item in tray_ids if str(item).strip()
+        ]
+        if not normalized:
+            return []
+        if len(normalized) == 1:
+            return [normalized[0]]
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Trolley")
+        dialog.resize(420, 420)
+        root = QVBoxLayout(dialog)
+        root.addWidget(QLabel("Select tray(s) to remove:", dialog))
+
+        tray_list = QListWidget(dialog)
+        tray_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        for tray_id in normalized:
+            item = QListWidgetItem(tray_id, tray_list)
+            item.setSelected(True)
+        root.addWidget(tray_list, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        root.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return []
+        selected = [
+            str(item.text()).strip()
+            for item in tray_list.selectedItems()
+            if str(item.text()).strip()
+        ]
+        if not selected:
+            self._status.setText(
+                "Please select at least one tray to delete."
+            )
+            return []
+        return selected
+
+    def _build_tray_summary_rows(
+        self, tray_payloads: list[dict[str, Any]]
+    ) -> list[dict[str, str]]:
         now = datetime.now()
         out: list[dict[str, str]] = []
         for row in tray_payloads:
@@ -2189,7 +2864,9 @@ class _MainWindow(QMainWindow):
                 if ccu_end_dt is None or precharge_start_dt is None:
                     aging_text = "-"
                 else:
-                    aging_text = _format_timedelta(precharge_start_dt - ccu_end_dt)
+                    aging_text = _format_timedelta(
+                        precharge_start_dt - ccu_end_dt
+                    )
             elif has_ccu:
                 if end_dt is None:
                     aging_text = "-"
@@ -2204,13 +2881,25 @@ class _MainWindow(QMainWindow):
             out.append(
                 {
                     "tray_id": tray_id,
-                    "start_time": start_dt.isoformat(sep=" ", timespec="seconds") if start_dt else "-",
-                    "end_time": end_dt.isoformat(sep=" ", timespec="seconds") if end_dt else "-",
+                    "start_time": (
+                        start_dt.isoformat(sep=" ", timespec="seconds")
+                        if start_dt else "-"
+                    ),
+                    "end_time": (
+                        end_dt.isoformat(sep=" ", timespec="seconds")
+                        if end_dt else "-"
+                    ),
                     "aging_time": aging_text,
                     "status": status_text,
                 }
             )
-        out.sort(key=lambda item: (item.get("end_time", ""), item.get("tray_id", "")), reverse=True)
+        out.sort(
+            key=lambda item: (
+                item.get("end_time", ""),
+                item.get("tray_id", ""),
+            ),
+            reverse=True,
+        )
         return out
 
     def _on_auto_group_toggled(self, checked: bool) -> None:
@@ -2232,10 +2921,14 @@ class _MainWindow(QMainWindow):
             return
 
         prev_max_trays = int(settings.trolley_max_trays)
-        prev_total_trolley_count = int(getattr(settings, "total_trolley_count", 99))
+        prev_total_trolley_count = int(
+            getattr(settings, "total_trolley_count", 99)
+        )
         prev_refresh_interval = float(settings.delta_poll_interval_seconds)
         prev_window_days = int(settings.ui_data_window_days)
-        prev_auto_group_gap = int(getattr(settings, "auto_group_gap_minutes", 10))
+        prev_auto_group_gap = int(
+            getattr(settings, "auto_group_gap_minutes", 10)
+        )
         prev_target_aging = float(settings.target_aging_hours)
         prev_aging_tolerance = float(settings.target_aging_tolerance_hours)
 
@@ -2265,12 +2958,24 @@ class _MainWindow(QMainWindow):
         _sync_data_window_settings()
 
         max_trays_changed = prev_max_trays != settings.trolley_max_trays
-        total_trolley_changed = prev_total_trolley_count != settings.total_trolley_count
-        refresh_changed = abs(prev_refresh_interval - settings.delta_poll_interval_seconds) > 1e-6
+        total_trolley_changed = (
+            prev_total_trolley_count != settings.total_trolley_count
+        )
+        refresh_changed = (
+            abs(prev_refresh_interval - settings.delta_poll_interval_seconds)
+            > 1e-6
+        )
         window_days_changed = prev_window_days != settings.ui_data_window_days
-        auto_group_gap_changed = prev_auto_group_gap != settings.auto_group_gap_minutes
-        target_aging_changed = abs(prev_target_aging - settings.target_aging_hours) > 1e-6
-        aging_tolerance_changed = abs(prev_aging_tolerance - settings.target_aging_tolerance_hours) > 1e-6
+        auto_group_gap_changed = (
+            prev_auto_group_gap != settings.auto_group_gap_minutes
+        )
+        target_aging_changed = (
+            abs(prev_target_aging - settings.target_aging_hours) > 1e-6
+        )
+        aging_tolerance_changed = (
+            abs(prev_aging_tolerance - settings.target_aging_tolerance_hours)
+            > 1e-6
+        )
 
         try:
             _upsert_env_values(
@@ -2283,24 +2988,43 @@ class _MainWindow(QMainWindow):
                     "TOTAL_TROLLEY_COUNT": str(settings.total_trolley_count),
                     "AUTO_GROUP_GAP_MINUTES": str(settings.auto_group_gap_minutes),
                     "TARGET_AGING_HOURS": str(settings.target_aging_hours),
-                    "TARGET_AGING_TOLERANCE_HOURS": str(settings.target_aging_tolerance_hours),
-                    "DELTA_POLL_INTERVAL_SECONDS": str(settings.delta_poll_interval_seconds),
+                    "TARGET_AGING_TOLERANCE_HOURS": str(
+                        settings.target_aging_tolerance_hours
+                    ),
+                    "DELTA_POLL_INTERVAL_SECONDS": str(
+                        settings.delta_poll_interval_seconds
+                    ),
                     "UI_DATA_WINDOW_DAYS": str(settings.ui_data_window_days),
-                    "INITIAL_LOAD_LOOKBACK_HOURS": str(settings.initial_load_lookback_hours),
-                    "CCU_BACKFILL_LOOKBACK_HOURS": str(settings.ccu_backfill_lookback_hours),
+                    "INITIAL_LOAD_LOOKBACK_HOURS": str(
+                        settings.initial_load_lookback_hours
+                    ),
+                    "CCU_BACKFILL_LOOKBACK_HOURS": str(
+                        settings.ccu_backfill_lookback_hours
+                    ),
                 },
             )
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Settings", f"Failed to save .env settings: {exc}")
+            QMessageBox.critical(
+                self, "Settings", f"Failed to save .env settings: {exc}"
+            )
             return
 
         extra_messages: list[str] = []
         if auto_group_gap_changed:
-            extra_messages.append(f"App setting changed auto group gap {settings.auto_group_gap_minutes} min completed")
+            extra_messages.append(
+                f"App setting changed auto group gap "
+                f"{settings.auto_group_gap_minutes} min completed"
+            )
         if target_aging_changed:
-            extra_messages.append(f"App setting changed target aging {settings.target_aging_hours:g}h completed")
+            extra_messages.append(
+                f"App setting changed target aging "
+                f"{settings.target_aging_hours:g}h completed"
+            )
         if aging_tolerance_changed:
-            extra_messages.append(f"App setting changed aging tolerance {settings.target_aging_tolerance_hours:g}h completed")
+            extra_messages.append(
+                f"App setting changed aging tolerance "
+                f"{settings.target_aging_tolerance_hours:g}h completed"
+            )
 
         self._pending_settings_context = {
             "max_trays_changed": max_trays_changed,
@@ -2315,13 +3039,20 @@ class _MainWindow(QMainWindow):
         }
 
         self._pending_db_restart_notice = db_changed
-        runtime_settings_changed = max_trays_changed or total_trolley_changed or refresh_changed or window_days_changed
+        runtime_settings_changed = (
+            max_trays_changed
+            or total_trolley_changed
+            or refresh_changed
+            or window_days_changed
+        )
         if not runtime_settings_changed:
             message_parts = list(extra_messages)
             if not message_parts:
                 message_parts.append("No runtime setting value changed.")
             if self._pending_db_restart_notice:
-                message_parts.append("Restart app to apply DB host/user/password.")
+                message_parts.append(
+                    "Restart app to apply DB host/user/password."
+                )
                 self._pending_db_restart_notice = False
             self._status.setText(" ".join(message_parts))
             self._pending_settings_context = None
@@ -2336,7 +3067,13 @@ class _MainWindow(QMainWindow):
             )
         )
 
-    def _run_action(self, *, action_name: str, action: Callable[[], Any], lock_ui: bool = True) -> None:
+    def _run_action(
+        self,
+        *,
+        action_name: str,
+        action: Callable[[], Any],
+        lock_ui: bool = True,
+    ) -> None:
         if self._action_inflight:
             self._status.setText("Another action is running. Please wait.")
             return
@@ -2352,7 +3089,9 @@ class _MainWindow(QMainWindow):
                 result = action()
                 self._action_bridge.action_done.emit(action_name, result, None)
             except Exception as exc:  # noqa: BLE001
-                self._action_bridge.action_done.emit(action_name, None, str(exc))
+                self._action_bridge.action_done.emit(
+                    action_name, None, str(exc)
+                )
 
         threading.Thread(
             target=_worker,
@@ -2374,7 +3113,9 @@ class _MainWindow(QMainWindow):
                 result = action()
                 self._action_bridge.action_done.emit(action_name, result, None)
             except Exception as exc:  # noqa: BLE001
-                self._action_bridge.action_done.emit(action_name, None, str(exc))
+                self._action_bridge.action_done.emit(
+                    action_name, None, str(exc)
+                )
 
         threading.Thread(
             target=_worker,
@@ -2393,10 +3134,16 @@ class _MainWindow(QMainWindow):
 
         def _worker() -> None:
             try:
-                result = self._runtime.data_window_loading_status(data_window_days=int(days))
-                self._action_bridge.action_done.emit("Window status", result, None)
+                result = self._runtime.data_window_loading_status(
+                    data_window_days=int(days)
+                )
+                self._action_bridge.action_done.emit(
+                    "Window status", result, None
+                )
             except Exception as exc:  # noqa: BLE001
-                self._action_bridge.action_done.emit("Window status", None, str(exc))
+                self._action_bridge.action_done.emit(
+                    "Window status", None, str(exc)
+                )
 
         threading.Thread(
             target=_worker,
@@ -2416,7 +3163,9 @@ class _MainWindow(QMainWindow):
         if self._window_status_timer.isActive():
             self._window_status_timer.stop()
 
-    def _on_action_done(self, action_name: str, result: object, error: object) -> None:
+    def _on_action_done(
+        self, action_name: str, result: object, error: object
+    ) -> None:
         if action_name == "Window status":
             self._window_status_check_inflight = False
             if error:
@@ -2428,7 +3177,11 @@ class _MainWindow(QMainWindow):
                 return
             days_value_raw = payload.get("data_window_days")
             try:
-                days_value = int(str(days_value_raw).strip()) if days_value_raw is not None else 0
+                days_value = (
+                    int(str(days_value_raw).strip())
+                    if days_value_raw is not None
+                    else 0
+                )
             except Exception:  # noqa: BLE001
                 days_value = int(self._window_load_monitor_days or 0)
             self._stop_window_load_monitor()
@@ -2445,29 +3198,38 @@ class _MainWindow(QMainWindow):
             if self._action_locked_ui:
                 self._set_controls_enabled(True)
             self._action_locked_ui = False
+
         if action_name == "Search":
             query = self._pending_search_query
             self._pending_search_query = ""
             if error:
                 self._status.setText(f"Search failed: {error}")
-                log.error("UI action failed action=%s error=%s", action_name, error)
+                log.error(
+                    "UI action failed action=%s error=%s", action_name, error
+                )
                 return
             owner = dict(result) if isinstance(result, dict) else None
             if owner is None:
                 self._status.setText(f"No data for {query}.")
                 log.info("UI action completed action=%s", action_name)
                 return
-            self._status.setText(self._format_cell_search_result(query, owner))
+            self._status.setText(
+                self._format_cell_search_result(query, owner)
+            )
             log.info("UI action completed action=%s", action_name)
             return
+
         if error:
             message = f"{action_name} failed: {error}"
             self._status.setText(message)
-            log.error("UI action failed action=%s error=%s", action_name, error)
+            log.error(
+                "UI action failed action=%s error=%s", action_name, error
+            )
             if action_name == "Apply settings":
                 self._pending_db_restart_notice = False
                 self._pending_settings_context = None
             return
+
         if action_name == "Apply settings":
             payload = dict(result) if isinstance(result, dict) else {}
             context = self._pending_settings_context or {}
@@ -2475,27 +3237,43 @@ class _MainWindow(QMainWindow):
             message_parts: list[str] = []
             if context.get("max_trays_changed"):
                 message_parts.append(
-                    f"App setting changed max {int(context.get('max_trays_per_trolley') or 0)}tray/trolley completed"
+                    f"App setting changed max "
+                    f"{int(context.get('max_trays_per_trolley') or 0)}"
+                    f"tray/trolley completed"
                 )
             if context.get("total_trolley_changed"):
                 message_parts.append(
-                    f"App setting changed total {int(context.get('total_trolley_count') or 0)} trolley completed"
+                    f"App setting changed total "
+                    f"{int(context.get('total_trolley_count') or 0)}"
+                    f" trolley completed"
                 )
             if context.get("refresh_changed"):
-                refresh_seconds = float(context.get("refresh_interval_seconds") or 0.0)
-                message_parts.append(f"App setting changed refresh {refresh_seconds:g}s completed")
+                refresh_seconds = float(
+                    context.get("refresh_interval_seconds") or 0.0
+                )
+                message_parts.append(
+                    f"App setting changed refresh {refresh_seconds:g}s completed"
+                )
 
             waiting_for_window_data = False
             if context.get("window_days_changed"):
-                days_value = int(context.get("data_window_days") or settings.ui_data_window_days)
-                waiting_for_window_data = bool(payload.get("window_backfill_scheduled"))
+                days_value = int(
+                    context.get("data_window_days")
+                    or settings.ui_data_window_days
+                )
+                waiting_for_window_data = bool(
+                    payload.get("window_backfill_scheduled")
+                )
                 if waiting_for_window_data:
                     message_parts.append(
-                        f"App setting changed {days_value} days. Please waiting a few minute to loading....."
+                        f"App setting changed {days_value} days. "
+                        "Please waiting a few minute to loading....."
                     )
                     self._start_window_load_monitor(days=days_value)
                 else:
-                    message_parts.append(f"App setting changed {days_value} days completed")
+                    message_parts.append(
+                        f"App setting changed {days_value} days completed"
+                    )
                     self._stop_window_load_monitor()
 
             for extra in context.get("extra_messages", []):
@@ -2510,10 +3288,41 @@ class _MainWindow(QMainWindow):
 
             message = " ".join(message_parts)
             if self._pending_db_restart_notice:
-                message = f"{message} Restart app to apply DB host/user/password."
+                message = (
+                    f"{message} Restart app to apply DB host/user/password."
+                )
                 self._pending_db_restart_notice = False
             self._status.setText(message)
-            log.info("UI action completed action=%s result=%s", action_name, payload)
+            log.info(
+                "UI action completed action=%s result=%s",
+                action_name, payload,
+            )
+            return
+
+        if action_name == "Delete trolleys":
+            payload = dict(result) if isinstance(result, dict) else {}
+            requested = int(payload.get("requested") or 0)
+            deleted = int(payload.get("deleted") or 0)
+            failed = int(
+                payload.get("failed") or max(0, requested - deleted)
+            )
+            not_found = list(payload.get("not_found") or [])
+            if not_found:
+                self._status.setText(
+                    f"Delete trolleys completed: deleted {deleted}/{requested}, "
+                    f"failed {failed}. "
+                    f"Not found: "
+                    f"{', '.join(str(item) for item in not_found[:5])}"
+                )
+            else:
+                self._status.setText(
+                    f"Delete trolleys completed: deleted {deleted}/{requested}, "
+                    f"failed {failed}."
+                )
+            log.info(
+                "UI action completed action=%s result=%s",
+                action_name, payload,
+            )
             return
 
         if result is None:
@@ -2524,9 +3333,20 @@ class _MainWindow(QMainWindow):
             self._vm.assembly_ungrouped_model.clear_checked()
             used_trolley_id = ""
             if isinstance(result, dict):
-                used_trolley_id = str(result.get("trolley_id") or "").strip()
-            self._refresh_suggested_trolley_id(force=True, used_trolley_id=used_trolley_id)
+                used_trolley_id = str(
+                    result.get("trolley_id") or ""
+                ).strip()
+            self._refresh_suggested_trolley_id(
+                force=True, used_trolley_id=used_trolley_id
+            )
         self._status.setText(message)
+
+        if action_name == "Auto group":
+            QTimer.singleShot(100, self._vm.force_refresh_summary)
+            self._status.setText(message)
+            log.info("UI action completed action=%s", action_name)
+            return
+
         log.info("UI action completed action=%s", action_name)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
@@ -2565,7 +3385,9 @@ class _MainWindow(QMainWindow):
         if event.type() == QEvent.Type.MouseButtonPress:
             tray_table = self._assembly_card.tray_table
             if tray_table is not None and tray_table.isVisible():
-                global_position_fn = getattr(event, "globalPosition", None)
+                global_position_fn = getattr(
+                    event, "globalPosition", None
+                )
                 if callable(global_position_fn):
                     global_point = global_position_fn().toPoint()
                     target_widget = QApplication.widgetAt(global_point)
@@ -2582,13 +3404,17 @@ class _MainWindow(QMainWindow):
                     keep_selection = bool(
                         target_widget is not None
                         and any(
-                            target_widget is keep_widget or keep_widget.isAncestorOf(target_widget)
+                            target_widget is keep_widget
+                            or keep_widget.isAncestorOf(target_widget)
                             for keep_widget in keep_widgets
                         )
                     )
                     inside_table = bool(
                         target_widget is not None
-                        and (target_widget is tray_table or tray_table.isAncestorOf(target_widget))
+                        and (
+                            target_widget is tray_table
+                            or tray_table.isAncestorOf(target_widget)
+                        )
                     )
                     trolley_lists = (
                         self._assembly_card.trolley_list,
@@ -2598,7 +3424,8 @@ class _MainWindow(QMainWindow):
                     inside_trolley_list = bool(
                         target_widget is not None
                         and any(
-                            target_widget is list_view or list_view.isAncestorOf(target_widget)
+                            target_widget is list_view
+                            or list_view.isAncestorOf(target_widget)
                             for list_view in trolley_lists
                         )
                     )
@@ -2619,18 +3446,13 @@ class _MainWindow(QMainWindow):
     def _apply_styles(self) -> None:
         self.setStyleSheet(
             """
-            QMainWindow {
-                background: #f3f5fb;
-            }
+            QMainWindow { background: #f3f5fb; }
             QFrame#metricBox {
                 background: #ffffff;
                 border: 1px solid #d8dfec;
                 border-radius: 12px;
             }
-            QLabel#metricTitle {
-                color: #64748b;
-                font-size: 12px;
-            }
+            QLabel#metricTitle { color: #64748b; font-size: 12px; }
             QLabel#metricValue {
                 color: #0f172a;
                 font-size: 22px;
@@ -2650,9 +3472,7 @@ class _MainWindow(QMainWindow):
                 padding: 6px 12px;
                 font-weight: 600;
             }
-            QPushButton:hover {
-                background: #1e40af;
-            }
+            QPushButton:hover { background: #1e40af; }
             QLineEdit {
                 background: #ffffff;
                 border: 1px solid #c9d3e6;
@@ -2668,8 +3488,13 @@ class _MainWindow(QMainWindow):
         )
 
 
+# ── Utility functions ─────────────────────────────────────────────────────────
+
+
 def _upsert_env_values(path: Path, values: dict[str, str]) -> None:
-    normalized = {key.strip(): value for key, value in values.items() if key.strip()}
+    normalized = {
+        key.strip(): value for key, value in values.items() if key.strip()
+    }
     if not normalized:
         return
     existing_lines: list[str] = []
@@ -2705,7 +3530,12 @@ def _format_timedelta(delta: timedelta) -> str:
 
 def _signature(value: Any) -> Any:
     if isinstance(value, dict):
-        return tuple((str(key), _signature(val)) for key, val in sorted(value.items(), key=lambda item: str(item[0])))
+        return tuple(
+            (str(key), _signature(val))
+            for key, val in sorted(
+                value.items(), key=lambda item: str(item[0])
+            )
+        )
     if isinstance(value, list):
         return tuple(_signature(item) for item in value)
     if isinstance(value, tuple):
@@ -2731,7 +3561,30 @@ def _aging_status_text(delta: timedelta) -> str:
 def main() -> int:
     _configure_logging()
     _install_crash_hooks()
-    log.info("Application starting pid=%s python=%s", os.getpid(), sys.version.split()[0])
+    log.info(
+        "Application starting pid=%s python=%s",
+        os.getpid(),
+        sys.version.split()[0],
+    )
+
+    from wip_management.infrastructure.sqlserver.connection import (
+        list_sql_server_drivers,
+        _LEGACY_SQL_DRIVER_NAME,
+    )
+    drivers = list_sql_server_drivers()
+    modern_drivers = [d for d in drivers if d.strip().lower() != _LEGACY_SQL_DRIVER_NAME]
+    if not modern_drivers:
+        log.warning(
+            "=" * 70 + "\n"
+            "WARNING: Only legacy 'SQL Server' ODBC driver detected!\n"
+            "This driver has known thread-safety issues and may cause crashes.\n"
+            "The application will run in SERIALIZED mode (slower, but stable).\n"
+            "For better performance, ask IT to install:\n"
+            "  'ODBC Driver 17 for SQL Server' or 'ODBC Driver 18 for SQL Server'\n"
+            "Download: https://docs.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server\n"
+            + "=" * 70
+        )
+
     app = QApplication(sys.argv)
 
     vm = BoardViewModel()

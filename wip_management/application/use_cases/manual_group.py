@@ -3,13 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from wip_management.domain.models.tray import TrayId
-from wip_management.domain.models.trolley import Column
+from wip_management.domain.models.trolley import Column, TrolleyMode
 
 
 @dataclass(slots=True)
 class ManualGroupingAssignment:
     trolley_id: str
     column: Column
+    mode: TrolleyMode = TrolleyMode.MANUAL
 
 
 @dataclass(slots=True)
@@ -21,16 +22,31 @@ class ManualGroupUseCase:
     def __init__(self) -> None:
         self._state = ManualGroupingState(assignments={})
 
-    def group_to_trolley(self, tray_id: TrayId, trolley_id: str, column: Column) -> None:
+    def group_to_trolley(
+        self,
+        tray_id: TrayId,
+        trolley_id: str,
+        column: Column,
+        *,
+        mode: TrolleyMode = TrolleyMode.MANUAL,
+    ) -> None:
         normalized_trolley_id = trolley_id.strip()
         if not normalized_trolley_id:
             raise ValueError("trolley_id must not be empty")
         self._state.assignments[str(tray_id)] = ManualGroupingAssignment(
             trolley_id=normalized_trolley_id,
             column=column,
+            mode=mode,
         )
 
-    def group_many_to_trolley(self, tray_ids: list[TrayId], trolley_id: str, column: Column) -> int:
+    def group_many_to_trolley(
+        self,
+        tray_ids: list[TrayId],
+        trolley_id: str,
+        column: Column,
+        *,
+        mode: TrolleyMode = TrolleyMode.MANUAL,
+    ) -> int:
         normalized_trolley_id = trolley_id.strip()
         if not normalized_trolley_id:
             raise ValueError("trolley_id must not be empty")
@@ -42,6 +58,7 @@ class ManualGroupUseCase:
             self._state.assignments[tray_key] = ManualGroupingAssignment(
                 trolley_id=normalized_trolley_id,
                 column=column,
+                mode=mode,
             )
             applied += 1
         return applied
@@ -87,22 +104,23 @@ class ManualGroupUseCase:
             tray_id: {
                 "trolley_id": assignment.trolley_id,
                 "column": assignment.column.value,
+                "mode": assignment.mode.value,
             }
             for tray_id, assignment in self._state.assignments.items()
         }
 
-    def projection_assignments(self) -> dict[str, tuple[Column, str]]:
+    def projection_assignments(self) -> dict[str, tuple[Column, str, TrolleyMode]]:
         return {
-            tray_id: (assignment.column, assignment.trolley_id)
+            tray_id: (assignment.column, assignment.trolley_id, assignment.mode)
             for tray_id, assignment in self._state.assignments.items()
         }
 
-    def restore(self, assignments: dict[str, tuple[Column, str]]) -> None:
+    def restore(self, assignments: dict[str, tuple[Column, str, TrolleyMode]]) -> None:
         restored: dict[str, ManualGroupingAssignment] = {}
-        for tray_id, (column, trolley_id) in assignments.items():
+        for tray_id, (column, trolley_id, mode) in assignments.items():
             tray_key = tray_id.strip()
             trolley_key = trolley_id.strip()
             if not tray_key or not trolley_key:
                 continue
-            restored[tray_key] = ManualGroupingAssignment(trolley_id=trolley_key, column=column)
+            restored[tray_key] = ManualGroupingAssignment(trolley_id=trolley_key, column=column, mode=mode)
         self._state.assignments = restored

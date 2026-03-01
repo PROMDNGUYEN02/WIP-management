@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import lru_cache
 import logging
 import time
 from typing import Any
 
-from PySide6.QtCore import QAbstractListModel, QAbstractTableModel, QModelIndex, QObject, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import (
+    QAbstractListModel, QAbstractTableModel, QModelIndex,
+    QObject, Qt, QTimer, Signal, Slot
+)
 from PySide6.QtGui import QBrush, QColor
 
 from wip_management.config import settings
@@ -21,10 +25,6 @@ _AGE_STATE_WAITING = "waiting"
 _AGE_STATE_READY = "ready"
 _AGE_STATE_EXCEED = "exceed"
 
-_AGE_LABEL_WAITING = "Aging"
-_AGE_LABEL_READY = "Aged"
-_AGE_LABEL_EXCEED = "Aged Out"
-
 _SELECT_ICON_COLOR = QBrush(QColor("#8a949e"))
 
 
@@ -36,13 +36,13 @@ class TrolleyRowVM:
     state: str
     tray_quantity: int
     cell_quantity: int
-    tray_ids: list[str]
+    tray_ids: tuple[str, ...]
     aging_state: str
     aging_time: str
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "TrolleyRowVM":
-        tray_ids = [str(item) for item in payload.get("tray_ids", [])]
+        tray_ids = tuple(str(item) for item in payload.get("tray_ids", []))
         return cls(
             trolley_id=str(payload.get("trolley_id", "")),
             column=str(payload.get("column", "")),
@@ -69,6 +69,8 @@ class UngroupTrayRowVM:
 
 
 class TrolleyListModel(QAbstractListModel):
+    """Optimized trolley list model with diff-based updates."""
+
     TrolleyIdRole = Qt.ItemDataRole.UserRole + 1
     ColumnRole = Qt.ItemDataRole.UserRole + 2
     ModeRole = Qt.ItemDataRole.UserRole + 3
@@ -82,58 +84,49 @@ class TrolleyListModel(QAbstractListModel):
     def __init__(self) -> None:
         super().__init__()
         self._rows: list[TrolleyRowVM] = []
+        self._row_hash: int = 0
 
-    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
             return 0
         return len(self._rows)
 
-    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:  # noqa: N802
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
         if not index.isValid():
             return None
         row = index.row()
         if row < 0 or row >= len(self._rows):
             return None
         item = self._rows[row]
+
         if role == Qt.ItemDataRole.DisplayRole:
             if item.column == "Queue" and item.aging_state != _AGE_STATE_UNKNOWN:
-                return (
-                    f"{item.trolley_id} | {item.state} | age={item.aging_time} | "
-                    f"trays={item.tray_quantity} | cells={item.cell_quantity} | {item.mode.upper()}"
-                )
-            return f"{item.trolley_id} | {item.state} | trays={item.tray_quantity} | cells={item.cell_quantity} | {item.mode.upper()}"
-        if role == Qt.ItemDataRole.ToolTipRole and item.column == "Queue":
-            return f"Aging: {item.aging_time}"
-        if role == Qt.ItemDataRole.BackgroundRole:
-            if item.column == "Queue":
-                if item.aging_state == _AGE_STATE_WAITING:
-                    return QBrush(QColor("#ffedd5"))
-                if item.aging_state == _AGE_STATE_READY:
-                    return QBrush(QColor("#dcfce7"))
-                if item.aging_state == _AGE_STATE_EXCEED:
-                    return QBrush(QColor("#fee2e2"))
-            return None
-        if role == self.TrolleyIdRole:
-            return item.trolley_id
-        if role == self.ColumnRole:
-            return item.column
-        if role == self.ModeRole:
-            return item.mode
-        if role == self.TrayCountRole:
-            return item.tray_quantity
-        if role == self.TrayIdsRole:
-            return item.tray_ids
-        if role == self.StateRole:
-            return item.state
-        if role == self.CellCountRole:
-            return item.cell_quantity
-        if role == self.AgingStateRole:
-            return item.aging_state
-        if role == self.AgingTimeRole:
-            return item.aging_time
-        return None
+                return f"{item.trolley_id} | {item.state} | age={item.aging_time} | trays={item.tray_quantity} | {item.mode.upper()}"
+            return f"{item.trolley_id} | {item.state} | trays={item.tray_quantity} | {item.mode.upper()}"
 
-    def roleNames(self) -> dict[int, bytes]:  # noqa: N802
+        if role == Qt.ItemDataRole.BackgroundRole and item.column == "Queue":
+            colors = {
+                _AGE_STATE_WAITING: "#ffedd5",
+                _AGE_STATE_READY: "#dcfce7",
+                _AGE_STATE_EXCEED: "#fee2e2",
+            }
+            color = colors.get(item.aging_state)
+            return QBrush(QColor(color)) if color else None
+
+        role_map = {
+            self.TrolleyIdRole: item.trolley_id,
+            self.ColumnRole: item.column,
+            self.ModeRole: item.mode,
+            self.TrayCountRole: item.tray_quantity,
+            self.TrayIdsRole: list(item.tray_ids),
+            self.StateRole: item.state,
+            self.CellCountRole: item.cell_quantity,
+            self.AgingStateRole: item.aging_state,
+            self.AgingTimeRole: item.aging_time,
+        }
+        return role_map.get(role)
+
+    def roleNames(self) -> dict[int, bytes]:
         return {
             self.TrolleyIdRole: b"trolleyId",
             self.ColumnRole: b"column",
@@ -147,9 +140,14 @@ class TrolleyListModel(QAbstractListModel):
         }
 
     def replace_all(self, payload_rows: list[dict[str, Any]]) -> None:
+        """Replace with diff detection to minimize UI updates."""
         items = [TrolleyRowVM.from_payload(row) for row in payload_rows if row.get("trolley_id")]
-        if items == self._rows:
+
+        new_hash = hash(tuple(items))
+        if new_hash == self._row_hash:
             return
+
+        self._row_hash = new_hash
         self.beginResetModel()
         self._rows = items
         self.endResetModel()
@@ -161,18 +159,17 @@ class TrolleyListModel(QAbstractListModel):
         return out
 
     def totals(self) -> tuple[int, int, int]:
-        trolley_count = len(self._rows)
-        tray_count = sum(row.tray_quantity for row in self._rows)
-        cell_count = sum(row.cell_quantity for row in self._rows)
-        return trolley_count, tray_count, cell_count
+        return (
+            len(self._rows),
+            sum(row.tray_quantity for row in self._rows),
+            sum(row.cell_quantity for row in self._rows),
+        )
 
     def trolley_ids(self) -> list[str]:
         return [row.trolley_id for row in self._rows]
 
     def find_by_tray_id(self, tray_id: str) -> TrolleyRowVM | None:
         wanted = tray_id.strip()
-        if not wanted:
-            return None
         for row in self._rows:
             if wanted in row.tray_ids:
                 return row
@@ -180,6 +177,8 @@ class TrolleyListModel(QAbstractListModel):
 
 
 class UngroupTrayTableModel(QAbstractTableModel):
+    """Optimized ungroup table with incremental updates."""
+
     _headers = ["Select", "#", "Tray_ID", "Q'ty", "Assembly_Out", "Precharge_In", "Aging", "Status", "Location"]
 
     def __init__(self) -> None:
@@ -187,275 +186,235 @@ class UngroupTrayTableModel(QAbstractTableModel):
         self._rows: list[UngroupTrayRowVM] = []
         self._checked_tray_ids: set[str] = set()
         self._interaction_hold = False
-        self._pending_tray_payload_rows: list[dict[str, Any]] | None = None
+        self._pending_payload: list[dict[str, Any]] | None = None
+        self._data_hash: int = 0
+        self._update_scheduled = False
 
-    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
-        if parent.isValid():
-            return 0
-        return len(self._rows)
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._rows)
 
-    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
-        if parent.isValid():
-            return 0
-        return len(self._headers)
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._headers)
 
-    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:  # noqa: N802
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
         if not index.isValid():
             return None
+
         row = index.row()
         col = index.column()
+
         if row < 0 or row >= len(self._rows):
             return None
+
         item = self._rows[row]
+
         if col == 0:
-            if role == Qt.ItemDataRole.DisplayRole:
-                return ""
             if role == UNGROUP_CHECK_VISUAL_ROLE:
                 return "on" if item.tray_id in self._checked_tray_ids else "off"
-            if role == Qt.ItemDataRole.ForegroundRole:
-                return _SELECT_ICON_COLOR
             if role == Qt.ItemDataRole.TextAlignmentRole:
-                return Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+                return Qt.AlignmentFlag.AlignCenter
             return None
+
         if role == Qt.ItemDataRole.TextAlignmentRole:
-            return Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+            return Qt.AlignmentFlag.AlignCenter
+
         if role != Qt.ItemDataRole.DisplayRole:
             return None
-        if col == 1:
-            return item.no
-        if col == 2:
-            return item.tray_id
-        if col == 3:
-            return item.quantity
-        if col == 4:
-            return item.assembly_out
-        if col == 5:
-            return item.precharge_in
-        if col == 6:
-            return item.aging_time
-        if col == 7:
-            return item.status
-        if col == 8:
-            return item.location
-        return None
 
-    def flags(self, index: QModelIndex) -> Qt.ItemFlag:  # noqa: N802
+        col_map = {
+            1: item.no,
+            2: item.tray_id,
+            3: item.quantity,
+            4: item.assembly_out,
+            5: item.precharge_in,
+            6: item.aging_time,
+            7: item.status,
+            8: item.location,
+        }
+        return col_map.get(col)
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
         if not index.isValid():
             return Qt.ItemFlag.NoItemFlags
         return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
 
-    def setData(self, index: QModelIndex, value: Any, role: int = Qt.ItemDataRole.EditRole) -> bool:  # noqa: N802
-        if (
-            not index.isValid()
-            or index.column() != 0
-            or role not in {Qt.ItemDataRole.CheckStateRole, Qt.ItemDataRole.EditRole}
-        ):
+    def setData(self, index: QModelIndex, value: Any, role: int = Qt.ItemDataRole.EditRole) -> bool:
+        if not index.isValid() or index.column() != 0:
             return False
+
         row = index.row()
         if row < 0 or row >= len(self._rows):
             return False
+
         tray_id = self._rows[row].tray_id
         if not tray_id:
             return False
-        checked_value = Qt.CheckState.Checked.value
-        checked = value in {True, 1, Qt.CheckState.Checked, checked_value}
+
+        checked = value in {True, 1, Qt.CheckState.Checked, Qt.CheckState.Checked.value}
+
         if checked:
             self._checked_tray_ids.add(tray_id)
         else:
             self._checked_tray_ids.discard(tray_id)
-        self.dataChanged.emit(
-            index,
-            index,
-            [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.TextAlignmentRole, UNGROUP_CHECK_VISUAL_ROLE],
-        )
+
+        self.dataChanged.emit(index, index, [UNGROUP_CHECK_VISUAL_ROLE])
         self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, 0)
         return True
 
-    def headerData(  # noqa: N802
-        self,
-        section: int,
-        orientation: Qt.Orientation,
-        role: int = Qt.ItemDataRole.DisplayRole,
-    ) -> Any:
-        if orientation == Qt.Orientation.Horizontal:
-            if section < 0 or section >= len(self._headers):
-                return None
-            if section == 0:
-                if role == Qt.ItemDataRole.DisplayRole:
-                    return ""
-                if role == UNGROUP_CHECK_VISUAL_ROLE:
-                    if not self._rows:
-                        return "off"
-                    total = len(self._rows)
-                    selected = len(self._checked_tray_ids)
-                    if selected == 0:
-                        return "off"
-                    if selected >= total:
-                        return "on"
-                    return "partial"
-                if role == Qt.ItemDataRole.ForegroundRole:
-                    return _SELECT_ICON_COLOR
-                if role == Qt.ItemDataRole.TextAlignmentRole:
-                    return Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
-                return None
-            if role == Qt.ItemDataRole.DisplayRole:
-                return self._headers[section]
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if orientation != Qt.Orientation.Horizontal:
+            return section + 1 if role == Qt.ItemDataRole.DisplayRole else None
+
+        if section < 0 or section >= len(self._headers):
+            return None
+
+        if section == 0:
+            if role == UNGROUP_CHECK_VISUAL_ROLE:
+                if not self._rows:
+                    return "off"
+                selected = len(self._checked_tray_ids)
+                if selected == 0:
+                    return "off"
+                return "on" if selected >= len(self._rows) else "partial"
             if role == Qt.ItemDataRole.TextAlignmentRole:
-                return Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+                return Qt.AlignmentFlag.AlignCenter
+            if role == Qt.ItemDataRole.DisplayRole:
+                return ""
             return None
-        if role != Qt.ItemDataRole.DisplayRole:
-            return None
-        return section + 1
 
-    def replace_from_tray_payloads(self, tray_payload_rows: list[dict[str, Any]], *, force: bool = False) -> None:
-        if self._interaction_hold and (not force):
-            self._pending_tray_payload_rows = list(tray_payload_rows)
+        if role == Qt.ItemDataRole.DisplayRole:
+            return self._headers[section]
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            return Qt.AlignmentFlag.AlignCenter
+        return None
+
+    def replace_from_tray_payloads(self, tray_payload_rows: list[dict[str, Any]], *, force: bool = False, immediate: bool = False) -> None:
+        """Replace data with debounced updates."""
+        if self._interaction_hold and not force:
+            self._pending_payload = list(tray_payload_rows)
             return
+
         if force:
-            self._pending_tray_payload_rows = None
-        self._apply_tray_payload_rows(tray_payload_rows)
+            self._pending_payload = None
 
-    def set_interaction_hold(self, hold: bool) -> None:
-        hold = bool(hold)
-        if self._interaction_hold == hold:
-            return
-        self._interaction_hold = hold
-        if hold:
-            return
-        if self._pending_tray_payload_rows is None:
-            return
-        pending = self._pending_tray_payload_rows
-        self._pending_tray_payload_rows = None
-        self._apply_tray_payload_rows(pending)
+        if immediate:
+            self._apply_payload(tray_payload_rows)
+        else:
+            self._schedule_apply(tray_payload_rows)
 
-    def _apply_tray_payload_rows(self, tray_payload_rows: list[dict[str, Any]]) -> None:
+    def _schedule_apply(self, rows: list[dict[str, Any]]) -> None:
+        """Debounce rapid updates."""
+        if self._update_scheduled:
+            self._pending_payload = rows
+            return
+
+        self._update_scheduled = True
+        QTimer.singleShot(50, lambda: self._apply_payload(rows))
+
+    def _apply_payload(self, tray_payload_rows: list[dict[str, Any]]) -> None:
+        """Apply payload with hash-based change detection."""
+        self._update_scheduled = False
+
+        if self._pending_payload is not None:
+            tray_payload_rows = self._pending_payload
+            self._pending_payload = None
+
         started_at = time.perf_counter()
-        now = _coarse_now(step_seconds=30)
-        items: list[tuple[tuple[datetime, datetime, str], UngroupTrayRowVM]] = []
+        now = _coarse_now(60)
+
+        items: list[tuple[tuple, UngroupTrayRowVM]] = []
+
         for row in tray_payload_rows:
             tray_id = str(row.get("tray_id", "")).strip()
             if not tray_id:
                 continue
-            ccu_payload = row.get("ccu_payload") or {}
-            fpc_payload = row.get("fpc_payload") or {}
-            has_ccu = bool(ccu_payload)
-            has_fpc = bool(fpc_payload)
-            if not has_ccu:
-                # Ungroup view is CCU-first: hide FPC-only rows to avoid misleading "Precharge" interpretation.
+
+            ccu = row.get("ccu_payload") or {}
+            fpc = row.get("fpc_payload") or {}
+
+            if not ccu:
                 continue
 
-            quantity = _to_int(
-                ccu_payload.get("quantity"),
-                default=_to_int(fpc_payload.get("cell_count"), default=0),
-            )
-            ccu_end_dt = parse_datetime(ccu_payload.get("end_time"))
-            end_dt = ccu_end_dt
-            raw_precharge_start_dt = parse_datetime(fpc_payload.get("precharge_start_time"))
-            precharge_start_dt = raw_precharge_start_dt if (has_ccu and has_fpc) else None
+            qty = _to_int(ccu.get("quantity"), default=_to_int(fpc.get("cell_count"), default=0))
+            end_dt = _parse_cached(ccu.get("end_time"))
+            precharge_start = _parse_cached(fpc.get("precharge_start_time")) if ccu and fpc else None
 
-            if has_fpc:
+            if fpc:
                 location = "Precharge"
                 status = "Precharged"
-                if ccu_end_dt is None or precharge_start_dt is None:
-                    aging_text = "-"
-                else:
-                    aging_text = _format_timedelta(precharge_start_dt - ccu_end_dt)
+                aging = _format_td(precharge_start - end_dt) if end_dt and precharge_start else "-"
             else:
                 location = "Assembly"
-                if end_dt is None:
-                    aging_text = "-"
-                    status = "-"
+                if end_dt:
+                    delta = now - end_dt
+                    aging = _format_td(delta)
+                    status = _aging_label(delta)
                 else:
-                    aging = now - end_dt
-                    aging_text = _format_timedelta(aging)
-                    _, status = _aging_state_and_label(aging)
-            vm = UngroupTrayRowVM(
+                    aging = "-"
+                    status = "-"
+
+            sort_key = (end_dt or datetime.min, precharge_start or datetime.min, tray_id)
+
+            items.append((sort_key, UngroupTrayRowVM(
                 no=0,
                 tray_id=tray_id,
-                quantity=quantity,
+                quantity=qty,
                 assembly_out=end_dt.isoformat(sep=" ", timespec="seconds") if end_dt else "-",
-                precharge_in=precharge_start_dt.isoformat(sep=" ", timespec="seconds") if precharge_start_dt else "-",
-                aging_time=aging_text,
+                precharge_in=precharge_start.isoformat(sep=" ", timespec="seconds") if precharge_start else "-",
+                aging_time=aging,
                 status=status,
                 location=location,
-            )
-            production_order_key = (
-                end_dt or datetime.min,
-                precharge_start_dt or datetime.min,
-                tray_id,
-            )
-            items.append((production_order_key, vm))
+            )))
 
-        items.sort(key=lambda item: item[0], reverse=True)
+        items.sort(key=lambda x: x[0], reverse=True)
 
-        ordered: list[UngroupTrayRowVM] = []
-        for idx, (_, vm) in enumerate(items, start=1):
-            ordered.append(
-                UngroupTrayRowVM(
-                    no=idx,
-                    tray_id=vm.tray_id,
-                    quantity=vm.quantity,
-                    assembly_out=vm.assembly_out,
-                    precharge_in=vm.precharge_in,
-                    aging_time=vm.aging_time,
-                    status=vm.status,
-                    location=vm.location,
-                )
+        ordered = [
+            UngroupTrayRowVM(
+                no=idx + 1,
+                tray_id=vm.tray_id,
+                quantity=vm.quantity,
+                assembly_out=vm.assembly_out,
+                precharge_in=vm.precharge_in,
+                aging_time=vm.aging_time,
+                status=vm.status,
+                location=vm.location,
             )
-        retained = {row.tray_id for row in ordered}
-        if self._rows == ordered:
-            new_checked = self._checked_tray_ids.intersection(retained)
-            if new_checked != self._checked_tray_ids:
-                self._checked_tray_ids = set(new_checked)
-                if self._rows:
-                    top_left = self.index(0, 0)
-                    bottom_right = self.index(len(self._rows) - 1, 0)
-                    self.dataChanged.emit(
-                        top_left,
-                        bottom_right,
-                        [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.TextAlignmentRole],
-                    )
-                self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, 0)
+            for idx, (_, vm) in enumerate(items)
+        ]
+
+        new_hash = hash(tuple((r.tray_id, r.assembly_out, r.status) for r in ordered))
+        if new_hash == self._data_hash and len(ordered) == len(self._rows):
             return
+
+        self._data_hash = new_hash
+
+        retained = {r.tray_id for r in ordered}
+        self._checked_tray_ids &= retained
 
         self.beginResetModel()
         self._rows = ordered
-        self._checked_tray_ids.intersection_update(retained)
         self.endResetModel()
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-        if elapsed_ms >= 35:
-            log.warning(
-                "Ungroup table rebuild slow elapsed_ms=%s input_rows=%s output_rows=%s",
-                elapsed_ms,
-                len(tray_payload_rows),
-                len(ordered),
-            )
+
+        elapsed = int((time.perf_counter() - started_at) * 1000)
+        if elapsed > 30:
+            log.warning("Ungroup rebuild slow elapsed_ms=%s rows=%s", elapsed, len(ordered))
+
+    def set_interaction_hold(self, hold: bool) -> None:
+        if self._interaction_hold == hold:
+            return
+        self._interaction_hold = hold
+
+        if not hold and self._pending_payload is not None:
+            pending = self._pending_payload
+            self._pending_payload = None
+            self._apply_payload(pending)
 
     def checked_tray_ids(self) -> list[str]:
-        ordered: list[str] = []
-        for row in self._rows:
-            if row.tray_id in self._checked_tray_ids:
-                ordered.append(row.tray_id)
-        return ordered
+        return [r.tray_id for r in self._rows if r.tray_id in self._checked_tray_ids]
 
     def has_tray(self, tray_id: str) -> bool:
         wanted = tray_id.strip()
-        if not wanted:
-            return False
-        return any(row.tray_id == wanted for row in self._rows)
-
-    def set_row_checked(self, row: int, checked: bool) -> None:
-        if row < 0 or row >= len(self._rows):
-            return
-        tray_id = self._rows[row].tray_id
-        if not tray_id:
-            return
-        index = self.index(row, 0)
-        self.setData(
-            index,
-            Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked,
-            Qt.ItemDataRole.CheckStateRole,
-        )
+        return any(r.tray_id == wanted for r in self._rows)
 
     def toggle_row(self, row: int) -> None:
         if row < 0 or row >= len(self._rows):
@@ -463,37 +422,49 @@ class UngroupTrayTableModel(QAbstractTableModel):
         tray_id = self._rows[row].tray_id
         if not tray_id:
             return
-        next_checked = tray_id not in self._checked_tray_ids
-        self.set_row_checked(row, next_checked)
+
+        if tray_id in self._checked_tray_ids:
+            self._checked_tray_ids.discard(tray_id)
+        else:
+            self._checked_tray_ids.add(tray_id)
+
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index, [UNGROUP_CHECK_VISUAL_ROLE])
+        self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, 0)
 
     def set_all_checked(self, checked: bool) -> None:
         if checked:
-            self._checked_tray_ids = {row.tray_id for row in self._rows if row.tray_id}
+            self._checked_tray_ids = {r.tray_id for r in self._rows if r.tray_id}
         else:
             self._checked_tray_ids.clear()
+
         if self._rows:
-            top_left = self.index(0, 0)
-            bottom_right = self.index(len(self._rows) - 1, 0)
             self.dataChanged.emit(
-                top_left,
-                bottom_right,
-                [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.TextAlignmentRole, UNGROUP_CHECK_VISUAL_ROLE],
+                self.index(0, 0),
+                self.index(len(self._rows) - 1, 0),
+                [UNGROUP_CHECK_VISUAL_ROLE]
             )
         self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, 0)
 
     def clear_checked(self) -> None:
         self.set_all_checked(False)
 
-    def is_all_checked(self) -> bool:
-        if not self._rows:
-            return False
-        return len(self._checked_tray_ids) >= len(self._rows)
-
     def toggle_all_checked(self) -> None:
-        self.set_all_checked(not self.is_all_checked())
+        self.set_all_checked(len(self._checked_tray_ids) < len(self._rows))
+
+    def get_all_tray_ids(self) -> set[str]:
+        """Return all tray IDs in ungrouped list."""
+        return {r.tray_id for r in self._rows if r.tray_id}
 
 
 class BoardViewModel(QObject):
+    """
+    Board view model with CONSISTENT summary computation.
+    
+    KEY FIX: Summary counts are now derived from the SAME data source
+    as the displayed lists, ensuring consistency.
+    """
+
     updated = Signal(object)
 
     def __init__(self) -> None:
@@ -502,96 +473,241 @@ class BoardViewModel(QObject):
         self.queue_trolley_model = TrolleyListModel()
         self.precharge_trolley_model = TrolleyListModel()
         self.assembly_ungrouped_model = UngroupTrayTableModel()
+
         self._tray_cache: dict[str, dict[str, Any]] = {}
         self._last_event_seq = 0
-        self._rebuild_ungroup_pending = False
-        self._last_summary_payload: dict[str, int] | None = None
-        self._queued_event_payload: dict[str, Any] | None = None
-        self._event_apply_scheduled = False
+        self._last_summary: dict[str, int] | None = None
+        self._queued_event: dict[str, Any] | None = None
+        self._apply_scheduled = False
+        
+        # Track the actual counts from last projection for consistency
+        self._last_projection_ungrouped_count: int = 0
+        self._last_projection_grouped_tray_ids: set[str] = set()
 
     @Slot(object)
     def on_event(self, payload: dict[str, Any]) -> None:
+        """Queue event for coalesced processing."""
         seq = _to_int(payload.get("seq"), default=0)
-        if seq > 0 and seq <= self._last_event_seq:
-            log.debug(
-                "BoardViewModel ignored stale queued event seq=%s last_seq=%s type=%s",
-                seq,
-                self._last_event_seq,
-                payload.get("type"),
-            )
-            return
-        current_queued = self._queued_event_payload
-        current_seq = _to_int(current_queued.get("seq"), default=0) if isinstance(current_queued, dict) else 0
-        if current_queued is None or seq == 0 or seq >= current_seq:
-            self._queued_event_payload = payload
-        if self._event_apply_scheduled:
-            return
-        self._event_apply_scheduled = True
-        QTimer.singleShot(16, self._apply_queued_event)
 
-    def _apply_queued_event(self) -> None:
-        self._event_apply_scheduled = False
-        payload = self._queued_event_payload
-        self._queued_event_payload = None
+        if seq > 0 and seq <= self._last_event_seq:
+            return
+
+        current_seq = _to_int(self._queued_event.get("seq"), default=0) if self._queued_event else 0
+        if seq >= current_seq or seq == 0:
+            self._queued_event = payload
+
+        if not self._apply_scheduled:
+            self._apply_scheduled = True
+            QTimer.singleShot(32, self._process_event)
+
+    def _process_event(self) -> None:
+        """Process queued event."""
+        self._apply_scheduled = False
+
+        payload = self._queued_event
+        self._queued_event = None
+
         if payload is None:
             return
+
         started_at = time.perf_counter()
         seq = _to_int(payload.get("seq"), default=0)
+
+        if seq > 0 and seq <= self._last_event_seq:
+            return
+
         if seq > 0:
-            if seq <= self._last_event_seq:
-                log.debug(
-                    "BoardViewModel ignored stale event seq=%s last_seq=%s type=%s",
-                    seq,
-                    self._last_event_seq,
-                    payload.get("type"),
-                )
-                if self._queued_event_payload is not None and not self._event_apply_scheduled:
-                    self._event_apply_scheduled = True
-                    QTimer.singleShot(16, self._apply_queued_event)
-                return
             self._last_event_seq = seq
+
         event_type = str(payload.get("type", ""))
-        log.debug("BoardViewModel event received type=%s seq=%s", event_type, seq)
+
         if event_type == "snapshot":
             self._apply_snapshot(payload)
         elif event_type == "projection":
             self._apply_projection(payload)
         elif event_type == "trays_delta":
-            self._apply_trays_delta(payload.get("rows", []))
-        else:
-            log.debug("BoardViewModel ignored unknown event type=%s", event_type)
-        summary_payload = self.summary()
-        if summary_payload != self._last_summary_payload:
-            self._last_summary_payload = dict(summary_payload)
-            self.updated.emit(summary_payload)
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-        if elapsed_ms >= 45:
-            log.warning(
-                "BoardViewModel event slow type=%s seq=%s elapsed_ms=%s",
-                event_type,
-                seq,
-                elapsed_ms,
+            self._apply_delta(payload.get("rows", []))
+
+        # Emit summary - computed from current model state
+        summary = self.summary()
+        if summary != self._last_summary:
+            self._last_summary = dict(summary)
+            self.updated.emit(summary)
+
+        elapsed = int((time.perf_counter() - started_at) * 1000)
+        if elapsed > 50:
+            log.warning("BoardViewModel slow type=%s elapsed_ms=%s", event_type, elapsed)
+
+    def _apply_snapshot(self, payload: dict[str, Any]) -> None:
+        """Apply full snapshot."""
+        tray_rows = payload.get("trays", [])
+        self._tray_cache = {
+            str(row["tray_id"]): row
+            for row in tray_rows
+            if row.get("tray_id")
+        }
+        self._apply_projection(payload)
+        log.info("BoardViewModel snapshot applied trays=%s", len(self._tray_cache))
+
+    def _apply_projection(self, payload: dict[str, Any]) -> None:
+        """
+        Apply projection update.
+        
+        KEY FIX: Track grouped tray IDs and ungrouped count from the projection
+        itself, not from model state which may be stale.
+        """
+        assembly = payload.get("assembly_trolleys", [])
+        queue = self._annotate_queue_aging(payload.get("queue_trolleys", []))
+        precharge = payload.get("precharge_trolleys", [])
+
+        # Update trolley models
+        self.assembly_trolley_model.replace_all(assembly)
+        self.queue_trolley_model.replace_all(queue)
+        self.precharge_trolley_model.replace_all(precharge)
+
+        # Compute grouped tray IDs from projection data directly
+        grouped_tray_ids: set[str] = set()
+        for trolley_list in [assembly, queue, precharge]:
+            for trolley in trolley_list:
+                tray_ids = trolley.get("tray_ids", [])
+                for tray_id in tray_ids:
+                    tid = str(tray_id).strip()
+                    if tid:
+                        grouped_tray_ids.add(tid)
+        
+        self._last_projection_grouped_tray_ids = grouped_tray_ids
+
+        # Handle ungrouped list
+        if "assembly_ungrouped" in payload:
+            ungrouped = [r for r in payload.get("assembly_ungrouped", []) if isinstance(r, dict)]
+            
+            # Update tray cache with ungrouped data
+            for row in ungrouped:
+                tray_id = str(row.get("tray_id", "")).strip()
+                if tray_id:
+                    self._tray_cache[tray_id] = row
+            
+            # Track ungrouped count from projection
+            self._last_projection_ungrouped_count = len(ungrouped)
+            
+            # Update ungrouped model
+            self.assembly_ungrouped_model.replace_from_tray_payloads(
+                ungrouped, force=True, immediate=True
             )
-        if self._queued_event_payload is not None and not self._event_apply_scheduled:
-            self._event_apply_scheduled = True
-            QTimer.singleShot(16, self._apply_queued_event)
+            
+            log.debug(
+                "Projection applied: grouped=%d ungrouped=%d",
+                len(grouped_tray_ids),
+                len(ungrouped)
+            )
+
+    def _apply_delta(self, rows: list[dict[str, Any]]) -> None:
+        """Apply incremental tray updates."""
+        if not rows:
+            return
+
+        grouped_ids = self._grouped_tray_ids()
+        rebuild_needed = False
+
+        for row in rows:
+            tray_id = str(row.get("tray_id", "")).strip()
+            if not tray_id:
+                continue
+
+            prev = self._tray_cache.get(tray_id)
+            if prev == row:
+                continue
+
+            self._tray_cache[tray_id] = row
+
+            if tray_id not in grouped_ids:
+                rebuild_needed = True
+
+        if rebuild_needed:
+            self._rebuild_ungrouped()
+
+    def _rebuild_ungrouped(self) -> None:
+        """Rebuild ungrouped list from cache."""
+        grouped = self._grouped_tray_ids()
+        rows = [
+            row for tray_id, row in self._tray_cache.items()
+            if tray_id not in grouped and row.get("ccu_payload")
+        ]
+        self._last_projection_ungrouped_count = len(rows)
+        self.assembly_ungrouped_model.replace_from_tray_payloads(rows)
+
+    def _annotate_queue_aging(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Add aging info to queue trolleys."""
+        now = _coarse_now(30)
+        out: list[dict[str, Any]] = []
+
+        for row in rows:
+            row_copy = dict(row)
+            latest_end: datetime | None = None
+
+            for tray_id in row.get("tray_ids", []):
+                tray = self._tray_cache.get(str(tray_id))
+                if not tray:
+                    continue
+
+                ccu = tray.get("ccu_payload") or {}
+                fpc = tray.get("fpc_payload") or {}
+
+                end_dt = _parse_cached(ccu.get("end_time")) or _parse_cached(fpc.get("precharge_end_time"))
+                if end_dt and (latest_end is None or end_dt > latest_end):
+                    latest_end = end_dt
+
+            if latest_end is None:
+                row_copy["aging_state"] = _AGE_STATE_UNKNOWN
+                row_copy["aging_time"] = "-"
+            else:
+                delta = now - latest_end
+                row_copy["aging_state"] = _aging_state(delta)
+                row_copy["aging_time"] = _format_td(delta)
+
+            out.append(row_copy)
+
+        return out
+
+    def _grouped_tray_ids(self) -> set[str]:
+        """Get all tray IDs in trolleys."""
+        return (
+            self.assembly_trolley_model.all_tray_ids() |
+            self.queue_trolley_model.all_tray_ids() |
+            self.precharge_trolley_model.all_tray_ids()
+        )
 
     def summary(self) -> dict[str, int]:
-        grouped_ids = self._grouped_tray_ids()
-        assembly_ungroup_count = self.assembly_ungrouped_model.rowCount()
-        # "Total Tray" should reflect what UI is currently rendering (grouped + ungrouped),
-        # not raw tray cache size which can include hidden FPC-only/stale rows.
-        total_visible_trays = len(grouped_ids) + assembly_ungroup_count
-        asm_trolley, asm_tray, asm_cell = self.assembly_trolley_model.totals()
-        que_trolley, que_tray, que_cell = self.queue_trolley_model.totals()
-        pre_trolley, pre_tray, pre_cell = self.precharge_trolley_model.totals()
+        """
+        Get current summary metrics.
+        
+        KEY FIX: Use consistent sources for counts:
+        - grouped_count comes from trolley models (authoritative for grouped)
+        - ungrouped_count comes from ungrouped model row count (authoritative for ungrouped)
+        - total = grouped + ungrouped (derived, not independently computed)
+        """
+        # Get grouped tray IDs from trolley models
+        grouped_tray_ids = self._grouped_tray_ids()
+        grouped_count = len(grouped_tray_ids)
+        
+        # Get ungrouped count directly from the ungrouped model
+        # This ensures the count matches what's displayed
+        ungrouped_count = self.assembly_ungrouped_model.rowCount()
+        
+        # Total is derived from the two authoritative counts
+        total_count = grouped_count + ungrouped_count
+
+        asm_t, asm_tray, asm_cell = self.assembly_trolley_model.totals()
+        que_t, que_tray, que_cell = self.queue_trolley_model.totals()
+        pre_t, pre_tray, pre_cell = self.precharge_trolley_model.totals()
+
         return {
-            "tray_count": total_visible_trays,
-            "group_count": len(grouped_ids),
-            "assembly_trolley_count": asm_trolley,
-            "queue_trolley_count": que_trolley,
-            "precharge_trolley_count": pre_trolley,
-            "assembly_ungroup_count": assembly_ungroup_count,
+            "tray_count": total_count,
+            "group_count": grouped_count,
+            "assembly_trolley_count": asm_t,
+            "queue_trolley_count": que_t,
+            "precharge_trolley_count": pre_t,
+            "assembly_ungroup_count": ungrouped_count,
             "assembly_tray_count": asm_tray,
             "queue_tray_count": que_tray,
             "precharge_tray_count": pre_tray,
@@ -600,128 +716,20 @@ class BoardViewModel(QObject):
             "precharge_cell_count": pre_cell,
         }
 
-    def _apply_snapshot(self, payload: dict[str, Any]) -> None:
-        tray_rows = payload.get("trays", [])
-        self._tray_cache = {str(row["tray_id"]): row for row in tray_rows if row.get("tray_id")}
-        self._apply_projection(payload)
-        log.info("BoardViewModel snapshot applied trays=%s", len(self._tray_cache))
-
-    def _apply_projection(self, payload: dict[str, Any]) -> None:
-        assembly_rows = payload.get("assembly_trolleys", [])
-        queue_rows = self._annotate_queue_trolley_rows(payload.get("queue_trolleys", []))
-        precharge_rows = payload.get("precharge_trolleys", [])
-        self.assembly_trolley_model.replace_all(assembly_rows)
-        self.queue_trolley_model.replace_all(queue_rows)
-        self.precharge_trolley_model.replace_all(precharge_rows)
-        log.debug(
-            "BoardViewModel projection applied assembly=%s queue=%s precharge=%s",
-            self.assembly_trolley_model.rowCount(),
-            self.queue_trolley_model.rowCount(),
-            self.precharge_trolley_model.rowCount(),
-        )
-        if "assembly_ungrouped" in payload:
-            raw_ungrouped = payload.get("assembly_ungrouped", [])
-            if not isinstance(raw_ungrouped, list):
-                raw_ungrouped = []
-            ungrouped_rows = [row for row in raw_ungrouped if isinstance(row, dict)]
-            for row in ungrouped_rows:
-                tray_id = str(row.get("tray_id", "")).strip()
-                if tray_id:
-                    self._tray_cache[tray_id] = row
-            self._rebuild_ungroup_pending = False
-            # Projection payload is authoritative; apply immediately so summary and list stay consistent.
-            self.assembly_ungrouped_model.replace_from_tray_payloads(ungrouped_rows, force=True)
-            return
-        self._schedule_rebuild_assembly_ungrouped()
-
     def tray_payload_by_id(self, tray_id: str) -> dict[str, Any] | None:
         return self._tray_cache.get(tray_id)
 
     def tray_payloads(self, tray_ids: list[str]) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for tray_id in tray_ids:
-            row = self._tray_cache.get(tray_id)
-            if row is not None:
-                out.append(row)
-        return out
+        return [self._tray_cache[tid] for tid in tray_ids if tid in self._tray_cache]
+    
+    def force_refresh_summary(self) -> None:
+        """Force emit current summary to UI."""
+        summary = self.summary()
+        self._last_summary = dict(summary)
+        self.updated.emit(summary)
 
-    def _apply_trays_delta(self, payload_rows: list[dict[str, Any]]) -> None:
-        if not payload_rows:
-            return
-        changed = False
-        for row in payload_rows:
-            tray_id = str(row.get("tray_id", "")).strip()
-            if not tray_id:
-                continue
-            previous = self._tray_cache.get(tray_id)
-            if previous == row:
-                continue
-            self._tray_cache[tray_id] = row
-            changed = True
-        if not changed:
-            return
-        self._schedule_rebuild_assembly_ungrouped()
-        log.debug(
-            "BoardViewModel trays delta applied rows=%s cache=%s",
-            len(payload_rows),
-            len(self._tray_cache),
-        )
 
-    def _schedule_rebuild_assembly_ungrouped(self) -> None:
-        if self._rebuild_ungroup_pending:
-            return
-        self._rebuild_ungroup_pending = True
-        QTimer.singleShot(180, self._flush_rebuild_assembly_ungrouped)
-
-    def _flush_rebuild_assembly_ungrouped(self) -> None:
-        if not self._rebuild_ungroup_pending:
-            return
-        self._rebuild_ungroup_pending = False
-        self._rebuild_assembly_ungrouped_from_cache()
-
-    def _rebuild_assembly_ungrouped_from_cache(self) -> None:
-        grouped_ids = self._grouped_tray_ids()
-        rows = [row for tray_id, row in self._tray_cache.items() if tray_id not in grouped_ids]
-        self.assembly_ungrouped_model.replace_from_tray_payloads(rows)
-
-    def _annotate_queue_trolley_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        now = _coarse_now(step_seconds=30)
-        out: list[dict[str, Any]] = []
-        for row in rows:
-            row_copy = dict(row)
-            latest_end: datetime | None = None
-            tray_ids = [str(item) for item in row.get("tray_ids", [])]
-            for tray_id in tray_ids:
-                tray_row = self._tray_cache.get(tray_id)
-                if tray_row is None:
-                    continue
-                ccu_payload = tray_row.get("ccu_payload") or {}
-                fpc_payload = tray_row.get("fpc_payload") or {}
-                end_dt = parse_datetime(ccu_payload.get("end_time")) or parse_datetime(
-                    fpc_payload.get("precharge_end_time"),
-                )
-                if end_dt is None:
-                    continue
-                if latest_end is None or end_dt > latest_end:
-                    latest_end = end_dt
-            if latest_end is None:
-                row_copy["aging_state"] = _AGE_STATE_UNKNOWN
-                row_copy["aging_time"] = "-"
-            else:
-                aging = now - latest_end
-                state, _ = _aging_state_and_label(aging)
-                row_copy["aging_state"] = state
-                row_copy["aging_time"] = _format_timedelta(aging)
-            out.append(row_copy)
-        return out
-
-    def _grouped_tray_ids(self) -> set[str]:
-        return {
-            *self.assembly_trolley_model.all_tray_ids(),
-            *self.queue_trolley_model.all_tray_ids(),
-            *self.precharge_trolley_model.all_tray_ids(),
-        }
-
+# ===== Utility Functions =====
 
 def _to_int(value: Any, *, default: int) -> int:
     if value is None:
@@ -730,32 +738,52 @@ def _to_int(value: Any, *, default: int) -> int:
         return value
     try:
         return int(str(value).strip())
-    except Exception:  # noqa: BLE001
+    except Exception:
         return default
 
 
-def _format_timedelta(delta: timedelta) -> str:
-    total_seconds = max(0, int(delta.total_seconds()))
-    hours, rem = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(rem, 60)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+def _format_td(delta: timedelta) -> str:
+    """Format timedelta as HH:MM:SS."""
+    total = max(0, int(delta.total_seconds()))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def _coarse_now(*, step_seconds: int) -> datetime:
-    step = max(1, int(step_seconds))
+def _coarse_now(step_seconds: int) -> datetime:
+    """Get coarse-grained current time for cache efficiency."""
     now = datetime.now()
-    floored_second = (now.second // step) * step
-    return now.replace(second=floored_second, microsecond=0)
+    floored = (now.second // step_seconds) * step_seconds
+    return now.replace(second=floored, microsecond=0)
 
 
-def _aging_state_and_label(delta: timedelta) -> tuple[str, str]:
-    age_hours = max(delta.total_seconds(), 0.0) / 3600.0
-    target = max(float(settings.target_aging_hours), 0.0)
-    tolerance = max(float(settings.target_aging_tolerance_hours), 0.0)
-    min_target = max(target - tolerance, 0.0)
-    max_target = target + tolerance
-    if age_hours < min_target:
-        return _AGE_STATE_WAITING, _AGE_LABEL_WAITING
-    if age_hours <= max_target:
-        return _AGE_STATE_READY, _AGE_LABEL_READY
-    return _AGE_STATE_EXCEED, _AGE_LABEL_EXCEED
+@lru_cache(maxsize=10000)
+def _parse_cached(text: str | None) -> datetime | None:
+    """Cached datetime parsing."""
+    if not text:
+        return None
+    return parse_datetime(text)
+
+
+def _aging_state(delta: timedelta) -> str:
+    """Get aging state based on settings."""
+    hours = max(delta.total_seconds(), 0) / 3600
+    target = max(float(settings.target_aging_hours), 0)
+    tol = max(float(settings.target_aging_tolerance_hours), 0)
+
+    if hours < max(target - tol, 0):
+        return _AGE_STATE_WAITING
+    if hours <= target + tol:
+        return _AGE_STATE_READY
+    return _AGE_STATE_EXCEED
+
+
+def _aging_label(delta: timedelta) -> str:
+    """Get aging label text."""
+    state = _aging_state(delta)
+    labels = {
+        _AGE_STATE_WAITING: "Aging",
+        _AGE_STATE_READY: "Aged",
+        _AGE_STATE_EXCEED: "Aged Out",
+    }
+    return labels.get(state, "-")

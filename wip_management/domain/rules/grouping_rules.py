@@ -39,7 +39,7 @@ def choose_column(tray: Tray) -> Column:
 def build_trolley_projection(
     trays: Iterable[Tray],
     *,
-    manual_assignments: Mapping[str, tuple[Column, str]] | None = None,
+    manual_assignments: Mapping[str, tuple[Column, str, TrolleyMode]] | None = None,
     max_per_trolley: int = 30,
     assembly_auto_trolley_count: int = 1,
     auto_group_enabled: bool = True,
@@ -49,19 +49,33 @@ def build_trolley_projection(
     assignments = manual_assignments or {}
     tray_by_id = {str(tray.tray_id): tray for tray in rows}
 
-    manual_groups: dict[tuple[Column, str], list[Tray]] = defaultdict(list)
+    manual_groups: dict[tuple[Column, str, TrolleyMode], list[Tray]] = defaultdict(list)
     manually_assigned: set[str] = set()
     for tray in rows:
         tray_key = str(tray.tray_id)
         assignment = assignments.get(tray_key)
         if assignment is None:
             continue
-        column, trolley_id = assignment
+        if len(assignment) == 2:
+            column, trolley_id = assignment
+            mode = TrolleyMode.MANUAL
+        else:
+            column, trolley_id, mode = assignment
+        if not isinstance(column, Column):
+            try:
+                column = Column(str(column).strip())
+            except ValueError:
+                continue
+        if not isinstance(mode, TrolleyMode):
+            try:
+                mode = TrolleyMode(str(mode).strip().lower())
+            except ValueError:
+                mode = TrolleyMode.MANUAL
         if not trolley_id:
             continue
-        manual_groups[(column, trolley_id)].append(tray)
+        manual_groups[(column, trolley_id, mode)].append(tray)
         manually_assigned.add(tray_key)
-    manual_trolley_ids = sorted({trolley_id for _, trolley_id in manual_groups.keys()})
+    manual_trolley_ids = sorted({trolley_id for _, trolley_id, _ in manual_groups.keys()})
     trolley_id_allocator = _TrolleyIdAllocator(
         total_count=max(1, int(total_trolley_count)),
         manual_trolley_ids=manual_trolley_ids,
@@ -159,26 +173,50 @@ def build_trolley_projection(
 
 
 def _manual_trolleys(
-    manual_groups: Mapping[tuple[Column, str], list[Tray]],
+    manual_groups: Mapping[tuple[Column, str, TrolleyMode], list[Tray]],
     tray_by_id: Mapping[str, Tray],
 ) -> list[Trolley]:
-    out: list[Trolley] = []
-    for key in sorted(manual_groups.keys(), key=lambda item: (item[0].value, item[1])):
-        column, trolley_id = key
+    merged: dict[tuple[Column, str], tuple[TrolleyMode, list[Tray]]] = {}
+    for key in sorted(manual_groups.keys(), key=lambda item: (item[0].value, item[1], item[2].value)):
+        column, trolley_id, mode = key
         trays = manual_groups[key]
+        bucket_key = (column, trolley_id)
+        current = merged.get(bucket_key)
+        if current is None:
+            merged[bucket_key] = (mode, list(trays))
+            continue
+        current_mode, current_trays = current
+        if mode is TrolleyMode.MANUAL:
+            current_mode = TrolleyMode.MANUAL
+        current_trays.extend(trays)
+        merged[bucket_key] = (current_mode, current_trays)
+
+    out: list[Trolley] = []
+    for key in sorted(merged.keys(), key=lambda item: (item[0].value, item[1])):
+        column, trolley_id = key
+        mode, trays = merged[key]
         if column is Column.ASSEMBLY:
             state = TrolleyState.STACKING
         elif column is Column.PRECHARGE:
             state = TrolleyState.WAITING
         else:
             state = TrolleyState.AGING
+        ordered_trays = sorted(trays, key=_tray_sort_key, reverse=True)
+        deduped_tray_ids: list[TrayId] = []
+        seen_tray_ids: set[str] = set()
+        for tray in ordered_trays:
+            tray_key = str(tray.tray_id)
+            if tray_key in seen_tray_ids:
+                continue
+            seen_tray_ids.add(tray_key)
+            deduped_tray_ids.append(tray.tray_id)
         out.append(
             _build_trolley(
                 trolley_id=trolley_id,
                 column=column,
-                tray_ids=[tray.tray_id for tray in trays],
+                tray_ids=deduped_tray_ids,
                 tray_by_id=tray_by_id,
-                mode=TrolleyMode.MANUAL,
+                mode=mode,
                 state=state,
             )
         )
@@ -424,15 +462,33 @@ def _reassign_auto_trolley_ids_by_assembly_out(
         total_count=max(1, int(total_trolley_count)),
         manual_trolley_ids=list(manual_trolley_ids),
     )
+    # Keep IDs stable for trolleys that come from persisted manual assignments.
+    # This matters when auto-group is disabled: we preserve prior auto groups as
+    # manual assignments with mode=AUTO, and delete operations must target a
+    # stable trolley ID across recomputations.
+    preserved_manual_ids = {
+        str(tid).strip().upper()
+        for tid in manual_trolley_ids
+        if str(tid).strip()
+    }
     indexed: list[tuple[datetime, str, str, int]] = []
     for idx, trolley in enumerate(assembly_trolleys):
         if trolley.mode is TrolleyMode.AUTO:
+            current_id = str(trolley.trolley_id).strip().upper()
+            if current_id in preserved_manual_ids:
+                continue
             indexed.append((_trolley_oldest_assembly_out_time(trolley, tray_by_id=tray_by_id), str(trolley.trolley_id), "assembly", idx))
     for idx, trolley in enumerate(queue_trolleys):
         if trolley.mode is TrolleyMode.AUTO:
+            current_id = str(trolley.trolley_id).strip().upper()
+            if current_id in preserved_manual_ids:
+                continue
             indexed.append((_trolley_oldest_assembly_out_time(trolley, tray_by_id=tray_by_id), str(trolley.trolley_id), "queue", idx))
     for idx, trolley in enumerate(precharge_trolleys):
         if trolley.mode is TrolleyMode.AUTO:
+            current_id = str(trolley.trolley_id).strip().upper()
+            if current_id in preserved_manual_ids:
+                continue
             indexed.append((_trolley_oldest_assembly_out_time(trolley, tray_by_id=tray_by_id), str(trolley.trolley_id), "precharge", idx))
     indexed.sort(key=lambda item: (item[0], item[1]))
     for _, _, bucket, idx in indexed:

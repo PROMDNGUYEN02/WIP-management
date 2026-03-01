@@ -1,85 +1,682 @@
+# wip_management/infrastructure/sqlserver/ccu_repo.py
 from __future__ import annotations
 
 import asyncio
+import atexit
+import hashlib
 import json
 import logging
-import re
+import pickle
+import tempfile
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterable
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from wip_management.config import settings
 from wip_management.domain.models.tray import SignalSource, TrayId, TraySignal, Watermark
 from wip_management.infrastructure.sqlserver.connection import SQLServerConnection
-from wip_management.infrastructure.sqlserver.window_cache import SQLWindowRowCache
 
-_TOKEN_PATTERN = re.compile(r"V[A-Z]\d{4,}", re.IGNORECASE)
 log = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Fast JSON parsing - try orjson first
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    import orjson
 
+    def _fast_json_loads(s: str | bytes) -> dict:
+        if isinstance(s, str):
+            s = s.encode("utf-8")
+        return orjson.loads(s)
+
+    _JSON_BACKEND = "orjson"
+except ImportError:
+    def _fast_json_loads(s: str | bytes) -> dict:
+        if isinstance(s, bytes):
+            s = s.decode("utf-8")
+        return json.loads(s)
+
+    _JSON_BACKEND = "stdlib"
+
+log.debug("JSON backend: %s", _JSON_BACKEND)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Thread Pool Management
+# ─────────────────────────────────────────────────────────────────────────────
+_PARSE_EXECUTOR: ThreadPoolExecutor | None = None
+_EXECUTOR_LOCK = threading.Lock()
+
+
+def _get_parse_executor() -> ThreadPoolExecutor:
+    global _PARSE_EXECUTOR
+    if _PARSE_EXECUTOR is None:
+        with _EXECUTOR_LOCK:
+            if _PARSE_EXECUTOR is None:
+                _PARSE_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=2,
+                    thread_name_prefix="ccu-parse",
+                )
+                atexit.register(_shutdown_executor)
+    return _PARSE_EXECUTOR
+
+
+def _shutdown_executor() -> None:
+    global _PARSE_EXECUTOR
+    if _PARSE_EXECUTOR is not None:
+        _PARSE_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        _PARSE_EXECUTOR = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LRU Cache with TTL
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass(slots=True)
+class _CacheEntry:
+    data: Any
+    created_at: float
+    access_count: int = 0
+    last_access: float = field(default_factory=time.monotonic)
+
+
+class TTLCache:
+    """Thread-safe LRU cache with TTL expiration."""
+
+    def __init__(
+        self,
+        maxsize: int = 1000,
+        ttl_seconds: float = 600.0,
+        *,
+        name: str = "cache",
+    ) -> None:
+        self._maxsize = max(1, maxsize)
+        self._ttl = ttl_seconds
+        self._name = name
+        self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
+        self._lock = threading.Lock()
+        self._hits = 0
+        self._misses = 0
+
+    def get(self, key: str) -> Any | None:
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                self._misses += 1
+                return None
+            now = time.monotonic()
+            if self._ttl > 0 and (now - entry.created_at) > self._ttl:
+                del self._cache[key]
+                self._misses += 1
+                return None
+            self._cache.move_to_end(key)
+            entry.access_count += 1
+            entry.last_access = now
+            self._hits += 1
+            return entry.data
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            now = time.monotonic()
+            self._evict_expired(now)
+            while len(self._cache) >= self._maxsize:
+                self._cache.popitem(last=False)
+            self._cache[key] = _CacheEntry(data=value, created_at=now)
+
+    def _evict_expired(self, now: float) -> None:
+        if self._ttl <= 0:
+            return
+        expired = [
+            k for k, v in self._cache.items()
+            if (now - v.created_at) > self._ttl
+        ]
+        for k in expired:
+            del self._cache[k]
+
+    def invalidate(self, key: str) -> bool:
+        with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+                return True
+            return False
+
+    def invalidate_prefix(self, prefix: str) -> int:
+        with self._lock:
+            to_remove = [k for k in self._cache if k.startswith(prefix)]
+            for k in to_remove:
+                del self._cache[k]
+            return len(to_remove)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            total = self._hits + self._misses
+            hit_rate = (self._hits / total * 100) if total > 0 else 0.0
+            return {
+                "name": self._name,
+                "size": len(self._cache),
+                "maxsize": self._maxsize,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": f"{hit_rate:.1f}%",
+            }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Disk Cache
+# ─────────────────────────────────────────────────────────────────────────────
+class DiskCache:
+    """Simple disk-based cache for large results that survive restarts."""
+
+    def __init__(
+        self,
+        cache_dir: str | Path | None = None,
+        max_entries: int = 500,
+        ttl_hours: float = 24.0,
+    ) -> None:
+        if cache_dir is None:
+            cache_dir = Path(tempfile.gettempdir()) / "wip_cache"
+        self._cache_dir = Path(cache_dir)
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._max_entries = max_entries
+        self._ttl_seconds = ttl_hours * 3600
+        self._index_file = self._cache_dir / "_index.json"
+        self._index: dict[str, dict] = self._load_index()
+        self._lock = threading.Lock()
+
+    def _load_index(self) -> dict[str, dict]:
+        try:
+            if self._index_file.exists():
+                with open(self._index_file, "r") as f:
+                    return json.load(f)
+        except Exception:
+            log.debug("Disk cache index load failed, starting fresh")
+        return {}
+
+    def _save_index(self) -> None:
+        try:
+            with open(self._index_file, "w") as f:
+                json.dump(self._index, f)
+        except Exception:
+            log.warning("Disk cache index save failed")
+
+    def _key_to_filename(self, key: str) -> str:
+        return hashlib.sha256(key.encode()).hexdigest()[:32] + ".pkl"
+
+    def get(self, key: str) -> Any | None:
+        with self._lock:
+            entry = self._index.get(key)
+            if entry is None:
+                return None
+            created_at = entry.get("created_at", 0)
+            if time.time() - created_at > self._ttl_seconds:
+                self._remove_entry(key)
+                return None
+            filename = entry.get("filename", "")
+            filepath = self._cache_dir / filename
+            try:
+                if filepath.exists():
+                    with open(filepath, "rb") as f:
+                        return pickle.load(f)
+            except Exception:
+                log.debug("Disk cache read failed key=%s", key)
+                self._remove_entry(key)
+            return None
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            self._evict_if_needed()
+            filename = self._key_to_filename(key)
+            filepath = self._cache_dir / filename
+            try:
+                with open(filepath, "wb") as f:
+                    pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+                self._index[key] = {
+                    "filename": filename,
+                    "created_at": time.time(),
+                    "size": filepath.stat().st_size,
+                }
+                self._save_index()
+            except Exception:
+                log.warning("Disk cache write failed key=%s", key)
+
+    def _remove_entry(self, key: str) -> None:
+        entry = self._index.pop(key, None)
+        if entry:
+            filepath = self._cache_dir / entry.get("filename", "")
+            try:
+                if filepath.exists():
+                    filepath.unlink()
+            except Exception:
+                pass
+            self._save_index()
+
+    def _evict_if_needed(self) -> None:
+        now = time.time()
+        expired = [
+            k for k, v in self._index.items()
+            if now - v.get("created_at", 0) > self._ttl_seconds
+        ]
+        for k in expired:
+            self._remove_entry(k)
+        while len(self._index) >= self._max_entries:
+            oldest_key = min(
+                self._index.keys(),
+                key=lambda k: self._index[k].get("created_at", 0),
+            )
+            self._remove_entry(oldest_key)
+
+    def clear(self) -> None:
+        with self._lock:
+            for entry in self._index.values():
+                filepath = self._cache_dir / entry.get("filename", "")
+                try:
+                    if filepath.exists():
+                        filepath.unlink()
+                except Exception:
+                    pass
+            self._index.clear()
+            self._save_index()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON helpers
+# ─────────────────────────────────────────────────────────────────────────────
+_BAD_PREFIXES = frozenset((
+    "FIELDNAME", "PARAMNAME", "MAXVALUE", "WIPID",
+    "RECORDTIME", "CREATEUSER", "CREATEDATE", "STDVALUE",
+))
+
+
+def _parse_record_json(raw: str) -> dict[str, str]:
+    """
+    Parse RECORD_JSON with optimized fast path.
+    Structure: {"TRAYID": {"paramValue": "VB050000435", ...}, ...}
+    """
+    if not raw or len(raw) < 10:
+        return {}
+    try:
+        outer = _fast_json_loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(outer, dict):
+        return {}
+    result: dict[str, str] = {}
+    for field_name, field_obj in outer.items():
+        if isinstance(field_obj, dict):
+            v = field_obj.get("paramValue")
+            if v is not None:
+                result[field_name] = str(v)
+        elif isinstance(field_obj, (str, int, float)):
+            result[field_name] = str(field_obj)
+    return result
+
+
+def _is_valid_tray_id(value: str) -> bool:
+    if not value:
+        return False
+    length = len(value)
+    if length < 6 or length > 40:
+        return False
+    has_digit = False
+    for c in value:
+        if c.isdigit():
+            has_digit = True
+            break
+    if not has_digit:
+        return False
+    upper_value = value.upper()
+    for prefix in _BAD_PREFIXES:
+        if upper_value.startswith(prefix):
+            return False
+    return True
+
+
+def _coerce_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    text = str(value).strip()
+    if not text or len(text) < 10:
+        return None
+    try:
+        normalized = text.replace("Z", "").replace("T", " ")
+        if "." in normalized:
+            normalized = normalized[:26]
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text[:26], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _chunked(values: list, chunk_size: int) -> list[list]:
+    if chunk_size <= 0:
+        return [values]
+    return [values[i:i + chunk_size] for i in range(0, len(values), chunk_size)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core Parse (runs in thread pool)
+# ─────────────────────────────────────────────────────────────────────────────
+def _parse_ccu_rows_sync(
+    rows: list[dict[str, Any]],
+    tray_key: str,
+    pos_key: str,
+    keyword: str,
+) -> list[TraySignal]:
+    per_tray: dict[str, dict[str, Any]] = {}
+    skipped = parsed = 0
+    keyword_upper = keyword.upper() if keyword else ""
+
+    for row in rows:
+        start_time = _coerce_datetime(row.get("start_time"))
+        end_time = _coerce_datetime(row.get("end_time"))
+        collected = end_time or start_time
+        if collected is None:
+            skipped += 1
+            continue
+
+        raw_json = row.get("record_json")
+        if not raw_json:
+            skipped += 1
+            continue
+
+        raw_text = str(raw_json)
+        if keyword_upper and keyword_upper not in raw_text.upper():
+            skipped += 1
+            continue
+
+        fields = _parse_record_json(raw_text)
+        if not fields:
+            skipped += 1
+            continue
+
+        raw_tray = fields.get(tray_key, "").strip()
+        if not raw_tray:
+            raw_tray = fields.get(tray_key.upper(), "").strip()
+        tray_id = raw_tray.upper()
+        if not _is_valid_tray_id(tray_id):
+            skipped += 1
+            continue
+
+        raw_pos = fields.get(pos_key, "") or fields.get(pos_key.upper(), "")
+        pos_value: int | None = None
+        if raw_pos:
+            try:
+                pos_value = int(float(raw_pos))
+            except (ValueError, TypeError):
+                pass
+
+        lot_no = (
+            fields.get("LOT_NO", "").strip()
+            or str(row.get("lot_no") or "").strip()
+        )
+
+        if tray_id not in per_tray:
+            per_tray[tray_id] = {
+                "seen_positions": set(),
+                "lot_nos": set(),
+                "latest_lot": None,
+                "min_pos": None,
+                "max_pos": None,
+                "first_start": None,
+                "last_end": None,
+                "latest_time": collected,
+            }
+
+        stat = per_tray[tray_id]
+
+        if pos_value is not None:
+            stat["seen_positions"].add(pos_value)
+            if stat["min_pos"] is None or pos_value < stat["min_pos"]:
+                stat["min_pos"] = pos_value
+            if stat["max_pos"] is None or pos_value > stat["max_pos"]:
+                stat["max_pos"] = pos_value
+
+        if lot_no:
+            stat["lot_nos"].add(lot_no)
+            stat["latest_lot"] = lot_no
+
+        if start_time and (
+            stat["first_start"] is None or start_time < stat["first_start"]
+        ):
+            stat["first_start"] = start_time
+        if end_time and (
+            stat["last_end"] is None or end_time > stat["last_end"]
+        ):
+            stat["last_end"] = end_time
+        if collected > stat["latest_time"]:
+            stat["latest_time"] = collected
+
+        parsed += 1
+
+    out: list[TraySignal] = []
+    for tray_id, stat in per_tray.items():
+        quantity = (
+            len(stat["seen_positions"])
+            if stat["seen_positions"]
+            else len(stat["lot_nos"])
+        )
+        payload: dict[str, Any] = {
+            "lot_no": stat["latest_lot"],
+            "quantity": quantity,
+            "lot_count": len(stat["lot_nos"]),
+            "start_time": (
+                stat["first_start"].isoformat() if stat["first_start"] else None
+            ),
+            "end_time": (
+                stat["last_end"].isoformat() if stat["last_end"] else None
+            ),
+            "min_position": stat["min_pos"],
+            "max_position": stat["max_pos"],
+        }
+        out.append(TraySignal(
+            source=SignalSource.CCU,
+            tray_id=TrayId(tray_id),
+            collected_time=stat["latest_time"],
+            payload=payload,
+        ))
+
+    out.sort(key=lambda s: (s.collected_time, str(s.tray_id)))
+
+    if rows and skipped == len(rows):
+        log.error(
+            "CCU parse: ALL %s rows skipped! tray_key='%s' pos_key='%s'",
+            len(rows), tray_key, pos_key,
+        )
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lookup Strategy Enum
+# ─────────────────────────────────────────────────────────────────────────────
+class TrayLookupStrategy:
+    """Determines how to look up tray IDs in the CCU table."""
+    JSON_VALUE = "json_value"  # Use JSON_VALUE() — precise, SQL Server 2016+
+    LIKE_SCAN = "like_scan"    # Use RECORD_JSON LIKE '%tray_id%' — slow fallback
+    INDEXED_COLUMN = "indexed_column"  # Use pre-computed indexed column
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Repository
+# ─────────────────────────────────────────────────────────────────────────────
 class CcuRepo:
+    """
+    Optimized CCU Repository:
+    - L1: In-memory TTL cache (hot data)
+    - L2: Disk cache (persistence across restarts)
+    - JSON_VALUE() extraction for tray ID lookups (SQL Server 2016+)
+    - Falls back to LIKE scan only if explicitly configured
+
+    IMPORTANT: MANUFACTURE_CODE contains machine codes (e.g. 'RMP1.06092ASY01'),
+    NOT tray IDs. Tray IDs are stored in RECORD_JSON under $.TRAYID.paramValue.
+    """
+
     def __init__(self, connection: SQLServerConnection) -> None:
         self._conn = connection
-        self._table = SQLServerConnection.table_name(settings.sql_schema, settings.ccu_table)
+        self._table = SQLServerConnection.table_name(
+            settings.sql_schema, settings.ccu_table
+        )
         self._lot_col = SQLServerConnection.column_name(settings.ccu_lot_column)
         self._start_col = SQLServerConnection.column_name(settings.ccu_start_column)
         self._end_col = SQLServerConnection.column_name(settings.ccu_end_column)
         self._update_col = SQLServerConnection.column_name(settings.update_time_column)
-        self._record_col = SQLServerConnection.column_name(settings.ccu_record_json_column)
+        self._record_col = SQLServerConnection.column_name(
+            settings.ccu_record_json_column
+        )
         self._tray_key = settings.ccu_json_tray_id_key
         self._pos_key = settings.ccu_json_pos_key
         self._keyword = settings.record_filter_keyword.strip().upper()
-        self._sql_tray_markers = _build_sql_marker_patterns(
-            self._tray_key,
-            fallback_keys=("TRAY_ID", "TRAYBARCODE", "TRAY_BARCODE"),
+
+        # JSON path for SQL Server JSON_VALUE()
+        self._json_tray_path = getattr(
+            settings, "ccu_json_tray_id_path", "$.TRAYID.paramValue"
         )
-        self._tray_cells_cache: dict[str, list[dict[str, str | None]]] = {}
-        self._tray_cells_cache_keys: dict[str, set[tuple[str, str | None, str | None]]] = {}
-        self._tray_cells_cache_max_trays = 2000
-        self._tray_cells_max_rows_per_tray = 2000
-        self._cell_owner_cache: dict[str, dict[str, str | None]] = {}
-        self._cell_owner_cache_times: dict[str, datetime] = {}
-        self._cell_owner_cache_max_entries = 200000
-        self._range_cache = SQLWindowRowCache(
-            name="CCU",
-            overlap_seconds=settings.delta_overlap_seconds,
-            max_rows=max(50000, settings.max_fetch_batch * 8),
+
+        # Resolve lookup strategy
+        self._lookup_strategy: str
+        self._tray_id_col_quoted: str | None = None
+
+        _raw_col = getattr(settings, "ccu_tray_id_db_column", "").strip()
+
+        if not _raw_col:
+            # Default: Use JSON_VALUE() for precise extraction
+            self._lookup_strategy = TrayLookupStrategy.JSON_VALUE
+            log.info(
+                "CCU repo: using JSON_VALUE('%s') for tray ID extraction "
+                "(MANUFACTURE_CODE contains machine codes, not tray IDs)",
+                self._json_tray_path,
+            )
+        elif _raw_col.upper() == "LIKE":
+            # Explicit LIKE fallback
+            self._lookup_strategy = TrayLookupStrategy.LIKE_SCAN
+            log.info(
+                "CCU repo: using RECORD_JSON LIKE scan for tray ID lookup "
+                "(slow, consider JSON_VALUE or computed column)"
+            )
+        else:
+            # Assume it's an indexed column name (computed column)
+            try:
+                self._tray_id_col_quoted = SQLServerConnection.column_name(_raw_col)
+                self._lookup_strategy = TrayLookupStrategy.INDEXED_COLUMN
+                log.info(
+                    "CCU repo: using indexed column %s for tray ID lookup",
+                    _raw_col,
+                )
+            except ValueError:
+                log.warning(
+                    "CCU repo: invalid ccu_tray_id_db_column='%s', "
+                    "falling back to JSON_VALUE",
+                    _raw_col,
+                )
+                self._lookup_strategy = TrayLookupStrategy.JSON_VALUE
+
+        # L1: Memory cache
+        self._tray_cells_cache = TTLCache(
+            maxsize=int(getattr(settings, "tray_detail_cache_max_entries", 500)),
+            ttl_seconds=float(
+                getattr(settings, "tray_detail_cache_ttl_seconds", 300)
+            ),
+            name="tray_cells",
         )
+
+        # L2: Disk cache
+        cache_dir = Path(getattr(settings, "local_cache_dir", "")) or None
+        self._disk_cache = DiskCache(
+            cache_dir=cache_dir,
+            max_entries=2000,
+            ttl_hours=24.0,
+        )
+
+        # Cell owner cache
+        self._cell_owner_cache = TTLCache(
+            maxsize=1000,
+            ttl_seconds=600.0,
+            name="cell_owner",
+        )
+
+        # Known tray data from initial/delta loads
+        self._known_tray_data: dict[str, dict[str, Any]] = {}
+        self._known_tray_lock = threading.Lock()
 
     async def start(self) -> None:
         await self._conn.start()
 
     async def close(self) -> None:
         await self._conn.close()
+        self._tray_cells_cache.clear()
+        self._cell_owner_cache.clear()
+        log.info(
+            "CCU repo closed cache_stats=%s",
+            self._tray_cells_cache.stats(),
+        )
 
-    async def fetch_initial(self, start_time: datetime, end_time: datetime) -> list[TraySignal]:
-        log.info("CCU initial fetch start start_time=%s end_time=%s", start_time.isoformat(), end_time.isoformat())
-        started_at = time.perf_counter()
-        rows = await self._fetch_range(start_time=start_time, end_time=end_time)
-        signals = self._rows_to_signals(rows)
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    def register_known_tray(self, tray_id: str, data: dict[str, Any]) -> None:
+        with self._known_tray_lock:
+            self._known_tray_data[tray_id.upper()] = data
+
+    def get_known_tray(self, tray_id: str) -> dict[str, Any] | None:
+        with self._known_tray_lock:
+            return self._known_tray_data.get(tray_id.upper())
+
+    async def fetch_initial(
+        self,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[TraySignal]:
+        log.info(
+            "CCU initial fetch start start_time=%s end_time=%s batch_size=%s",
+            start_time.isoformat(),
+            end_time.isoformat(),
+            settings.max_fetch_batch,
+        )
+        t0 = time.perf_counter()
+        rows = await self._fetch_range(start_time, end_time)
+        signals = await self._parse_rows_parallel(rows)
+        for signal in signals:
+            self.register_known_tray(str(signal.tray_id), signal.payload)
         log.info(
             "CCU initial fetch done elapsed_ms=%s raw_rows=%s signals=%s",
-            elapsed_ms,
+            int((time.perf_counter() - t0) * 1000),
             len(rows),
             len(signals),
         )
         return signals
 
-    async def fetch_delta(self, watermark: Watermark, end_time: datetime) -> list[TraySignal]:
-        overlap_start = watermark.collected_time - timedelta(seconds=settings.delta_overlap_seconds)
-        log.debug(
-            "CCU delta fetch start watermark=%s overlap_start=%s end_time=%s",
-            watermark.collected_time.isoformat(),
-            overlap_start.isoformat(),
-            end_time.isoformat(),
+    async def fetch_delta(
+        self,
+        watermark: Watermark,
+        end_time: datetime,
+    ) -> list[TraySignal]:
+        overlap_start = watermark.collected_time - timedelta(
+            seconds=settings.delta_overlap_seconds
         )
-        started_at = time.perf_counter()
-        rows = await self._fetch_range(start_time=overlap_start, end_time=end_time)
-        signals = self._rows_to_signals(rows)
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-        log.debug("CCU delta fetch done elapsed_ms=%s raw_rows=%s signals=%s", elapsed_ms, len(rows), len(signals))
+        t0 = time.perf_counter()
+        rows = await self._fetch_range(overlap_start, end_time)
+        signals = await self._parse_rows_parallel(rows)
+        for signal in signals:
+            self.register_known_tray(str(signal.tray_id), signal.payload)
+        log.debug(
+            "CCU delta fetch done elapsed_ms=%s raw_rows=%s signals=%s",
+            int((time.perf_counter() - t0) * 1000),
+            len(rows),
+            len(signals),
+        )
         return signals
 
     async def fetch_by_tray_ids(
@@ -90,385 +687,49 @@ class CcuRepo:
         allow_historical_scan: bool = True,
         allow_targeted_lookup: bool = True,
     ) -> list[TraySignal]:
-        wanted = {tray_id.strip() for tray_id in tray_ids if tray_id and tray_id.strip()}
+        wanted = {t.strip().upper() for t in tray_ids if t and t.strip()}
         if not wanted:
-            log.debug("CCU backfill skipped because tray_ids is empty")
             return []
+
+        log.info("CCU backfill fetch start tray_count=%s", len(wanted))
+        t0 = time.perf_counter()
+        lookback_start = end_time - timedelta(
+            hours=max(1.0, float(settings.ccu_backfill_lookback_hours))
+        )
+
+        all_rows: list[dict[str, Any]] = []
+        for batch in _chunked(sorted(wanted), 50):
+            all_rows.extend(
+                await self._fetch_by_tray_ids_batch(batch, lookback_start, end_time)
+            )
+
+        signals = await self._parse_rows_parallel(all_rows)
+        result = [s for s in signals if str(s.tray_id).upper() in wanted]
+
+        for signal in result:
+            self.register_known_tray(str(signal.tray_id), signal.payload)
+
         log.info(
-            "CCU backfill fetch start tray_count=%s end_time=%s allow_historical_scan=%s allow_targeted_lookup=%s",
+            "CCU backfill fetch done elapsed_ms=%s requested=%s matched=%s strategy=%s",
+            int((time.perf_counter() - t0) * 1000),
             len(wanted),
-            end_time.isoformat(),
-            allow_historical_scan,
-            allow_targeted_lookup,
+            len(result),
+            self._lookup_strategy,
         )
-        started_at = time.perf_counter()
-        day_start = end_time.replace(hour=settings.initial_load_start_hour, minute=0, second=0, microsecond=0)
-        lookback_start = end_time - timedelta(hours=max(1.0, float(settings.ccu_backfill_lookback_hours)))
-        backfill_step = timedelta(hours=max(0.25, float(settings.ccu_backfill_step_hours)))
-        latest_by_tray: dict[str, TraySignal] = {}
-        raw_rows_total = 0
-        scan_count = 0
-
-        # 1) Fast-path for small missing sets: targeted lookup first.
-        targeted_first_limit = max(1, int(settings.ccu_backfill_targeted_first_max_trays))
-        targeted_first = allow_targeted_lookup and len(wanted) <= targeted_first_limit
-        unresolved = set(wanted)
-        if targeted_first:
-            targeted_signals, targeted_rows = await self._fetch_latest_signals_for_unresolved_trays(
-                tray_ids=unresolved,
-                start_time=lookback_start,
-                end_time=end_time,
-            )
-            raw_rows_total += targeted_rows
-            if targeted_signals:
-                for signal in targeted_signals:
-                    latest_by_tray[str(signal.tray_id)] = signal
-            unresolved = wanted.difference(latest_by_tray.keys())
-            log.info(
-                "CCU backfill targeted-first done tray_count=%s resolved=%s unresolved=%s rows=%s",
-                len(wanted),
-                len(targeted_signals),
-                len(unresolved),
-                targeted_rows,
-            )
-        if targeted_first and unresolved:
-            log.info(
-                "CCU backfill targeted-first partial unresolved=%s continue_with_window_scan=True",
-                len(unresolved),
-            )
-
-        # 2) Current day window (00:00 today -> now)
-        if unresolved:
-            rows = await self._fetch_range(start_time=day_start, end_time=end_time)
-            raw_rows_total += len(rows)
-            before_count = len(latest_by_tray)
-            _collect_latest_by_tray_from_rows(
-                rows=rows,
-                wanted=unresolved,
-                latest_by_tray=latest_by_tray,
-                row_parser=self._rows_to_signals,
-            )
-            resolved_in_day = len(latest_by_tray) - before_count
-            unresolved = wanted.difference(latest_by_tray.keys())
-            log.info(
-                "CCU backfill day-window resolved=%s unresolved=%s raw_rows=%s",
-                resolved_in_day,
-                len(unresolved),
-                len(rows),
-            )
-
-        # 3) Walk backwards by fixed step (e.g. 23:00 yesterday, 22:00, ...)
-        window_end = day_start
-        empty_streak = 0
-        no_progress_streak = 0
-        max_empty_streak = 2
-        max_no_progress_streak = 3
-        while allow_historical_scan and unresolved and lookback_start < window_end:
-            window_start = max(lookback_start, window_end - backfill_step)
-            rows = await self._fetch_range(start_time=window_start, end_time=window_end)
-            raw_rows_total += len(rows)
-            before_count = len(latest_by_tray)
-            _collect_latest_by_tray_from_rows(
-                rows=rows,
-                wanted=unresolved,
-                latest_by_tray=latest_by_tray,
-                row_parser=self._rows_to_signals,
-            )
-            newly_resolved = len(latest_by_tray) - before_count
-            unresolved = wanted.difference(latest_by_tray.keys())
-            scan_count += 1
-            empty_streak = (empty_streak + 1) if not rows else 0
-            no_progress_streak = (no_progress_streak + 1) if newly_resolved == 0 else 0
-            log.info(
-                "CCU backfill step=%s window_start=%s window_end=%s raw_rows=%s newly_resolved=%s unresolved=%s",
-                scan_count,
-                window_start.isoformat(),
-                window_end.isoformat(),
-                len(rows),
-                newly_resolved,
-                len(unresolved),
-            )
-            if unresolved and (empty_streak >= max_empty_streak or no_progress_streak >= max_no_progress_streak):
-                log.info(
-                    "CCU backfill switch-to-targeted unresolved=%s empty_streak=%s/%s no_progress_streak=%s/%s",
-                    len(unresolved),
-                    empty_streak,
-                    max_empty_streak,
-                    no_progress_streak,
-                    max_no_progress_streak,
-                )
-                break
-            if window_start == lookback_start:
-                break
-            window_end = window_start
-
-        if unresolved and allow_targeted_lookup:
-            unresolved_before_targeted = set(unresolved)
-            targeted_signals, targeted_rows = await self._fetch_latest_signals_for_unresolved_trays(
-                tray_ids=unresolved,
-                start_time=lookback_start,
-                end_time=end_time,
-            )
-            raw_rows_total += targeted_rows
-            if targeted_signals:
-                for signal in targeted_signals:
-                    latest_by_tray[str(signal.tray_id)] = signal
-                unresolved = wanted.difference(latest_by_tray.keys())
-            log.info(
-                "CCU backfill targeted lookup done tray_count=%s resolved=%s unresolved=%s rows=%s",
-                len(unresolved_before_targeted),
-                len(targeted_signals),
-                len(unresolved),
-                targeted_rows,
-            )
-        elif unresolved and (not allow_historical_scan) and (not allow_targeted_lookup):
-            log.info(
-                "CCU backfill skip targeted lookup unresolved=%s reason=fast-path-disabled",
-                len(unresolved),
-            )
-        elif unresolved and (not allow_targeted_lookup):
-            log.info(
-                "CCU backfill skip targeted lookup unresolved=%s reason=disabled",
-                len(unresolved),
-            )
-
-        out = list(latest_by_tray.values())
-        out.sort(key=lambda item: (item.collected_time, str(item.tray_id)))
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-        unresolved_list = sorted(wanted.difference(latest_by_tray.keys()))
-        unresolved_sample = unresolved_list[:5]
-        log.info(
-            "CCU backfill fetch done elapsed_ms=%s raw_rows=%s scans=%s matched_trays=%s unresolved=%s unresolved_sample=%s signals=%s lookback_start=%s step_hours=%.2f",
-            elapsed_ms,
-            raw_rows_total,
-            scan_count,
-            len(latest_by_tray),
-            len(unresolved_list),
-            unresolved_sample,
-            len(out),
-            lookback_start.isoformat(),
-            backfill_step.total_seconds() / 3600.0,
-        )
-        return out
-
-    async def _fetch_latest_signals_for_unresolved_trays(
-        self,
-        *,
-        tray_ids: set[str],
-        start_time: datetime,
-        end_time: datetime,
-    ) -> tuple[list[TraySignal], int]:
-        if not tray_ids:
-            return [], 0
-        tray_ids_sorted = sorted(tray_ids)
-        unresolved: set[str] = set(tray_ids_sorted)
-        latest_by_tray: dict[str, TraySignal] = {}
-        raw_rows_total = 0
-        batch_matched_total = 0
-
-        batch_enabled = bool(settings.ccu_backfill_targeted_batch_enabled)
-        batch_chunk_size = max(2, int(settings.ccu_backfill_targeted_batch_max_trays))
-        batch_rows_per_tray = max(20, int(settings.ccu_backfill_targeted_batch_rows_per_tray))
-        if batch_enabled and len(unresolved) >= 2:
-            chunk_count = 0
-            for chunk_ids in _chunked(sorted(unresolved), batch_chunk_size):
-                chunk_count += 1
-                chunk_set = set(chunk_ids)
-                rows = await self._fetch_latest_rows_for_tray_ids_batch(
-                    tray_ids=chunk_set,
-                    start_time=start_time,
-                    end_time=end_time,
-                    rows_per_tray=batch_rows_per_tray,
-                )
-                raw_rows_total += len(rows)
-                if not rows:
-                    continue
-                matched_by_tray = _match_latest_signals_to_tray_ids(
-                    signals=self._rows_to_signals(rows),
-                    tray_ids=chunk_set,
-                )
-                if not matched_by_tray:
-                    continue
-                for tray_id, signal in matched_by_tray.items():
-                    previous = latest_by_tray.get(tray_id)
-                    if previous is None or signal.collected_time >= previous.collected_time:
-                        latest_by_tray[tray_id] = signal
-                resolved = set(matched_by_tray.keys())
-                batch_matched_total += len(resolved)
-                unresolved.difference_update(resolved)
-            if batch_matched_total:
-                log.info(
-                    "CCU targeted batch lookup matched=%s/%s unresolved=%s rows=%s chunks=%s",
-                    batch_matched_total,
-                    len(tray_ids_sorted),
-                    len(unresolved),
-                    raw_rows_total,
-                    chunk_count,
-                )
-
-        if not unresolved:
-            out = list(latest_by_tray.values())
-            out.sort(key=lambda item: (item.collected_time, str(item.tray_id)))
-            return out, raw_rows_total
-
-        workers = max(1, int(settings.ccu_backfill_targeted_workers))
-        sem = asyncio.Semaphore(workers)
-
-        async def _fetch_one(tray_id: str) -> tuple[str, int, TraySignal | None, bool]:
-            async with sem:
-                rows = await self._fetch_latest_rows_for_tray_id(
-                    tray_id=tray_id,
-                    start_time=start_time,
-                    end_time=end_time,
-                )
-            if not rows:
-                return tray_id, 0, None, False
-            signals = self._rows_to_signals(rows)
-            matched = next(
-                (
-                    signal
-                    for signal in signals
-                    if _tray_ids_equivalent(str(signal.tray_id), tray_id)
-                ),
-                None,
-            )
-            used_fallback = False
-            if matched is None:
-                matched = _build_backfill_fallback_signal(tray_id=tray_id, rows=rows)
-                used_fallback = matched is not None
-            return tray_id, len(rows), matched, used_fallback
-
-        fallback_ids = sorted(unresolved)
-        tasks = [asyncio.create_task(_fetch_one(tray_id), name=f"ccu-backfill-{tray_id}") for tray_id in fallback_ids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        fallback_matched = 0
-        for tray_id, result in zip(fallback_ids, results, strict=True):
-            if isinstance(result, Exception):
-                log.warning("CCU targeted lookup failed tray_id=%s error=%r", tray_id, result)
-                continue
-            _, raw_rows, matched, used_fallback = result
-            raw_rows_total += raw_rows
-            if matched is not None:
-                previous = latest_by_tray.get(tray_id)
-                if previous is None or matched.collected_time >= previous.collected_time:
-                    latest_by_tray[tray_id] = matched
-            if used_fallback:
-                fallback_matched += 1
-        out = list(latest_by_tray.values())
-        out.sort(key=lambda item: (item.collected_time, str(item.tray_id)))
-        if fallback_matched:
-            log.info(
-                "CCU targeted lookup fallback matched=%s/%s",
-                fallback_matched,
-                len(fallback_ids),
-            )
-        return out, raw_rows_total
-
-    async def _fetch_latest_rows_for_tray_ids_batch(
-        self,
-        *,
-        tray_ids: set[str],
-        start_time: datetime,
-        end_time: datetime,
-        rows_per_tray: int,
-    ) -> list[dict[str, Any]]:
-        if not tray_ids:
-            return []
-        patterns: list[str] = []
-        for tray_id in sorted(tray_ids):
-            patterns.extend(_tray_like_patterns(tray_id))
-        if not patterns:
-            return []
-        like_patterns = list(dict.fromkeys(patterns))
-        like_filter = " OR ".join(f"{self._record_col} LIKE ?" for _ in like_patterns)
-        requested_rows = max(len(tray_ids) * max(20, rows_per_tray), len(tray_ids) * 40)
-        max_rows = max(500, int(settings.ccu_backfill_targeted_batch_max_rows))
-        top_n = min(max_rows, requested_rows)
-        query = (
-            f"SELECT TOP {top_n} "
-            f"{self._lot_col} AS lot_no, "
-            f"{self._start_col} AS start_time, "
-            f"{self._end_col} AS end_time, "
-            f"{self._record_col} AS record_json "
-            f" FROM {self._table} "
-            "WHERE ("
-            f"({self._end_col} IS NOT NULL AND {self._end_col} >= ? AND {self._end_col} <= ?) "
-            "OR "
-            f"({self._end_col} IS NULL AND {self._start_col} >= ? AND {self._start_col} <= ?)"
-            ") "
-            f"AND ({like_filter}) "
-            "ORDER BY COALESCE(end_time, start_time) DESC"
-        )
-        params: list[Any] = [start_time, end_time, start_time, end_time, *like_patterns]
-        return await self._conn.query_rows(
-            query,
-            params,
-            query_name="ccu.backfill_latest_by_tray_ids_batch",
-        )
-
-    async def _fetch_latest_rows_for_tray_id(
-        self,
-        *,
-        tray_id: str,
-        start_time: datetime,
-        end_time: datetime,
-    ) -> list[dict[str, Any]]:
-        if not tray_id:
-            return []
-        like_patterns = _tray_like_patterns(tray_id)
-        if not like_patterns:
-            return []
-        like_filter = " OR ".join(f"{self._record_col} LIKE ?" for _ in like_patterns)
-        query = (
-            "SELECT TOP 120 "
-            f"{self._lot_col} AS lot_no, "
-            f"{self._start_col} AS start_time, "
-            f"{self._end_col} AS end_time, "
-            f"{self._record_col} AS record_json "
-            f" FROM {self._table} "
-            "WHERE ("
-            f"({self._end_col} IS NOT NULL AND {self._end_col} >= ? AND {self._end_col} <= ?) "
-            "OR "
-            f"({self._end_col} IS NULL AND {self._start_col} >= ? AND {self._start_col} <= ?)"
-            ") "
-            f"AND ({like_filter}) "
-            "ORDER BY COALESCE(end_time, start_time) DESC"
-        )
-        params: list[Any] = [start_time, end_time, start_time, end_time, *like_patterns]
-        return await self._conn.query_rows(
-            query,
-            params,
-            query_name="ccu.backfill_latest_by_tray_id",
-        )
+        return result
 
     async def peek_latest_signal_time(self, end_time: datetime) -> datetime | None:
-        query = (
-            "SELECT TOP 1 latest_signal_time FROM ("
-            f"SELECT MAX({self._end_col}) AS latest_signal_time "
-            f"FROM {self._table} "
-            f"WHERE {self._end_col} IS NOT NULL AND {self._end_col} <= ? "
-            "UNION ALL "
-            f"SELECT MAX({self._start_col}) AS latest_signal_time "
-            f"FROM {self._table} "
-            f"WHERE {self._end_col} IS NULL AND {self._start_col} <= ?"
-            ") AS latest "
-            "WHERE latest_signal_time IS NOT NULL "
-            "ORDER BY latest_signal_time DESC"
-        )
+        query = f"""
+        SELECT TOP 1 COALESCE({self._end_col}, {self._start_col}) AS latest_time
+        FROM {self._table} WITH (NOLOCK)
+        WHERE {self._update_col} <= ?
+          AND ({self._end_col} IS NOT NULL OR {self._start_col} IS NOT NULL)
+        ORDER BY {self._update_col} DESC
+        """
         rows = await self._conn.query_rows(
-            query,
-            [end_time, end_time],
-            query_name="ccu.peek_latest_signal_time",
+            query, [end_time], query_name="ccu.peek_latest"
         )
-        if not rows:
-            log.debug("CCU peek latest returned empty rowset")
-            return None
-        latest = _coerce_datetime(rows[0].get("latest_signal_time"))
-        if latest is None:
-            log.debug("CCU peek latest signal_time was not parseable")
-            return None
-        log.debug("CCU peek latest signal_time=%s", latest.isoformat())
-        return latest
+        return _coerce_datetime(rows[0].get("latest_time")) if rows else None
 
     async def fetch_tray_cells(
         self,
@@ -476,88 +737,208 @@ class CcuRepo:
         start_time: datetime,
         end_time: datetime,
     ) -> list[dict[str, str | None]]:
-        wanted = _normalize_tray_id(tray_id)
+        """
+        Fetch tray cells with multi-tier caching.
+        Uses JSON_VALUE() to extract tray ID from RECORD_JSON (correct approach),
+        NOT MANUFACTURE_CODE which contains machine codes.
+        """
+        wanted = tray_id.strip().upper()
         if not wanted:
             return []
-        cached = self._get_cached_cells_for_tray(wanted)
+
+        date_key = end_time.strftime("%Y%m%d")
+        memory_cache_key = f"{wanted}:{date_key}"
+        disk_cache_key = f"tray_cells:{wanted}:{date_key}"
+
+        # L1: Memory cache
+        cached = self._tray_cells_cache.get(memory_cache_key)
         if cached is not None:
-            log.info(
-                "CCU tray detail fetch tray_id=%s cells=%s source=memory-cache",
-                wanted,
-                len(cached),
-            )
-            return cached
-        if settings.sql_driver.strip().lower() == "sql server":
-            log.warning(
-                "CCU tray detail skipped tray_id=%s reason=legacy-driver-no-cache",
-                wanted,
-            )
-            return []
-        query = (
-            "SELECT TOP 5000 "
-            f"{self._lot_col} AS lot_no, "
-            f"{self._start_col} AS start_time, "
-            f"{self._end_col} AS end_time, "
-            f"{self._record_col} AS record_json "
-            f" FROM {self._table} "
-            "WHERE ("
-            f"({self._end_col} IS NOT NULL AND {self._end_col} >= ? AND {self._end_col} <= ?) "
-            "OR "
-            f"({self._end_col} IS NULL AND {self._start_col} >= ? AND {self._start_col} <= ?)"
-            ") "
-            "AND record_json LIKE ? "
-            "ORDER BY COALESCE(end_time, start_time) ASC, lot_no ASC, start_time ASC, end_time ASC"
-        )
-        like_text = f"%{wanted}%"
-        rows = await self._conn.query_rows(
-            query,
-            [start_time, end_time, start_time, end_time, like_text],
-            query_name="ccu.fetch_tray_cells",
+            log.debug("Tray cells L1 cache hit tray_id=%s", wanted)
+            return list(cached)
+
+        # L2: Disk cache
+        disk_cached = self._disk_cache.get(disk_cache_key)
+        if disk_cached is not None:
+            log.debug("Tray cells L2 cache hit tray_id=%s", wanted)
+            self._tray_cells_cache.set(memory_cache_key, disk_cached)
+            return list(disk_cached)
+
+        # L3: Tiered DB query
+        t0 = time.perf_counter()
+        result = await self._fetch_tray_cells_tiered(wanted, start_time, end_time)
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+        log.info(
+            "Tray cells fetched tray_id=%s rows=%s elapsed_ms=%s strategy=%s",
+            wanted,
+            len(result),
+            elapsed_ms,
+            self._lookup_strategy,
         )
 
-        out: list[dict[str, str | None]] = []
-        seen: set[tuple[str, str | None, str | None]] = set()
-        for row in rows:
-            raw_json = row.get("record_json")
-            parsed_json = _parse_json(raw_json)
-            raw_text = _stringify_record_json(raw_json, parsed_json)
-            tray_key, _ = _extract_tray_id_key(
-                parsed_json=parsed_json,
-                raw_text=raw_text,
-                primary_key=self._tray_key,
-                fallback_keys=("TRAY_ID", "TRAYBARCODE", "TRAY_BARCODE"),
+        if result:
+            self._tray_cells_cache.set(memory_cache_key, result)
+            self._disk_cache.set(disk_cache_key, result)
+
+        return result
+
+    async def _fetch_tray_cells_tiered(
+        self,
+        tray_id: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, str | None]]:
+        """
+        Tiered time window strategy:
+        Tier 1: last 2h  (fastest, most likely to contain today's data)
+        Tier 2: last 8h  (wider window if tier 1 has <10 results)
+        Tier 3: full window (fallback)
+        """
+        narrow_start_1 = end_time - timedelta(hours=2)
+        if narrow_start_1 >= start_time:
+            result = await self._fetch_tray_cells_query(
+                tray_id, narrow_start_1, end_time, limit=200
             )
-            if tray_key != wanted:
+            if len(result) >= 10:
+                return result
+
+        narrow_start_2 = end_time - timedelta(hours=8)
+        if narrow_start_2 >= start_time:
+            result = await self._fetch_tray_cells_query(
+                tray_id, narrow_start_2, end_time, limit=500
+            )
+            if result:
+                return result
+
+        return await self._fetch_tray_cells_query(
+            tray_id, start_time, end_time, limit=1000
+        )
+
+    async def _fetch_tray_cells_query(
+        self,
+        tray_id: str,
+        start_time: datetime,
+        end_time: datetime,
+        limit: int = 500,
+    ) -> list[dict[str, str | None]]:
+        """
+        Execute tray-cells query using the configured lookup strategy.
+
+        JSON_VALUE (default, recommended):
+          WHERE JSON_VALUE(RECORD_JSON, '$.TRAYID.paramValue') = 'VB050001008'
+          Precise extraction, works on SQL Server 2016+.
+
+        INDEXED_COLUMN (if computed column exists):
+          WHERE TRAY_ID = 'VB050001008'
+          Fastest, requires DBA to add computed column.
+
+        LIKE_SCAN (legacy fallback):
+          WHERE RECORD_JSON LIKE '%VB050001008%'
+          Slow (~8-24s), may match false positives.
+        """
+        if self._lookup_strategy == TrayLookupStrategy.JSON_VALUE:
+            # ── JSON_VALUE extraction (precise, no computed column needed) ────
+            query = f"""
+            SELECT TOP {limit}
+                {self._lot_col}    AS lot_no,
+                {self._start_col}  AS start_time,
+                {self._end_col}    AS end_time,
+                {self._record_col} AS record_json
+            FROM {self._table} WITH (NOLOCK)
+            WHERE {self._update_col} >= ?
+              AND {self._update_col} <= ?
+              AND JSON_VALUE({self._record_col}, '{self._json_tray_path}') = ?
+            ORDER BY {self._end_col} DESC
+            """
+            params: list[Any] = [start_time, end_time, tray_id]
+
+        elif self._lookup_strategy == TrayLookupStrategy.INDEXED_COLUMN:
+            # ── Indexed computed column (fastest) ─────────────────────────────
+            query = f"""
+            SELECT TOP {limit}
+                {self._lot_col}    AS lot_no,
+                {self._start_col}  AS start_time,
+                {self._end_col}    AS end_time,
+                {self._record_col} AS record_json
+            FROM {self._table} WITH (NOLOCK)
+            WHERE {self._update_col} >= ?
+              AND {self._update_col} <= ?
+              AND {self._tray_id_col_quoted} = ?
+            ORDER BY {self._end_col} DESC
+            """
+            params = [start_time, end_time, tray_id]
+
+        else:
+            # ── LIKE scan fallback (slow) ─────────────────────────────────────
+            query = f"""
+            SELECT TOP {limit}
+                {self._lot_col}    AS lot_no,
+                {self._start_col}  AS start_time,
+                {self._end_col}    AS end_time,
+                {self._record_col} AS record_json
+            FROM {self._table} WITH (NOLOCK)
+            WHERE {self._update_col} >= ?
+              AND {self._update_col} <= ?
+              AND {self._record_col} LIKE ?
+            ORDER BY {self._end_col} DESC
+            """
+            params = [start_time, end_time, f"%{tray_id}%"]
+
+        rows = await self._conn.query_rows(
+            query, params, query_name="ccu.fetch_tray_cells"
+        )
+        return self._parse_tray_cells_rows(rows, tray_id)
+
+    def _parse_tray_cells_rows(
+        self,
+        rows: list[dict[str, Any]],
+        target_tray_id: str,
+    ) -> list[dict[str, str | None]]:
+        out: list[dict[str, str | None]] = []
+        seen: set[str] = set()
+        target_upper = target_tray_id.upper()
+
+        for row in rows:
+            fields = _parse_record_json(str(row.get("record_json") or ""))
+
+            # Verify this row belongs to our target tray
+            tray_in_record = fields.get(self._tray_key, "").strip().upper()
+            if tray_in_record != target_upper:
                 continue
-            lot_value = row.get("lot_no")
-            cell_id = str(lot_value).strip() if lot_value is not None else ""
+
+            lot = (
+                fields.get("LOT_NO", "").strip()
+                or str(row.get("lot_no") or "").strip()
+            )
+            pos_raw = fields.get(self._pos_key, "")
+            pos: int | None = None
+            if pos_raw:
+                try:
+                    pos = int(float(pos_raw))
+                except (ValueError, TypeError):
+                    pass
+
+            key = f"{lot}|{pos}"
+            if key in seen:
+                continue
+            seen.add(key)
+
             start_dt = _coerce_datetime(row.get("start_time"))
             end_dt = _coerce_datetime(row.get("end_time"))
-            start_iso = start_dt.isoformat(sep=" ", timespec="seconds") if start_dt else None
-            end_iso = end_dt.isoformat(sep=" ", timespec="seconds") if end_dt else None
-            dedup_key = (cell_id, start_iso, end_iso)
-            if dedup_key in seen:
-                continue
-            seen.add(dedup_key)
-            out.append(
-                {
-                    "cell_id": cell_id,
-                    "start_time": start_iso,
-                    "end_time": end_iso,
-                }
-            )
 
-        out.sort(key=lambda item: (item.get("start_time") or "", item.get("cell_id") or ""))
-        if out:
-            self._replace_cached_cells_for_tray(wanted, out)
-        log.info(
-            "CCU tray detail fetch tray_id=%s cells=%s raw_rows=%s start_time=%s end_time=%s",
-            wanted,
-            len(out),
-            len(rows),
-            start_time.isoformat(),
-            end_time.isoformat(),
-        )
+            out.append({
+                "cell_id": lot,
+                "position": str(pos) if pos is not None else None,
+                "start_time": (
+                    start_dt.isoformat(sep=" ", timespec="seconds")
+                    if start_dt else None
+                ),
+                "end_time": (
+                    end_dt.isoformat(sep=" ", timespec="seconds")
+                    if end_dt else None
+                ),
+            })
+
         return out
 
     async def fetch_cell_owner(
@@ -566,806 +947,346 @@ class CcuRepo:
         start_time: datetime,
         end_time: datetime,
     ) -> dict[str, str | None] | None:
-        wanted_cell = str(cell_id).strip().upper()
-        if not wanted_cell:
+        wanted = cell_id.strip().upper()
+        if not wanted:
             return None
-        cached_owner = self._cell_owner_cache.get(wanted_cell)
-        if cached_owner is not None:
-            log.info("CCU cell owner lookup cache hit cell_id=%s tray_id=%s", wanted_cell, cached_owner.get("tray_id"))
-            return dict(cached_owner)
-        if settings.sql_driver.strip().lower() == "sql server":
-            log.warning(
-                "CCU cell owner lookup skipped cell_id=%s reason=legacy-driver-no-cache",
-                wanted_cell,
-            )
-            return None
-        query = (
-            "SELECT TOP 400 "
-            f"{self._lot_col} AS lot_no, "
-            f"{self._start_col} AS start_time, "
-            f"{self._end_col} AS end_time, "
-            f"{self._record_col} AS record_json "
-            f" FROM {self._table} "
-            "WHERE ("
-            f"({self._end_col} IS NOT NULL AND {self._end_col} >= ? AND {self._end_col} <= ?) "
-            "OR "
-            f"({self._end_col} IS NULL AND {self._start_col} >= ? AND {self._start_col} <= ?)"
-            ") "
-            "AND UPPER(CAST(lot_no AS NVARCHAR(128))) = ? "
-            "ORDER BY COALESCE(end_time, start_time) DESC"
-        )
+
+        cache_key = f"{wanted}:{end_time.strftime('%Y%m%d')}"
+        cached = self._cell_owner_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
+        query = f"""
+        SELECT TOP 1
+            {self._lot_col}    AS lot_no,
+            {self._start_col}  AS start_time,
+            {self._end_col}    AS end_time,
+            {self._record_col} AS record_json
+        FROM {self._table} WITH (NOLOCK)
+        WHERE {self._update_col} >= ?
+          AND {self._update_col} <= ?
+          AND UPPER({self._lot_col}) = ?
+        ORDER BY COALESCE({self._end_col}, {self._start_col}) DESC
+        """
         rows = await self._conn.query_rows(
             query,
-            [start_time, end_time, start_time, end_time, wanted_cell],
+            [start_time, end_time, wanted],
             query_name="ccu.fetch_cell_owner",
         )
         if not rows:
-            log.info(
-                "CCU cell owner lookup empty cell_id=%s start_time=%s end_time=%s",
-                wanted_cell,
-                start_time.isoformat(),
-                end_time.isoformat(),
-            )
             return None
 
-        for row in rows:
-            raw_json = row.get("record_json")
-            parsed_json = _parse_json(raw_json)
-            raw_text = _stringify_record_json(raw_json, parsed_json)
-            tray_key, _ = _extract_tray_id_key(
-                parsed_json=parsed_json,
-                raw_text=raw_text,
-                primary_key=self._tray_key,
-                fallback_keys=("TRAY_ID", "TRAYBARCODE", "TRAY_BARCODE"),
-            )
-            if not tray_key:
-                continue
-            start_dt = _coerce_datetime(row.get("start_time"))
-            end_dt = _coerce_datetime(row.get("end_time"))
-            result = {
-                "cell_id": wanted_cell,
-                "tray_id": tray_key,
-                "start_time": start_dt.isoformat(sep=" ", timespec="seconds") if start_dt else None,
-                "end_time": end_dt.isoformat(sep=" ", timespec="seconds") if end_dt else None,
-            }
-            self._cache_cell_owner(
-                cell_id=wanted_cell,
-                tray_id=tray_key,
-                start_time=start_dt,
-                end_time=end_dt,
-            )
-            log.info(
-                "CCU cell owner lookup hit cell_id=%s tray_id=%s start_time=%s end_time=%s",
-                wanted_cell,
-                tray_key,
-                result["start_time"],
-                result["end_time"],
-            )
-            return result
+        row = rows[0]
+        fields = _parse_record_json(str(row.get("record_json") or ""))
+        tray_raw = fields.get(self._tray_key, "").strip()
+        tray_id = tray_raw.upper()
+        if not tray_raw or not _is_valid_tray_id(tray_id):
+            return None
 
-        log.info(
-            "CCU cell owner lookup unresolved tray_id cell_id=%s scanned_rows=%s",
-            wanted_cell,
-            len(rows),
-        )
-        return None
+        start_dt = _coerce_datetime(row.get("start_time"))
+        end_dt = _coerce_datetime(row.get("end_time"))
 
-    async def _fetch_range(self, start_time: datetime, end_time: datetime) -> list[dict[str, Any]]:
-        return await self._range_cache.fetch(
-            start_time=start_time,
-            end_time=end_time,
-            fetch_uncached=self._fetch_range_uncached,
-        )
+        result = {
+            "cell_id": wanted,
+            "tray_id": tray_id,
+            "start_time": (
+                start_dt.isoformat(sep=" ", timespec="seconds") if start_dt else None
+            ),
+            "end_time": (
+                end_dt.isoformat(sep=" ", timespec="seconds") if end_dt else None
+            ),
+        }
+        self._cell_owner_cache.set(cache_key, result)
+        return result
 
-    async def _fetch_range_uncached(self, start_time: datetime, end_time: datetime) -> list[dict[str, Any]]:
-        rows = await self._fetch_batch(
-            start_time=start_time,
-            end_time=end_time,
-            offset=0,
-            query_name="ccu.window_fetch_batch",
-        )
-        log.debug("CCU fetch range rows=%s start_time=%s end_time=%s", len(rows), start_time.isoformat(), end_time.isoformat())
-        return rows
-
-    async def _fetch_batch(
+    async def _fetch_range(
         self,
-        *,
         start_time: datetime,
         end_time: datetime,
-        offset: int,
-        query_name: str = "ccu.fetch_batch",
     ) -> list[dict[str, Any]]:
-        if offset > 0:
-            # SQL is already deduped to one tray-bearing row per LOT_NO for this window.
-            return []
-        marker_filter = " OR ".join(f"{self._record_col} LIKE ?" for _ in self._sql_tray_markers)
-        query = (
-            "WITH cte AS ("
-            "SELECT "
-            f"{self._lot_col} AS lot_no, "
-            f"{self._start_col} AS start_time, "
-            f"{self._end_col} AS end_time, "
-            f"{self._record_col} AS record_json, "
-            f"{self._update_col} AS update_time, "
-            "ROW_NUMBER() OVER (PARTITION BY "
-            f"{self._lot_col} ORDER BY {self._update_col} DESC, {self._start_col} DESC, {self._end_col} DESC) AS rn "
-            f"FROM {self._table} "
-            f"WHERE {self._update_col} >= ? AND {self._update_col} <= ? "
-            f"AND ({marker_filter})"
-            ") "
-            "SELECT lot_no, start_time, end_time, record_json, update_time "
-            "FROM cte WHERE rn = 1 "
-            "ORDER BY update_time ASC, lot_no ASC, start_time ASC, end_time ASC"
-        )
-        params: list[Any] = [
-            start_time,
-            end_time,
-            *self._sql_tray_markers,
-        ]
-        return await self._conn.query_rows(query, params, query_name=query_name)
+        """Offset-based paginated range fetch for initial/delta loads."""
+        batch_size = max(1, int(settings.max_fetch_batch))
+        offset = 0
+        pages = 0
+        rows_desc: list[dict[str, Any]] = []
 
-    def _rows_to_signals(self, rows: list[dict[str, Any]]) -> list[TraySignal]:
-        per_tray: dict[str, dict[str, Any]] = {}
-        skipped_no_time = 0
-        skipped_bad_json = 0
-        skipped_no_token = 0
-        skipped_no_tray = 0
-        missing_lot_rows = 0
-        parsed_from_text = 0
-        tray_from_token = 0
+        paged_query = f"""
+        SELECT
+            {self._lot_col}    AS lot_no,
+            {self._start_col}  AS start_time,
+            {self._end_col}    AS end_time,
+            {self._record_col} AS record_json,
+            {self._update_col} AS update_time
+        FROM {self._table} WITH (NOLOCK)
+        WHERE {self._update_col} >= ?
+          AND {self._update_col} <= ?
+          AND {self._record_col} IS NOT NULL
+          AND LEN({self._record_col}) > 10
+        ORDER BY
+            {self._update_col} DESC,
+            {self._lot_col} DESC,
+            {self._start_col} DESC,
+            {self._end_col} DESC
+        OFFSET ? ROWS
+        FETCH NEXT {batch_size} ROWS ONLY
+        """
 
-        for row in rows:
-            start_time = _coerce_datetime(row.get("start_time"))
-            end_time = _coerce_datetime(row.get("end_time"))
-            collected_time = end_time or start_time
-            if collected_time is None:
-                skipped_no_time += 1
-                continue
-
-            raw_json = row.get("record_json")
-            raw_text = _stringify_record_json(raw_json, None)
-            token = _extract_token(raw_text)
-            lot_value = row.get("lot_no")
-            lot_no = str(lot_value).strip() if lot_value is not None else ""
-            if token is None and lot_no:
-                token = _extract_token(lot_no)
-            if self._keyword:
-                if token is None:
-                    skipped_no_token += 1
-                    continue
-                searchable = f"{raw_text} {lot_no} {token or ''}".upper()
-                if self._keyword not in searchable:
-                    skipped_no_token += 1
-                    continue
-
-            tray_key = ""
-            tray_source = ""
-            tray_text_direct = _find_text_value(raw_text, self._tray_key)
-            if tray_text_direct is not None:
-                tray_key = _normalize_tray_id(tray_text_direct)
-                if not _is_plausible_tray_id(tray_key):
-                    tray_key = ""
-            if not tray_key:
-                for key_name in ("TRAY_ID", "TRAYBARCODE", "TRAY_BARCODE"):
-                    value = _find_text_value(raw_text, key_name)
-                    if value is None:
-                        continue
-                    candidate = _normalize_tray_id(value)
-                    if _is_plausible_tray_id(candidate):
-                        tray_key = candidate
-                        tray_source = "text"
-                        break
-            if tray_key and not tray_source:
-                tray_source = "text"
-            parsed_json = None
-            if not tray_key:
-                parsed_json = _parse_json(raw_json)
-                if parsed_json is None:
-                    skipped_bad_json += 1
-                tray_key, tray_source = _extract_tray_id_key(
-                    parsed_json=parsed_json,
-                    raw_text=raw_text,
-                    primary_key=self._tray_key,
-                    fallback_keys=("TRAY_ID", "TRAYBARCODE", "TRAY_BARCODE"),
-                )
-            if not tray_key:
-                skipped_no_tray += 1
-                continue
-            if tray_source in {"text", "marker"}:
-                parsed_from_text += 1
-            if tray_source == "token":
-                tray_from_token += 1
-
-            if not lot_no:
-                missing_lot_rows += 1
-            self._cache_cell_row(
-                tray_key=tray_key,
-                lot_no=lot_no,
-                start_time=start_time,
-                end_time=end_time,
-            )
-
-            stat = per_tray.get(tray_key)
-            if stat is None:
-                stat = {
-                    "quantity": 0,
-                    "seen_lots": set(),
-                    "start_at_pos_1": None,
-                    "end_at_pos_400": None,
-                    "min_pos": None,
-                    "max_pos": None,
-                    "start_at_min_pos": None,
-                    "end_at_max_pos": None,
-                    "first_start_time": None,
-                    "last_end_time": None,
-                    "latest_signal_time": collected_time,
-                    "latest_lot_no": lot_no or None,
-                    "record_token": token,
-                }
-                per_tray[tray_key] = stat
-
-            if lot_no:
-                seen_lots = stat["seen_lots"]
-                if lot_no not in seen_lots:
-                    seen_lots.add(lot_no)
-                    stat["quantity"] += 1
-            else:
-                stat["quantity"] += 1
-            if lot_no:
-                stat["latest_lot_no"] = lot_no
-            if token:
-                stat["record_token"] = token
-
-            pos_raw = _find_text_value(raw_text, self._pos_key)
-            if pos_raw is None:
-                pos_raw = _find_text_value(raw_text, "TRAY_POS")
-            if pos_raw is None:
-                if parsed_json is None:
-                    parsed_json = _parse_json(raw_json)
-                    if parsed_json is None:
-                        skipped_bad_json += 1
-                pos_raw = _find_json_value(parsed_json, self._pos_key)
-            pos_value = _to_int(pos_raw)
-            if pos_value is not None:
-                # Business rule: start prefers position #1; fallback is minimum position.
-                if pos_value == 1:
-                    candidate_start = start_time or collected_time
-                    existing_start = stat["start_at_pos_1"]
-                    if candidate_start is not None and (
-                        existing_start is None or candidate_start < existing_start
-                    ):
-                        stat["start_at_pos_1"] = candidate_start
-                # Business rule: end prefers position #400; fallback is maximum position.
-                if pos_value == 400:
-                    candidate_end = end_time or collected_time
-                    existing_end = stat["end_at_pos_400"]
-                    if candidate_end is not None and (
-                        existing_end is None or candidate_end > existing_end
-                    ):
-                        stat["end_at_pos_400"] = candidate_end
-                current_min = stat["min_pos"]
-                current_max = stat["max_pos"]
-                if current_min is None or pos_value < current_min:
-                    stat["min_pos"] = pos_value
-                    stat["start_at_min_pos"] = start_time or collected_time
-                if current_max is None or pos_value > current_max:
-                    stat["max_pos"] = pos_value
-                    stat["end_at_max_pos"] = end_time or collected_time
-
-            if start_time is not None:
-                first_start = stat["first_start_time"]
-                if first_start is None or start_time < first_start:
-                    stat["first_start_time"] = start_time
-            if end_time is not None:
-                last_end = stat["last_end_time"]
-                if last_end is None or end_time > last_end:
-                    stat["last_end_time"] = end_time
-            if collected_time > stat["latest_signal_time"]:
-                stat["latest_signal_time"] = collected_time
-
-        out: list[TraySignal] = []
-        for tray_text, stat in per_tray.items():
-            start_dt = stat["start_at_pos_1"] or stat["start_at_min_pos"] or stat["first_start_time"]
-            end_dt = (
-                stat["end_at_pos_400"]
-                or stat["end_at_max_pos"]
-                or stat["last_end_time"]
-                or stat["latest_signal_time"]
-            )
-            payload = {
-                "lot_no": stat["latest_lot_no"],
-                "quantity": stat["quantity"],
-                "start_time": start_dt.isoformat() if start_dt is not None else None,
-                "end_time": end_dt.isoformat() if end_dt is not None else None,
-                "min_position": stat["min_pos"],
-                "max_position": stat["max_pos"],
-                "record_token": stat["record_token"],
-            }
-            out.append(
-                TraySignal(
-                    source=SignalSource.CCU,
-                    tray_id=TrayId(tray_text),
-                    collected_time=stat["latest_signal_time"],
-                    payload=payload,
-                )
-            )
-
-        out.sort(key=lambda item: (item.collected_time, str(item.tray_id)))
-        log_level = log.warning if rows and not out else log.debug
-        log_level(
-            "CCU convert rows done input=%s output=%s skipped_no_time=%s skipped_bad_json=%s skipped_no_token=%s skipped_no_tray=%s missing_lot_rows=%s parsed_from_text=%s tray_from_token=%s keyword=%s",
-            len(rows),
-            len(out),
-            skipped_no_time,
-            skipped_bad_json,
-            skipped_no_token,
-            skipped_no_tray,
-            missing_lot_rows,
-            parsed_from_text,
-            tray_from_token,
-            self._keyword or "<none>",
-        )
-        return out
-
-    def _cache_cell_row(
-        self,
-        *,
-        tray_key: str,
-        lot_no: str,
-        start_time: datetime | None,
-        end_time: datetime | None,
-    ) -> None:
-        if not tray_key or not lot_no:
-            return
-        start_iso = start_time.isoformat(sep=" ", timespec="seconds") if start_time else None
-        end_iso = end_time.isoformat(sep=" ", timespec="seconds") if end_time else None
-        dedup_key = (lot_no, start_iso, end_iso)
-
-        if tray_key not in self._tray_cells_cache:
-            if len(self._tray_cells_cache) >= self._tray_cells_cache_max_trays:
-                oldest_tray = next(iter(self._tray_cells_cache))
-                self._tray_cells_cache.pop(oldest_tray, None)
-                self._tray_cells_cache_keys.pop(oldest_tray, None)
-            self._tray_cells_cache[tray_key] = []
-            self._tray_cells_cache_keys[tray_key] = set()
-
-        keys = self._tray_cells_cache_keys[tray_key]
-        if dedup_key in keys:
-            return
-        rows = self._tray_cells_cache[tray_key]
-        rows.append({"cell_id": lot_no, "start_time": start_iso, "end_time": end_iso})
-        keys.add(dedup_key)
-
-        if len(rows) > self._tray_cells_max_rows_per_tray:
-            removed = rows.pop(0)
-            removed_key = (
-                str(removed.get("cell_id") or ""),
-                removed.get("start_time"),
-                removed.get("end_time"),
-            )
-            keys.discard(removed_key)
-        self._cache_cell_owner(
-            cell_id=lot_no,
-            tray_id=tray_key,
-            start_time=start_time,
-            end_time=end_time,
-        )
-
-    def _cache_cell_owner(
-        self,
-        *,
-        cell_id: str,
-        tray_id: str,
-        start_time: datetime | None,
-        end_time: datetime | None,
-    ) -> None:
-        cell_key = str(cell_id).strip().upper()
-        tray_key = str(tray_id).strip()
-        if not cell_key or not tray_key:
-            return
-        signal_time = end_time or start_time
-        if signal_time is None:
-            signal_time = datetime.min
-        prev_time = self._cell_owner_cache_times.get(cell_key)
-        if prev_time is not None and prev_time > signal_time:
-            return
-        owner = {
-            "cell_id": cell_key,
-            "tray_id": tray_key,
-            "start_time": start_time.isoformat(sep=" ", timespec="seconds") if start_time else None,
-            "end_time": end_time.isoformat(sep=" ", timespec="seconds") if end_time else None,
-        }
-        if cell_key in self._cell_owner_cache:
-            self._cell_owner_cache.pop(cell_key, None)
-            self._cell_owner_cache_times.pop(cell_key, None)
-        self._cell_owner_cache[cell_key] = owner
-        self._cell_owner_cache_times[cell_key] = signal_time
-        overflow = len(self._cell_owner_cache) - self._cell_owner_cache_max_entries
-        if overflow > 0:
-            stale_keys = list(self._cell_owner_cache.keys())[:overflow]
-            for stale_key in stale_keys:
-                self._cell_owner_cache.pop(stale_key, None)
-                self._cell_owner_cache_times.pop(stale_key, None)
-
-    def _replace_cached_cells_for_tray(self, tray_key: str, rows: list[dict[str, str | None]]) -> None:
-        keys: set[tuple[str, str | None, str | None]] = set()
-        dedup_rows: list[dict[str, str | None]] = []
-        for row in rows:
-            dedup_key = (
-                str(row.get("cell_id") or ""),
-                row.get("start_time"),
-                row.get("end_time"),
-            )
-            if dedup_key in keys:
-                continue
-            keys.add(dedup_key)
-            dedup_rows.append(
-                {
-                    "cell_id": dedup_key[0],
-                    "start_time": dedup_key[1],
-                    "end_time": dedup_key[2],
-                }
-            )
-            if len(dedup_rows) >= self._tray_cells_max_rows_per_tray:
-                break
-        self._tray_cells_cache[tray_key] = dedup_rows
-        self._tray_cells_cache_keys[tray_key] = keys
-
-    def _get_cached_cells_for_tray(self, tray_key: str) -> list[dict[str, str | None]] | None:
-        rows = self._tray_cells_cache.get(tray_key)
-        if rows is None:
-            return None
-        out = [dict(item) for item in rows]
-        out.sort(key=lambda item: (item.get("start_time") or "", item.get("cell_id") or ""))
-        return out
-
-
-def _parse_json(value: Any) -> Any | None:
-    if isinstance(value, (dict, list)):
-        return value
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    if isinstance(parsed, str):
-        nested = parsed.strip()
-        if nested:
+        while True:
             try:
-                parsed_nested = json.loads(nested)
-                if isinstance(parsed_nested, (dict, list)):
-                    return parsed_nested
-            except json.JSONDecodeError:
-                return None
-    if isinstance(parsed, (dict, list)):
-        return parsed
-    return None
+                chunk = await self._conn.query_rows(
+                    paged_query,
+                    [start_time, end_time, offset],
+                    query_name="ccu.fetch_range",
+                )
+            except Exception as exc:
+                message = str(exc).lower()
+                if offset == 0 and ("offset" in message or "fetch" in message):
+                    legacy_query = f"""
+                    SELECT
+                        lot_no, start_time, end_time, record_json, update_time
+                    FROM (
+                        SELECT TOP {batch_size}
+                            {self._lot_col}    AS lot_no,
+                            {self._start_col}  AS start_time,
+                            {self._end_col}    AS end_time,
+                            {self._record_col} AS record_json,
+                            {self._update_col} AS update_time
+                        FROM {self._table} WITH (NOLOCK)
+                        WHERE {self._update_col} >= ?
+                          AND {self._update_col} <= ?
+                          AND {self._record_col} IS NOT NULL
+                          AND LEN({self._record_col}) > 10
+                        ORDER BY {self._update_col} DESC
+                    ) AS recent
+                    ORDER BY update_time ASC
+                    """
+                    log.warning(
+                        "CCU fetch_range paging unsupported, fallback max_rows=%s",
+                        batch_size,
+                    )
+                    return await self._conn.query_rows(
+                        legacy_query,
+                        [start_time, end_time],
+                        query_name="ccu.fetch_range",
+                    )
+                raise
 
+            if not chunk:
+                break
 
-def _extract_token(text: str) -> str | None:
-    match = _TOKEN_PATTERN.search(text)
-    if not match:
-        return None
-    return match.group(0).upper()
+            rows_desc.extend(chunk)
+            pages += 1
 
+            if len(chunk) < batch_size:
+                break
 
-def _find_json_value(obj: Any, target_key: str) -> Any | None:
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if str(key).upper() == target_key.upper():
-                return value
-        for value in obj.values():
-            found = _find_json_value(value, target_key)
-            if found is not None:
-                return found
-        return None
-    if isinstance(obj, list):
-        for value in obj:
-            found = _find_json_value(value, target_key)
-            if found is not None:
-                return found
-    return None
+            offset += batch_size
 
+        if pages > 1:
+            log.info(
+                "CCU fetch range paged pages=%s raw_rows=%s batch_size=%s",
+                pages,
+                len(rows_desc),
+                batch_size,
+            )
 
-def _to_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    try:
-        return int(str(value).strip())
-    except Exception:  # noqa: BLE001
-        return None
+        rows_desc.reverse()
+        return rows_desc
 
+    async def _fetch_by_tray_ids_batch(
+        self,
+        tray_ids: list[str],
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        """
+        Fetch rows for a batch of tray IDs using the configured strategy.
+        """
+        if not tray_ids:
+            return []
 
-def _build_sql_marker_patterns(primary_key: str, *, fallback_keys: tuple[str, ...]) -> tuple[str, ...]:
-    keys = [primary_key, *fallback_keys]
-    out: list[str] = []
-    seen: set[str] = set()
-    for key in keys:
-        normalized = str(key).strip()
-        if not normalized:
-            continue
-        upper = normalized.upper()
-        if upper in seen:
-            continue
-        seen.add(upper)
-        out.append(f"%{normalized}%")
-    return tuple(out)
+        if self._lookup_strategy == TrayLookupStrategy.JSON_VALUE:
+            return await self._fetch_by_tray_json_value(
+                tray_ids, start_time, end_time
+            )
+        elif self._lookup_strategy == TrayLookupStrategy.INDEXED_COLUMN:
+            return await self._fetch_by_tray_column(
+                tray_ids, start_time, end_time
+            )
+        else:
+            return await self._fetch_by_tray_like(
+                tray_ids, start_time, end_time
+            )
 
+    async def _fetch_by_tray_json_value(
+        self,
+        tray_ids: list[str],
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        """
+        Backfill lookup using JSON_VALUE() extraction.
+        Precise and efficient for small batches.
+        """
+        all_rows: list[dict[str, Any]] = []
+        backfill_batch = min(5000, settings.max_fetch_batch)
 
-def _stringify_record_json(raw_json: Any, parsed_json: Any | None) -> str:
-    if isinstance(raw_json, str):
-        return raw_json
-    if parsed_json is not None:
-        try:
-            return json.dumps(parsed_json, ensure_ascii=True)
-        except Exception:  # noqa: BLE001
-            return str(raw_json)
-    if raw_json is None:
-        return ""
-    return str(raw_json)
+        for chunk in _chunked(tray_ids, 20):
+            # Build OR conditions for JSON_VALUE matches
+            json_conditions = " OR ".join(
+                f"JSON_VALUE({self._record_col}, '{self._json_tray_path}') = ?"
+                for _ in chunk
+            )
+            query = f"""
+            SELECT TOP {backfill_batch}
+                {self._lot_col}    AS lot_no,
+                {self._start_col}  AS start_time,
+                {self._end_col}    AS end_time,
+                {self._record_col} AS record_json,
+                {self._update_col} AS update_time
+            FROM {self._table} WITH (NOLOCK)
+            WHERE {self._update_col} >= ?
+              AND {self._update_col} <= ?
+              AND ({json_conditions})
+            ORDER BY {self._update_col} DESC
+            """
+            try:
+                rows = await self._conn.query_rows(
+                    query,
+                    [start_time, end_time, *chunk],
+                    query_name="ccu.backfill_json_value",
+                )
+                all_rows.extend(rows)
+                log.debug(
+                    "CCU backfill JSON_VALUE rows=%s chunk_size=%s",
+                    len(rows), len(chunk),
+                )
+            except Exception as exc:
+                log.warning(
+                    "CCU backfill JSON_VALUE failed chunk=%s error=%r, "
+                    "falling back to LIKE for this chunk",
+                    chunk, exc,
+                )
+                # Per-chunk fallback to LIKE
+                fallback_rows = await self._fetch_by_tray_like(
+                    chunk, start_time, end_time
+                )
+                all_rows.extend(fallback_rows)
 
+        return all_rows
 
-def _find_text_value(text: str, target_key: str) -> str | None:
-    if not text:
-        return None
-    key = re.escape(target_key)
-    patterns = (
-        r'["\']?' + key + r'["\']?\s*[:=]\s*["\']?([^,"\'\}\]\s]+)',
-        key + r"\s*[:=]\s*([^,;\s]+)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
-            continue
-        value = match.group(1).strip().strip("\"'")
-        if value:
-            return value
-    return None
+    async def _fetch_by_tray_column(
+        self,
+        tray_ids: list[str],
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        """
+        Fast backfill lookup using indexed computed column.
+        Only used if DBA has created a computed column like:
+          ALTER TABLE TT_WO_RPARAM_RECORD_CCU
+          ADD TRAY_ID AS JSON_VALUE(RECORD_JSON, '$.TRAYID.paramValue');
+        """
+        all_rows: list[dict[str, Any]] = []
+        backfill_batch = min(5000, settings.max_fetch_batch)
 
+        for chunk in _chunked(tray_ids, 50):
+            placeholders = ", ".join("?" for _ in chunk)
+            query = f"""
+            SELECT TOP {backfill_batch}
+                {self._lot_col}    AS lot_no,
+                {self._start_col}  AS start_time,
+                {self._end_col}    AS end_time,
+                {self._record_col} AS record_json,
+                {self._update_col} AS update_time
+            FROM {self._table} WITH (NOLOCK)
+            WHERE {self._update_col} >= ?
+              AND {self._update_col} <= ?
+              AND {self._tray_id_col_quoted} IN ({placeholders})
+            ORDER BY {self._update_col} DESC
+            """
+            try:
+                rows = await self._conn.query_rows(
+                    query,
+                    [start_time, end_time, *chunk],
+                    query_name="ccu.backfill_indexed",
+                )
+                all_rows.extend(rows)
+            except Exception as exc:
+                log.warning(
+                    "CCU backfill indexed-column failed chunk=%s error=%r",
+                    chunk, exc,
+                )
 
-def _coerce_datetime(value: Any) -> datetime | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value
-        return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return all_rows
 
-    text = str(value).strip()
-    if not text:
-        return None
-    normalized = text.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(normalized)
-        if parsed.tzinfo is not None:
-            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
-        return parsed
-    except ValueError:
-        pass
+    async def _fetch_by_tray_like(
+        self,
+        tray_ids: list[str],
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        """
+        Slow fallback: RECORD_JSON LIKE '%tray_id%' full-table scan.
+        Only used when other strategies fail or are explicitly configured.
+        """
+        all_rows: list[dict[str, Any]] = []
+        backfill_batch = min(5000, settings.max_fetch_batch)
 
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S.%f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y-%m-%d",
-    ):
-        try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-    return None
+        for mini_batch in _chunked(tray_ids, 10):
+            like_clause = " OR ".join(
+                f"{self._record_col} LIKE ?" for _ in mini_batch
+            )
+            like_params = [f"%{t}%" for t in mini_batch]
+            query = f"""
+            SELECT TOP {backfill_batch}
+                {self._lot_col}    AS lot_no,
+                {self._start_col}  AS start_time,
+                {self._end_col}    AS end_time,
+                {self._record_col} AS record_json,
+                {self._update_col} AS update_time
+            FROM {self._table} WITH (NOLOCK)
+            WHERE {self._update_col} >= ?
+              AND {self._update_col} <= ?
+              AND ({like_clause})
+            ORDER BY {self._update_col} DESC
+            """
+            try:
+                rows = await self._conn.query_rows(
+                    query,
+                    [start_time, end_time, *like_params],
+                    query_name="ccu.backfill_like",
+                )
+                all_rows.extend(rows)
+            except Exception:
+                log.warning(
+                    "CCU backfill LIKE scan failed tray_ids=%s, skipping",
+                    mini_batch,
+                )
 
+        return all_rows
 
-def _normalize_tray_id(raw_value: str) -> str:
-    text = raw_value.strip().strip("\"'[]()")
-    if not text:
-        return ""
-    # Keep only alphanumeric to align CCU/FPC barcode variants
-    normalized = re.sub(r"[^A-Za-z0-9]", "", text).upper()
-    return normalized
+    async def _parse_rows_parallel(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> list[TraySignal]:
+        if not rows:
+            return []
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _get_parse_executor(),
+            _parse_ccu_rows_sync,
+            rows,
+            self._tray_key,
+            self._pos_key,
+            self._keyword,
+        )
 
-
-def _tray_like_patterns(raw_value: str) -> list[str]:
-    normalized = _normalize_tray_id(raw_value)
-    if not normalized:
-        return []
-    # Keep exact and flexible patterns so we can match barcode variants with separators.
-    exact = f"%{normalized}%"
-    flexible = "%" + "%".join(normalized) + "%"
-    if flexible == exact:
-        return [exact]
-    return [exact, flexible]
-
-
-def _extract_tray_id_key(
-    *,
-    parsed_json: Any | None,
-    raw_text: str,
-    primary_key: str,
-    fallback_keys: tuple[str, ...],
-) -> tuple[str, str]:
-    # 1) JSON key first
-    json_value = _find_json_value(parsed_json, primary_key)
-    if json_value is not None:
-        key = _normalize_tray_id(str(json_value))
-        if _is_plausible_tray_id(key):
-            return key, "json"
-
-    # 2) Text key matches
-    for key_name in (primary_key, *fallback_keys):
-        text_value = _find_text_value(raw_text, key_name)
-        if text_value is None:
-            continue
-        key = _normalize_tray_id(text_value)
-        if _is_plausible_tray_id(key):
-            return key, "text"
-
-    # 3) Marker-based value in flattened payloads
-    marker_value = _extract_after_markers(raw_text, ("COLLECTPARAMVALUE", "PARAMVALUE", "PARAMRESULT"))
-    if marker_value is not None:
-        key = _normalize_tray_id(marker_value)
-        if _is_plausible_tray_id(key):
-            return key, "marker"
-
-    # 4) Fallback token pattern
-    token = _extract_token(raw_text)
-    if token is not None:
-        key = _normalize_tray_id(token)
-        if _is_plausible_tray_id(key):
-            return key, "token"
-
-    return "", ""
-
-
-def _extract_after_markers(text: str, markers: tuple[str, ...]) -> str | None:
-    upper_text = text.upper()
-    for marker in markers:
-        idx = upper_text.find(marker)
-        if idx < 0:
-            continue
-        segment = text[idx + len(marker) :]
-        token = _extract_token(segment)
-        if token:
-            return token
-    return None
-
-
-def _is_plausible_tray_id(value: str) -> bool:
-    if not value:
-        return False
-    if len(value) < 6 or len(value) > 40:
-        return False
-    if not any(ch.isdigit() for ch in value):
-        return False
-    bad_prefixes = (
-        "FIELDNAME",
-        "PARAMNAME",
-        "MAXVALUE",
-        "STDVALUE",
-        "WIPID",
-        "MINVALUE",
-        "LINENO",
-        "RECORDTIME",
-        "CREATEUSER",
-        "CREATEDATE",
-        "COLLECTPARAMVALUE",
-    )
-    return not value.startswith(bad_prefixes)
-
-
-def _collect_latest_by_tray_from_rows(
-    *,
-    rows: list[dict[str, Any]],
-    wanted: set[str],
-    latest_by_tray: dict[str, TraySignal],
-    row_parser,
-) -> None:
-    if not rows or not wanted:
-        return
-    for signal in row_parser(rows):
-        tray_key = str(signal.tray_id)
-        if tray_key not in wanted:
-            continue
-        previous = latest_by_tray.get(tray_key)
-        if previous is None or signal.collected_time >= previous.collected_time:
-            latest_by_tray[tray_key] = signal
-
-
-def _chunked(values: list[str], chunk_size: int) -> list[list[str]]:
-    if chunk_size <= 0:
-        return [values]
-    out: list[list[str]] = []
-    for i in range(0, len(values), chunk_size):
-        out.append(values[i : i + chunk_size])
-    return out
-
-
-def _match_latest_signals_to_tray_ids(
-    *,
-    signals: list[TraySignal],
-    tray_ids: set[str],
-) -> dict[str, TraySignal]:
-    if not signals or not tray_ids:
-        return {}
-    wanted = sorted(tray_ids)
-    matched: dict[str, TraySignal] = {}
-    for signal in signals:
-        signal_tray_id = str(signal.tray_id)
-        for wanted_tray_id in wanted:
-            if not _tray_ids_equivalent(signal_tray_id, wanted_tray_id):
-                continue
-            previous = matched.get(wanted_tray_id)
-            if previous is None or signal.collected_time >= previous.collected_time:
-                matched[wanted_tray_id] = signal
-    return matched
-
-
-def _tray_ids_equivalent(candidate: str, wanted: str) -> bool:
-    candidate_norm = _normalize_tray_id(candidate)
-    wanted_norm = _normalize_tray_id(wanted)
-    if not candidate_norm or not wanted_norm:
-        return False
-    if candidate_norm == wanted_norm:
-        return True
-    return (candidate_norm in wanted_norm) or (wanted_norm in candidate_norm)
-
-
-def _build_backfill_fallback_signal(*, tray_id: str, rows: list[dict[str, Any]]) -> TraySignal | None:
-    if not rows:
-        return None
-
-    latest_signal_time: datetime | None = None
-    first_start: datetime | None = None
-    last_end: datetime | None = None
-    latest_lot_no: str | None = None
-    record_token: str | None = None
-
-    for row in rows:
-        start_time = _coerce_datetime(row.get("start_time"))
-        end_time = _coerce_datetime(row.get("end_time"))
-        collected_time = end_time or start_time
-        if collected_time is not None and (latest_signal_time is None or collected_time > latest_signal_time):
-            latest_signal_time = collected_time
-        if start_time is not None and (first_start is None or start_time < first_start):
-            first_start = start_time
-        if end_time is not None and (last_end is None or end_time > last_end):
-            last_end = end_time
-
-        lot_value = row.get("lot_no")
-        lot_no = str(lot_value).strip() if lot_value is not None else ""
-        if lot_no:
-            latest_lot_no = lot_no
-        raw_json = row.get("record_json")
-        parsed_json = _parse_json(raw_json)
-        raw_text = _stringify_record_json(raw_json, parsed_json)
-        token = _extract_token(raw_text)
-        if token is None and lot_no:
-            token = _extract_token(lot_no)
-        if token:
-            record_token = token
-
-    if latest_signal_time is None:
-        return None
-
-    payload = {
-        "lot_no": latest_lot_no,
-        "quantity": None,
-        "start_time": first_start.isoformat() if first_start is not None else None,
-        "end_time": (last_end or latest_signal_time).isoformat(),
-        "min_position": None,
-        "max_position": None,
-        "record_token": record_token,
-        "matched_by": "targeted_fallback",
-    }
-    return TraySignal(
-        source=SignalSource.CCU,
-        tray_id=TrayId(_normalize_tray_id(tray_id) or tray_id.strip()),
-        collected_time=latest_signal_time,
-        payload=payload,
-    )
+    def cache_stats(self) -> dict[str, Any]:
+        return {
+            "tray_cells": self._tray_cells_cache.stats(),
+            "cell_owner": self._cell_owner_cache.stats(),
+            "known_trays": len(self._known_tray_data),
+            "lookup_strategy": self._lookup_strategy,
+            "json_tray_path": self._json_tray_path,
+        }

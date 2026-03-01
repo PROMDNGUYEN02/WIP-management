@@ -48,21 +48,22 @@ class SharedGroupingStateRepository:
         self._path = self._dir / file_name
         self._lock_path = self._path.with_suffix(f"{self._path.suffix}.lock")
 
-    async def load_manual_assignments(self) -> dict[str, tuple[str, str]]:
+    async def load_manual_assignments(self) -> dict[str, tuple[str, str, str]]:
         document = await asyncio.to_thread(self._read_document_sync)
         raw = document.get("manual_assignments")
         if not isinstance(raw, dict):
             return {}
-        out: dict[str, tuple[str, str]] = {}
+        out: dict[str, tuple[str, str, str]] = {}
         for tray_id, item in raw.items():
             if not isinstance(item, dict):
                 continue
             tray_key = str(tray_id).strip()
             column = str(item.get("column", "")).strip()
             trolley_id = str(item.get("trolley_id", "")).strip()
+            mode = str(item.get("mode", "manual")).strip().lower() or "manual"
             if not tray_key or not column or not trolley_id:
                 continue
-            out[tray_key] = (column, trolley_id)
+            out[tray_key] = (column, trolley_id, mode)
         return out
 
     async def load_projection(self) -> dict[str, Any]:
@@ -72,15 +73,16 @@ class SharedGroupingStateRepository:
             return {}
         return dict(raw)
 
-    async def set_manual_assignment(self, tray_id: str, column: str, trolley_id: str) -> None:
+    async def set_manual_assignment(self, tray_id: str, column: str, trolley_id: str, mode: str = "manual") -> None:
         tray_key = tray_id.strip()
         column_key = column.strip()
         trolley_key = trolley_id.strip()
+        mode_key = str(mode).strip().lower() or "manual"
         if not tray_key or not column_key or not trolley_key:
             raise ValueError("tray_id, column, trolley_id must not be empty")
         await asyncio.to_thread(
             self._update_document_sync,
-            _set_assignment_mutator(tray_key, column_key, trolley_key),
+            _set_assignment_mutator(tray_key, column_key, trolley_key, mode_key),
         )
 
     async def remove_manual_assignment(self, tray_id: str) -> None:
@@ -89,16 +91,17 @@ class SharedGroupingStateRepository:
             return
         await asyncio.to_thread(self._update_document_sync, _remove_assignment_mutator(tray_key))
 
-    async def replace_manual_assignments(self, assignments: dict[str, tuple[str, str]]) -> None:
-        sanitized: dict[str, tuple[str, str]] = {}
+    async def replace_manual_assignments(self, assignments: dict[str, tuple[str, str, str]]) -> None:
+        sanitized: dict[str, tuple[str, str, str]] = {}
         for tray_id, item in assignments.items():
             tray_key = str(tray_id).strip()
-            column, trolley_id = item
+            column, trolley_id, mode = item
             column_key = str(column).strip()
             trolley_key = str(trolley_id).strip()
+            mode_key = str(mode).strip().lower() or "manual"
             if not tray_key or not column_key or not trolley_key:
                 continue
-            sanitized[tray_key] = (column_key, trolley_key)
+            sanitized[tray_key] = (column_key, trolley_key, mode_key)
         await asyncio.to_thread(
             self._update_document_sync,
             _replace_assignments_mutator(sanitized),
@@ -163,11 +166,11 @@ def _empty_document() -> dict[str, Any]:
     return {"version": 1, "manual_assignments": {}, "last_projection": {}, "updated_at": None}
 
 
-def _set_assignment_mutator(tray_id: str, column: str, trolley_id: str):
+def _set_assignment_mutator(tray_id: str, column: str, trolley_id: str, mode: str = "manual"):
     def _mutate(document: dict[str, Any]) -> None:
         raw = document.get("manual_assignments")
         manual_assignments = raw if isinstance(raw, dict) else {}
-        manual_assignments[tray_id] = {"column": column, "trolley_id": trolley_id}
+        manual_assignments[tray_id] = {"column": column, "trolley_id": trolley_id, "mode": mode}
         document["manual_assignments"] = manual_assignments
 
     return _mutate
@@ -191,11 +194,11 @@ def _save_projection_mutator(projection: dict[str, Any]):
     return _mutate
 
 
-def _replace_assignments_mutator(assignments: dict[str, tuple[str, str]]):
+def _replace_assignments_mutator(assignments: dict[str, tuple[str, str, str]]):
     def _mutate(document: dict[str, Any]) -> None:
         manual_assignments: dict[str, dict[str, str]] = {}
-        for tray_id, (column, trolley_id) in assignments.items():
-            manual_assignments[tray_id] = {"column": column, "trolley_id": trolley_id}
+        for tray_id, (column, trolley_id, mode) in assignments.items():
+            manual_assignments[tray_id] = {"column": column, "trolley_id": trolley_id, "mode": mode}
         document["manual_assignments"] = manual_assignments
 
     return _mutate

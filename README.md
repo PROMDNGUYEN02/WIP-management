@@ -53,3 +53,8 @@ If connection fails with IM002:
 1. Check installed drivers:
    `venv\Scripts\python -c "import pyodbc; print(pyodbc.drivers())"`
 2. Set `SQL_DRIVER` in `.env` to one installed driver.
+
+Get-ChildItem -Recurse -Include __pycache__ | Remove-Item -Recurse -Force
+Get-ChildItem -Recurse -Include *.pyc | Remove-Item -Force
+
+tree .\wip_management /F /A > structure.txt

@@ -528,7 +528,7 @@ SELECT 1 AS ok;
             "ORDER BY open_time DESC; "
             "IF @session_id IS NULL "
             "BEGIN "
-            "SET @session_id = NEWSEQUENTIALID(); "
+            "SET @session_id = NEWID(); "
             f"INSERT INTO {self._session_table} "
             "(session_id, trolley_id, open_time, close_time, status, last_update_time) "
             "VALUES (@session_id, ?, SYSUTCDATETIME(), NULL, 'OPEN', SYSUTCDATETIME()); "

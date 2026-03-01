@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from wip_management.domain.models.tray import Tray
-from wip_management.domain.models.trolley import Column, Trolley
+from wip_management.domain.models.trolley import Column, Trolley, TrolleyMode
 from wip_management.domain.rules.grouping_rules import build_trolley_projection
 
 
@@ -22,7 +22,7 @@ class RecomputeProjectionUseCase:
         self,
         trays: list[Tray],
         *,
-        manual_assignments: dict[str, tuple[Column, str]] | None = None,
+        manual_assignments: dict[str, tuple[Column, str, TrolleyMode]] | None = None,
         max_per_trolley: int = 30,
         assembly_auto_trolley_count: int = 1,
         auto_group_enabled: bool = True,
