@@ -25,9 +25,9 @@ from PySide6.QtWidgets import (
 
 from wip_management.presentation.ui.theme import theme
 from wip_management.presentation.ui.components import (
-    AnimatedCard, IconButton, LoadingOverlay, MetricCard, SearchBar,
-    StatusBadge, toast_manager
+    AnimatedCard, IconButton, LoadingOverlay, MetricCard, SearchBar, StatusBadge
 )
+from wip_management.presentation.ui.notifications import toast_manager
 
 
 class TrolleyItemDelegate(QStyledItemDelegate):

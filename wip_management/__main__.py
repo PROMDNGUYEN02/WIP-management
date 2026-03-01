@@ -680,6 +680,21 @@ def _install_crash_hooks() -> None:
         faulthandler.enable(all_threads=True)
 
 
+def _runtime_loop_exception_handler(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+    """Log unhandled asyncio callback/task exceptions with full context."""
+    message = str(context.get("message") or "Unhandled asyncio loop exception")
+    exc = context.get("exception")
+    if isinstance(exc, BaseException):
+        log.error("Asyncio loop exception: %s", message, exc_info=(type(exc), exc, exc.__traceback__))
+        return
+    context_preview = {
+        "future": repr(context.get("future")),
+        "task": repr(context.get("task")),
+        "handle": repr(context.get("handle")),
+    }
+    log.error("Asyncio loop exception: %s context=%s", message, context_preview)
+
+
 class _SystemClock:
     def now(self) -> datetime:
         return datetime.now()
@@ -954,6 +969,7 @@ class _Runtime:
         log.info("Runtime thread main started")
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        self._loop.set_exception_handler(_runtime_loop_exception_handler)
         try:
             self._loop.run_until_complete(self._run())
         except RuntimeError as exc:

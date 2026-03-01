@@ -1279,6 +1279,8 @@ class ThemeManager(QObject):
 
 # Global instance
 theme_manager = ThemeManager()
+# Backward-compatible alias used by legacy imports.
+theme = theme_manager
 
 
 def get_theme() -> ThemeManager:

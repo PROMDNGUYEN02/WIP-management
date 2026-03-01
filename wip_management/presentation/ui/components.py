@@ -5,11 +5,12 @@ Reusable UI Components
 from __future__ import annotations
 
 import contextlib
+import logging
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from PySide6.QtCore import (
-    Property, QEasingCurve, QParallelAnimationGroup, QPoint, QPropertyAnimation,
+    Property, QEasingCurve, QParallelAnimationGroup, QPoint, QPointF, QPropertyAnimation,
     QRect, QRectF, QSequentialAnimationGroup, QSize, Qt, QTimer, Signal
 )
 from PySide6.QtGui import (
@@ -23,6 +24,8 @@ from PySide6.QtWidgets import (
 )
 
 from wip_management.presentation.ui.theme import get_theme
+
+log = logging.getLogger(__name__)
 
 
 class AnimatedCard(QFrame):
@@ -253,58 +256,64 @@ class SparklineWidget(QWidget):
             return
         
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
-        rect = self.rect()
-        width = rect.width()
-        height = rect.height()
-        
-        min_val = min(self._data)
-        max_val = max(self._data)
-        value_range = max(max_val - min_val, 1)
-        
-        # Calculate points
-        points = []
-        step = width / (len(self._data) - 1)
-        for i, val in enumerate(self._data):
-            x = i * step
-            y = height - ((val - min_val) / value_range) * (height - 4) - 2
-            points.append(QPointF(x, y))
-        
-        # Draw gradient fill
-        gradient = QLinearGradient(0, 0, 0, height)
-        gradient.setColorAt(0, QColor(self._color.red(), self._color.green(), self._color.blue(), 50))
-        gradient.setColorAt(1, QColor(self._color.red(), self._color.green(), self._color.blue(), 0))
-        
-        fill_path = QPainterPath()
-        fill_path.moveTo(0, height)
-        for p in points:
-            fill_path.lineTo(p)
-        fill_path.lineTo(width, height)
-        fill_path.closeSubpath()
-        
-        painter.fillPath(fill_path, gradient)
-        
-        # Draw line
-        pen = QPen(self._color)
-        pen.setWidth(2)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        
-        path = QPainterPath()
-        path.moveTo(points[0])
-        for p in points[1:]:
-            path.lineTo(p)
-        
-        painter.drawPath(path)
-        
-        # Draw end point
-        if points:
-            last_point = points[-1]
-            painter.setBrush(self._color)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(last_point, 4, 4)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            
+            rect = self.rect()
+            width = rect.width()
+            height = rect.height()
+            
+            min_val = min(self._data)
+            max_val = max(self._data)
+            value_range = max(max_val - min_val, 1)
+            
+            # Calculate points
+            points = []
+            step = width / (len(self._data) - 1)
+            for i, val in enumerate(self._data):
+                x = i * step
+                y = height - ((val - min_val) / value_range) * (height - 4) - 2
+                points.append(QPointF(x, y))
+            
+            # Draw gradient fill
+            gradient = QLinearGradient(0, 0, 0, height)
+            gradient.setColorAt(0, QColor(self._color.red(), self._color.green(), self._color.blue(), 50))
+            gradient.setColorAt(1, QColor(self._color.red(), self._color.green(), self._color.blue(), 0))
+            
+            fill_path = QPainterPath()
+            fill_path.moveTo(0, height)
+            for p in points:
+                fill_path.lineTo(p)
+            fill_path.lineTo(width, height)
+            fill_path.closeSubpath()
+            
+            painter.fillPath(fill_path, gradient)
+            
+            # Draw line
+            pen = QPen(self._color)
+            pen.setWidth(2)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            
+            path = QPainterPath()
+            path.moveTo(points[0])
+            for p in points[1:]:
+                path.lineTo(p)
+            
+            painter.drawPath(path)
+            
+            # Draw end point
+            if points:
+                last_point = points[-1]
+                painter.setBrush(self._color)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(last_point, 4, 4)
+        except Exception:
+            # Never allow paintEvent exceptions to propagate into Qt's paint loop.
+            log.exception("SparklineWidget paintEvent failed")
+        finally:
+            painter.end()
 
 
 class SpinnerWidget(QWidget):
