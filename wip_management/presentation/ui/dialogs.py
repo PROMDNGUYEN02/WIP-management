@@ -79,8 +79,8 @@ class _BaseDialog(QDialog):
 
     def _setup_shadow(self) -> None:
         shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(40)
-        shadow.setOffset(0, 8)
+        shadow.setBlurRadius(12)
+        shadow.setOffset(0, 2)
         shadow.setColor(QColor(0, 0, 0, 40))
         self.setGraphicsEffect(shadow)
 
@@ -93,21 +93,21 @@ class _BaseDialog(QDialog):
         p = get_theme().palette
         header = QWidget()
         layout = QVBoxLayout(header)
-        layout.setContentsMargins(0, 0, 0, 16)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 4)
+        layout.setSpacing(2)
 
         # Title row
         title_row = QHBoxLayout()
 
         if icon:
             icon_label = QLabel(icon)
-            icon_label.setFont(QFont("Segoe UI Emoji", 22))
+            icon_label.setFont(QFont("Segoe UI Emoji", 14))
             title_row.addWidget(icon_label)
             title_row.addSpacing(8)
 
         title_label = QLabel(title)
         title_label.setStyleSheet(
-            f"font-size: 22px; font-weight: 700; color: {p.text_primary};"
+            f"font-size: 16px; font-weight: 700; color: {p.text_primary};"
         )
         title_row.addWidget(title_label)
         title_row.addStretch()
@@ -170,8 +170,8 @@ class SettingsDialog(_BaseDialog):
     def _setup_ui(self) -> None:
         p = get_theme().palette
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 28, 28, 24)
-        layout.setSpacing(20)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
         # Header
         layout.addWidget(self._make_header("Settings", "Configure WIP Management", "⚙️"))
@@ -190,14 +190,14 @@ class SettingsDialog(_BaseDialog):
             QFrame {{
                 background: {p.info_bg};
                 border: 1px solid {p.info_border};
-                border-radius: 10px;
+                border-radius: 0px;
                 padding: 8px;
             }}
         """)
         hint_layout = QHBoxLayout(hint_frame)
-        hint_layout.setContentsMargins(12, 8, 12, 8)
+        hint_layout.setContentsMargins(4, 2, 4, 2)
         hint_icon = QLabel("💡")
-        hint_icon.setFont(QFont("Segoe UI Emoji", 14))
+        hint_icon.setFont(QFont("Segoe UI Emoji", 10))
         hint_layout.addWidget(hint_icon)
         hint_text = QLabel(
             "Refresh & data window apply immediately. "
@@ -214,8 +214,8 @@ class SettingsDialog(_BaseDialog):
     def _create_connection_tab(self) -> QWidget:
         widget = QWidget()
         layout = QFormLayout(widget)
-        layout.setSpacing(16)
-        layout.setContentsMargins(20, 24, 20, 20)
+        layout.setSpacing(6)
+        layout.setContentsMargins(4, 4, 4, 4)
         layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self._host_input = self._make_input(settings.sql_server, "e.g. 10.148.144.75")
@@ -260,8 +260,8 @@ class SettingsDialog(_BaseDialog):
     def _create_grouping_tab(self) -> QWidget:
         widget = QWidget()
         layout = QFormLayout(widget)
-        layout.setSpacing(16)
-        layout.setContentsMargins(20, 24, 20, 20)
+        layout.setSpacing(6)
+        layout.setContentsMargins(4, 4, 4, 4)
         layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self._max_trays_input = self._make_spinbox(1, 500, settings.trolley_max_trays, " trays")
@@ -282,8 +282,8 @@ class SettingsDialog(_BaseDialog):
     def _create_aging_tab(self) -> QWidget:
         widget = QWidget()
         layout = QFormLayout(widget)
-        layout.setSpacing(16)
-        layout.setContentsMargins(20, 24, 20, 20)
+        layout.setSpacing(6)
+        layout.setContentsMargins(4, 4, 4, 4)
         layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self._target_aging_input = self._make_double_spinbox(
@@ -303,7 +303,7 @@ class SettingsDialog(_BaseDialog):
             QFrame {{
                 background: {p.surface};
                 border: 1px solid {p.border};
-                border-radius: 12px;
+                border-radius: 0px;
                 padding: 12px;
             }}
         """)
@@ -325,8 +325,8 @@ class SettingsDialog(_BaseDialog):
     def _create_performance_tab(self) -> QWidget:
         widget = QWidget()
         layout = QFormLayout(widget)
-        layout.setSpacing(16)
-        layout.setContentsMargins(20, 24, 20, 20)
+        layout.setSpacing(6)
+        layout.setContentsMargins(4, 4, 4, 4)
         layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self._refresh_interval_input = self._make_double_spinbox(
@@ -479,8 +479,8 @@ class TrolleyDetailDialog(_BaseDialog):
     def _setup_ui(self) -> None:
         p = get_theme().palette
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 28, 28, 24)
-        layout.setSpacing(20)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
         # Header with stats
         header_layout = QHBoxLayout()
@@ -488,7 +488,7 @@ class TrolleyDetailDialog(_BaseDialog):
         title_col = QVBoxLayout()
         title_col.setSpacing(4)
         title = QLabel(f"🚗 {self._trolley_id}")
-        title.setStyleSheet(f"font-size: 24px; font-weight: 700; color: {p.text_primary};")
+        title.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {p.text_primary};")
         title_col.addWidget(title)
 
         tray_count = len(self._tray_rows)
@@ -509,17 +509,17 @@ class TrolleyDetailDialog(_BaseDialog):
                 QFrame {{
                     background: {p.surface};
                     border: 1px solid {p.border};
-                    border-radius: 12px;
+                    border-radius: 0px;
                     padding: 12px 16px;
                 }}
             """)
             badge_layout = QVBoxLayout(badge)
-            badge_layout.setContentsMargins(12, 10, 12, 10)
-            badge_layout.setSpacing(4)
+            badge_layout.setContentsMargins(4, 2, 4, 2)
+            badge_layout.setSpacing(1)
 
             val_label = QLabel(key)
             val_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            val_label.setStyleSheet(f"font-size: 20px; font-weight: 700; color: {p.text_primary};")
+            val_label.setStyleSheet(f"font-size: 14px; font-weight: 700; color: {p.text_primary};")
             badge_layout.addWidget(val_label)
 
             cap_label = QLabel(f"{icon} {label}")
@@ -552,11 +552,11 @@ class TrolleyDetailDialog(_BaseDialog):
             QFrame {{
                 background: {p.surface};
                 border-bottom: 1px solid {p.border};
-                border-radius: 16px 16px 0 0;
+                border-radius: 0px;
             }}
         """)
         sum_header_layout = QHBoxLayout(sum_header)
-        sum_header_layout.setContentsMargins(20, 14, 20, 14)
+        sum_header_layout.setContentsMargins(4, 2, 4, 2)
 
         sum_title = QLabel("📋  Tray Summary")
         sum_title.setStyleSheet(f"font-size: 14px; font-weight: 600; color: {p.text_primary};")
@@ -625,11 +625,11 @@ class TrolleyDetailDialog(_BaseDialog):
             QFrame {{
                 background: {p.surface};
                 border-bottom: 1px solid {p.border};
-                border-radius: 16px 16px 0 0;
+                border-radius: 0px;
             }}
         """)
         cell_header_layout = QHBoxLayout(cell_header)
-        cell_header_layout.setContentsMargins(20, 14, 20, 14)
+        cell_header_layout.setContentsMargins(4, 2, 4, 2)
 
         self._cell_title = QLabel("🔋  Cell Detail")
         self._cell_title.setStyleSheet(
@@ -964,8 +964,8 @@ class TrayPickerDialog(_BaseDialog):
     def _setup_ui(self) -> None:
         p = get_theme().palette
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 20)
-        layout.setSpacing(16)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
         layout.addWidget(
             self._make_header("Select Trays", "Choose trays to remove from trolley", "🗑️")
@@ -1042,8 +1042,8 @@ class LoadingDialog(_BaseDialog):
     def _setup_ui(self, message: str, cancellable: bool) -> None:
         p = get_theme().palette
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(32, 32, 32, 28)
-        layout.setSpacing(20)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         # Spinner + title row
@@ -1130,8 +1130,8 @@ class ConfirmDialog(_BaseDialog):
     ) -> None:
         p = get_theme().palette
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 28, 28, 24)
-        layout.setSpacing(20)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
         # Icon + message
         content_row = QHBoxLayout()
@@ -1139,7 +1139,7 @@ class ConfirmDialog(_BaseDialog):
         content_row.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         icon_label = QLabel(icon)
-        icon_label.setFont(QFont("Segoe UI Emoji", 32))
+        icon_label.setFont(QFont("Segoe UI Emoji", 18))
         content_row.addWidget(icon_label)
 
         text_col = QVBoxLayout()
@@ -1193,7 +1193,7 @@ class DashboardPanel(QWidget):
         p = get_theme().palette
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
+        layout.setSpacing(4)
 
         # Header
         header_row = QHBoxLayout()
@@ -1214,13 +1214,13 @@ class DashboardPanel(QWidget):
 
         scroll_content = QWidget()
         scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setSpacing(16)
+        scroll_layout.setSpacing(4)
 
         # Throughput line chart
         chart_card1 = QFrame()
         chart_card1.setObjectName("card")
         chart_card1_layout = QVBoxLayout(chart_card1)
-        chart_card1_layout.setContentsMargins(16, 16, 16, 16)
+        chart_card1_layout.setContentsMargins(4, 2, 4, 2)
 
         chart1_title = QLabel("📈 Tray Throughput")
         chart1_title.setStyleSheet(f"font-weight: 600; color: {p.text_primary};")
@@ -1239,7 +1239,7 @@ class DashboardPanel(QWidget):
         chart_card2 = QFrame()
         chart_card2.setObjectName("card")
         chart_card2_layout = QVBoxLayout(chart_card2)
-        chart_card2_layout.setContentsMargins(16, 16, 16, 16)
+        chart_card2_layout.setContentsMargins(4, 2, 4, 2)
 
         chart2_title = QLabel("🍩 Column Distribution")
         chart2_title.setStyleSheet(f"font-weight: 600; color: {p.text_primary};")
@@ -1257,7 +1257,7 @@ class DashboardPanel(QWidget):
         chart_card3 = QFrame()
         chart_card3.setObjectName("card")
         chart_card3_layout = QVBoxLayout(chart_card3)
-        chart_card3_layout.setContentsMargins(16, 16, 16, 16)
+        chart_card3_layout.setContentsMargins(4, 2, 4, 2)
 
         chart3_title = QLabel("⏱️ Aging Distribution")
         chart3_title.setStyleSheet(f"font-weight: 600; color: {p.text_primary};")

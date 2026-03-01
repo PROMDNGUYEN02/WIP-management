@@ -122,8 +122,8 @@ LIGHT_PALETTE = ColorPalette(
     info_border="#67e8f9",
     
     # Neutral
-    background="#f8fafc",
-    background_secondary="#f1f5f9",
+    background="#ffffff",
+    background_secondary="#f8fafc",
     surface="#ffffff",
     surface_hover="#f8fafc",
     surface_pressed="#f1f5f9",
@@ -194,8 +194,8 @@ DARK_PALETTE = ColorPalette(
     info_border="#0891b2",
     
     # Neutral
-    background="#0f172a",
-    background_secondary="#1e293b",
+    background="#1e293b",
+    background_secondary="#334155",
     surface="#1e293b",
     surface_hover="#334155",
     surface_pressed="#475569",
@@ -338,13 +338,16 @@ class ThemeManager(QObject):
            ═══════════════════════════════════════════════════════════════ */
         
         * {{
-            margin: 0;
-            padding: 0;
+            margin: 0; padding: 0;
             outline: none;
         }}
         
         QMainWindow {{
-            background: {p.background};
+            background: {p.surface};
+        }}
+
+        QWidget#appRoot {{
+            background: {p.surface};
         }}
         
         QWidget {{
@@ -363,12 +366,12 @@ class ThemeManager(QObject):
            ═══════════════════════════════════════════════════════════════ */
         
         QScrollArea {{
-            background: transparent;
+            background: {p.surface};
             border: none;
         }}
         
         QScrollArea > QWidget > QWidget {{
-            background: transparent;
+            background: {p.surface};
         }}
         
         /* ═══════════════════════════════════════════════════════════════
@@ -378,7 +381,7 @@ class ThemeManager(QObject):
         QFrame#metricCard {{
             background: {p.surface};
             border: 1px solid {p.border};
-            border-radius: 16px;
+            border-radius: 8px;
         }}
         
         QFrame#metricCard:hover {{
@@ -435,7 +438,7 @@ class ThemeManager(QObject):
         QFrame#columnCard {{
             background: {p.surface};
             border: 1px solid {p.border};
-            border-radius: 16px 16px 0 0;
+            border-radius: 8px;
         }}
         
         QLabel#columnHeader {{
@@ -454,7 +457,7 @@ class ThemeManager(QObject):
             background: {p.surface};
             border: none;
             border-bottom: 1px solid {p.border};
-            border-radius: 16px 16px 0 0;
+            border-radius: 0px;
         }}
         
         /* ═══════════════════════════════════════════════════════════════
@@ -465,7 +468,7 @@ class ThemeManager(QObject):
             background: {p.primary};
             color: {p.text_inverse};
             border: none;
-            border-radius: 10px;
+            border-radius: 8px;
             padding: 10px 20px;
             font-weight: 600;
             font-size: 13px;
@@ -519,7 +522,7 @@ class ThemeManager(QObject):
             background: transparent;
             color: {p.text_secondary};
             border: none;
-            border-radius: 10px;
+            border-radius: 20px;
             padding: 10px;
             min-width: 40px;
             max-width: 40px;
@@ -572,7 +575,7 @@ class ThemeManager(QObject):
         QLineEdit {{
             background: {p.surface};
             border: 1px solid {p.border};
-            border-radius: 10px;
+            border-radius: 8px;
             padding: 10px 14px;
             font-size: 13px;
             color: {p.text_primary};
@@ -605,15 +608,15 @@ class ThemeManager(QObject):
            ═══════════════════════════════════════════════════════════════ */
         
         QCheckBox {{
-            spacing: 10px;
+            spacing: 4px;
             color: {p.text_primary};
             font-weight: 500;
         }}
         
         QCheckBox::indicator {{
-            width: 22px;
-            height: 22px;
-            border-radius: 6px;
+            width: 16px;
+            height: 16px;
+            border-radius: 4px;
             border: 2px solid {p.border};
             background: {p.surface};
         }}
@@ -647,7 +650,7 @@ class ThemeManager(QObject):
            ═══════════════════════════════════════════════════════════════ */
         
         QListView {{
-            background: transparent;
+            background: {p.surface};
             border: none;
             outline: none;
             padding: 4px;
@@ -656,7 +659,7 @@ class ThemeManager(QObject):
         QListView::item {{
             background: {p.surface};
             border: 1px solid {p.border_light};
-            border-radius: 12px;
+            border-radius: 8px;
             padding: 14px 16px;
             margin: 4px 8px;
             color: {p.text_primary};
@@ -682,7 +685,7 @@ class ThemeManager(QObject):
            ═══════════════════════════════════════════════════════════════ */
         
         QTableView {{
-            background: transparent;
+            background: {p.surface};
             border: none;
             gridline-color: {p.border_light};
             selection-background-color: {p.primary_light};
@@ -691,7 +694,7 @@ class ThemeManager(QObject):
         }}
         
         QTableView::item {{
-            padding: 10px 12px;
+            padding: 2px 6px;
             border: none;
             border-bottom: 1px solid {p.border_light};
         }}
@@ -710,7 +713,7 @@ class ThemeManager(QObject):
         }}
         
         QHeaderView {{
-            background: transparent;
+            background: {p.surface};
             border: none;
         }}
         
@@ -747,7 +750,7 @@ class ThemeManager(QObject):
         
         QScrollBar::handle:vertical {{
             background: {p.border};
-            border-radius: 4px;
+            border-radius: 6px;
             min-height: 40px;
         }}
         
@@ -777,7 +780,7 @@ class ThemeManager(QObject):
         
         QScrollBar::handle:horizontal {{
             background: {p.border};
-            border-radius: 4px;
+            border-radius: 6px;
             min-width: 40px;
         }}
         
@@ -818,7 +821,7 @@ class ThemeManager(QObject):
             background: {p.text_primary};
             color: {p.text_inverse};
             border: none;
-            border-radius: 8px;
+            border-radius: 4px;
             padding: 8px 14px;
             font-size: 12px;
             font-weight: 500;
@@ -831,13 +834,13 @@ class ThemeManager(QObject):
         QMenu {{
             background: {p.surface};
             border: 1px solid {p.border};
-            border-radius: 12px;
+            border-radius: 8px;
             padding: 8px;
         }}
         
         QMenu::item {{
-            padding: 10px 40px 10px 16px;
-            border-radius: 8px;
+            padding: 4px 20px 4px 10px;
+            border-radius: 4px;
             color: {p.text_primary};
             font-weight: 500;
         }}
@@ -865,7 +868,7 @@ class ThemeManager(QObject):
            ═══════════════════════════════════════════════════════════════ */
         
         QDialog {{
-            background: {p.background};
+            background: {p.surface};
         }}
         
         QDialogButtonBox {{
@@ -879,7 +882,7 @@ class ThemeManager(QObject):
         QSpinBox, QDoubleSpinBox {{
             background: {p.surface};
             border: 1px solid {p.border};
-            border-radius: 10px;
+            border-radius: 8px;
             padding: 8px 12px;
             color: {p.text_primary};
             min-height: 20px;
@@ -915,7 +918,7 @@ class ThemeManager(QObject):
         QComboBox {{
             background: {p.surface};
             border: 1px solid {p.border};
-            border-radius: 10px;
+            border-radius: 8px;
             padding: 10px 14px;
             color: {p.text_primary};
             min-height: 20px;
@@ -974,13 +977,13 @@ class ThemeManager(QObject):
         
         QTabWidget::pane {{
             border: 1px solid {p.border};
-            border-radius: 12px;
+            border-radius: 8px;
             background: {p.surface};
             margin-top: -1px;
         }}
         
         QTabBar {{
-            background: transparent;
+            background: {p.surface};
         }}
         
         QTabBar::tab {{
@@ -1032,7 +1035,7 @@ class ThemeManager(QObject):
         QGroupBox {{
             background: {p.surface};
             border: 1px solid {p.border};
-            border-radius: 12px;
+            border-radius: 8px;
             margin-top: 16px;
             padding-top: 24px;
             font-weight: 600;
@@ -1097,7 +1100,7 @@ class ThemeManager(QObject):
         QTextEdit, QPlainTextEdit {{
             background: {p.surface};
             border: 1px solid {p.border};
-            border-radius: 10px;
+            border-radius: 8px;
             padding: 12px;
             color: {p.text_primary};
             selection-background-color: {p.primary_light};
@@ -1209,13 +1212,13 @@ class ThemeManager(QObject):
         QFrame#card {{
             background: {p.surface};
             border: 1px solid {p.border};
-            border-radius: 16px;
+            border-radius: 8px;
         }}
         
         QFrame#cardElevated {{
             background: {p.surface_elevated};
             border: none;
-            border-radius: 16px;
+            border-radius: 8px;
         }}
         
         QFrame#cardHover:hover {{
@@ -1229,7 +1232,7 @@ class ThemeManager(QObject):
         
         QFrame#loadingOverlay {{
             background: {p.overlay_dark};
-            border-radius: 16px;
+            border-radius: 8px;
         }}
         
         QLabel#loadingText {{
@@ -1245,28 +1248,28 @@ class ThemeManager(QObject):
         QFrame#toastSuccess {{
             background: {p.success_bg};
             border: 1px solid {p.success_border};
-            border-radius: 12px;
+            border-radius: 8px;
             border-left: 4px solid {p.success};
         }}
         
         QFrame#toastWarning {{
             background: {p.warning_bg};
             border: 1px solid {p.warning_border};
-            border-radius: 12px;
+            border-radius: 8px;
             border-left: 4px solid {p.warning};
         }}
         
         QFrame#toastDanger {{
             background: {p.danger_bg};
             border: 1px solid {p.danger_border};
-            border-radius: 12px;
+            border-radius: 8px;
             border-left: 4px solid {p.danger};
         }}
         
         QFrame#toastInfo {{
             background: {p.info_bg};
             border: 1px solid {p.info_border};
-            border-radius: 12px;
+            border-radius: 8px;
             border-left: 4px solid {p.info};
         }}
         """

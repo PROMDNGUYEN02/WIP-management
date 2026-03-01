@@ -47,22 +47,22 @@ class AnimatedCard(QFrame):
     
     def _setup_shadow(self) -> None:
         self._shadow = QGraphicsDropShadowEffect(self)
-        self._shadow.setBlurRadius(20)
-        self._shadow.setOffset(0, 4)
+        self._shadow.setBlurRadius(8)
+        self._shadow.setOffset(0, 2)
         self._shadow.setColor(QColor(0, 0, 0, 20))
         self.setGraphicsEffect(self._shadow)
     
     def enterEvent(self, event) -> None:
         self._hovered = True
-        self._shadow.setBlurRadius(30)
-        self._shadow.setOffset(0, 8)
+        self._shadow.setBlurRadius(12)
+        self._shadow.setOffset(0, 2)
         self._shadow.setColor(QColor(0, 0, 0, 30))
         super().enterEvent(event)
     
     def leaveEvent(self, event) -> None:
         self._hovered = False
-        self._shadow.setBlurRadius(20)
-        self._shadow.setOffset(0, 4)
+        self._shadow.setBlurRadius(8)
+        self._shadow.setOffset(0, 2)
         self._shadow.setColor(QColor(0, 0, 0, 20))
         super().leaveEvent(event)
     
@@ -97,7 +97,7 @@ class MetricCard(AnimatedCard):
     ) -> None:
         super().__init__(parent, clickable=True)
         self.setObjectName("metricCard")
-        self.setMinimumHeight(104)
+        self.setMinimumHeight(56)
         self._color = color or get_theme().palette.primary
         self._current_value = 0
         self._target_value = 0
@@ -112,29 +112,29 @@ class MetricCard(AnimatedCard):
     
     def _setup_ui(self, title: str, icon: str) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(4)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         # Top row: icon + trend
         top_row = QHBoxLayout()
         top_row.setContentsMargins(0, 0, 0, 0)
-        top_row.setSpacing(6)
+        top_row.setSpacing(2)
         top_row.addStretch(1)
         
         # Icon with colored background
         icon_container = QFrame()
-        icon_container.setFixedSize(34, 34)
+        icon_container.setFixedSize(24, 24)
         icon_container.setStyleSheet(f"""
             background: {self._color}15;
-            border-radius: 10px;
+            border-radius: 0px;
         """)
         icon_layout = QVBoxLayout(icon_container)
         icon_layout.setContentsMargins(0, 0, 0, 0)
         icon_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         self._icon = QLabel(icon)
-        self._icon.setFont(QFont("Segoe UI Emoji", 15))
+        self._icon.setFont(QFont("Segoe UI Emoji", 12))
         self._icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_layout.addWidget(self._icon)
 
@@ -390,7 +390,7 @@ class LoadingOverlay(QFrame):
         
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setSpacing(16)
+        layout.setSpacing(4)
         
         # Spinner
         self._spinner = SpinnerWidget(size=48)
@@ -449,7 +449,7 @@ class SearchBar(QWidget):
             QFrame {{
                 background: {p.surface};
                 border: 1px solid {p.border};
-                border-radius: 12px;
+                border-radius: 0px;
             }}
             QFrame:focus-within {{
                 border-color: {p.primary};
@@ -458,8 +458,8 @@ class SearchBar(QWidget):
         """)
         
         inner_layout = QHBoxLayout(container)
-        inner_layout.setContentsMargins(14, 0, 6, 0)
-        inner_layout.setSpacing(10)
+        inner_layout.setContentsMargins(4, 0, 2, 0)
+        inner_layout.setSpacing(4)
         
         # Search icon
         icon = QLabel("🔍")
@@ -474,7 +474,7 @@ class SearchBar(QWidget):
             QLineEdit {{
                 background: transparent;
                 border: none;
-                padding: 12px 0;
+                padding: 4px 0;
                 color: {p.text_primary};
                 font-size: 13px;
             }}
@@ -486,7 +486,7 @@ class SearchBar(QWidget):
         # Clear button
         self._clear_btn = QPushButton("✕")
         self._clear_btn.setObjectName("iconBtn")
-        self._clear_btn.setFixedSize(28, 28)
+        self._clear_btn.setFixedSize(20, 20)
         self._clear_btn.setVisible(False)
         self._clear_btn.clicked.connect(self._clear)
         self._input.textChanged.connect(lambda t: self._clear_btn.setVisible(bool(t)))
@@ -558,7 +558,7 @@ class IconButton(QPushButton):
         self,
         icon: str,
         tooltip: str = "",
-        size: int = 40,
+        size: int = 28,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(icon, parent)
@@ -566,7 +566,7 @@ class IconButton(QPushButton):
         self.setToolTip(tooltip)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedSize(size, size)
-        self.setFont(QFont("Segoe UI Emoji", 14))
+        self.setFont(QFont("Segoe UI Emoji", 11))
 
 
 class ProgressCard(AnimatedCard):
@@ -589,8 +589,8 @@ class ProgressCard(AnimatedCard):
     
     def _setup_ui(self, title: str) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
         
         # Header
         header = QHBoxLayout()
@@ -617,11 +617,11 @@ class ProgressCard(AnimatedCard):
             QProgressBar {{
                 background: {get_theme().palette.background_secondary};
                 border: none;
-                border-radius: 4px;
+                border-radius: 0px;
             }}
             QProgressBar::chunk {{
                 background: {self._color};
-                border-radius: 4px;
+                border-radius: 0px;
             }}
         """)
         layout.addWidget(self._progress)
@@ -709,7 +709,7 @@ class ToggleSwitch(QWidget):
         self._checked = checked
         self._handle_position = 1.0 if checked else 0.0
         
-        self.setFixedSize(48, 26)
+        self.setFixedSize(36, 20)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         
         self._animation = QPropertyAnimation(self, b"handle_position")
@@ -758,16 +758,16 @@ class ToggleSwitch(QWidget):
         p = get_theme().palette
         
         # Track
-        track_rect = QRectF(0, 3, 48, 20)
+        track_rect = QRectF(0, 2, 36, 16)
         track_color = QColor(p.primary) if self._checked else QColor(p.border)
         
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(track_color)
-        painter.drawRoundedRect(track_rect, 10, 10)
+        painter.drawRect(track_rect)
         
         # Handle
-        handle_x = 2 + (self._handle_position * 24)
-        handle_rect = QRectF(handle_x, 1, 22, 24)
+        handle_x = 2 + (self._handle_position * 18)
+        handle_rect = QRectF(handle_x, 1, 16, 18)
         
         painter.setBrush(QColor(p.surface))
         painter.drawEllipse(handle_rect)
@@ -851,7 +851,7 @@ class Skeleton(QFrame):
         self,
         width: int | None = None,
         height: int = 20,
-        rounded: bool = True,
+        rounded: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -883,10 +883,7 @@ class Skeleton(QFrame):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(p.background_secondary))
         
-        if self._rounded:
-            painter.drawRoundedRect(rect, rect.height() // 2, rect.height() // 2)
-        else:
-            painter.drawRect(rect)
+        painter.drawRect(rect)
         
         # Shimmer gradient
         gradient = QLinearGradient(self._shimmer_pos - 100, 0, self._shimmer_pos, 0)
@@ -895,10 +892,7 @@ class Skeleton(QFrame):
         gradient.setColorAt(1, QColor(255, 255, 255, 0))
         
         painter.setBrush(gradient)
-        if self._rounded:
-            painter.drawRoundedRect(rect, rect.height() // 2, rect.height() // 2)
-        else:
-            painter.drawRect(rect)
+        painter.drawRect(rect)
     
     def stop(self) -> None:
         self._timer.stop()

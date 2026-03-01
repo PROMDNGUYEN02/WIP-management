@@ -651,7 +651,8 @@ class BoardViewModel(QObject):
 
         for row in rows:
             row_copy = dict(row)
-            latest_end: datetime | None = None
+            # Trolley aging follows the last loaded tray (latest end time), not an average.
+            last_tray_end: datetime | None = None
 
             for tray_id in row.get("tray_ids", []):
                 tray = self._tray_cache.get(str(tray_id))
@@ -662,14 +663,14 @@ class BoardViewModel(QObject):
                 fpc = tray.get("fpc_payload") or {}
 
                 end_dt = _parse_cached(ccu.get("end_time")) or _parse_cached(fpc.get("precharge_end_time"))
-                if end_dt and (latest_end is None or end_dt > latest_end):
-                    latest_end = end_dt
+                if end_dt and (last_tray_end is None or end_dt > last_tray_end):
+                    last_tray_end = end_dt
 
-            if latest_end is None:
+            if last_tray_end is None:
                 row_copy["aging_state"] = _AGE_STATE_UNKNOWN
                 row_copy["aging_time"] = "-"
             else:
-                delta = now - latest_end
+                delta = now - last_tray_end
                 row_copy["aging_state"] = _aging_state(delta)
                 row_copy["aging_time"] = _format_td(delta)
 

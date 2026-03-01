@@ -68,7 +68,7 @@ class Toast(QFrame):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setFixedWidth(380)
+        self.setFixedWidth(320)
         
         # Main layout
         main_layout = QVBoxLayout(self)
@@ -78,8 +78,8 @@ class Toast(QFrame):
         # Content container
         self._container = QFrame()
         container_layout = QHBoxLayout(self._container)
-        container_layout.setContentsMargins(16, 14, 12, 14)
-        container_layout.setSpacing(14)
+        container_layout.setContentsMargins(4, 2, 4, 2)
+        container_layout.setSpacing(4)
         
         # Icon
         icons = {
@@ -89,8 +89,8 @@ class Toast(QFrame):
             ToastType.INFO: "ℹ",
         }
         icon_label = QLabel(icons.get(self._toast_type, "ℹ"))
-        icon_label.setFont(QFont("Segoe UI Emoji", 16))
-        icon_label.setFixedSize(28, 28)
+        icon_label.setFont(QFont("Segoe UI Emoji", 11))
+        icon_label.setFixedSize(20, 20)
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         container_layout.addWidget(icon_label)
         
@@ -100,12 +100,12 @@ class Toast(QFrame):
         
         if title:
             title_label = QLabel(title)
-            title_label.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
+            title_label.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold))
             text_container.addWidget(title_label)
         
         message_label = QLabel(message)
         message_label.setWordWrap(True)
-        message_label.setFont(QFont("Segoe UI", 11))
+        message_label.setFont(QFont("Segoe UI", 10))
         text_container.addWidget(message_label)
         
         container_layout.addLayout(text_container, 1)
@@ -123,7 +123,7 @@ class Toast(QFrame):
         if show_close:
             close_btn = QPushButton("✕")
             close_btn.setObjectName("iconBtn")
-            close_btn.setFixedSize(28, 28)
+            close_btn.setFixedSize(20, 20)
             close_btn.clicked.connect(self.dismiss)
             container_layout.addWidget(close_btn)
         
@@ -131,8 +131,8 @@ class Toast(QFrame):
         
         # Progress bar
         self._progress_bar = QFrame()
-        self._progress_bar.setFixedHeight(3)
-        self._progress_bar.setStyleSheet(f"background: {get_theme().palette.primary}; border-radius: 1px;")
+        self._progress_bar.setFixedHeight(2)
+        self._progress_bar.setStyleSheet(f"background: {get_theme().palette.primary}; border-radius: 0px;")
         main_layout.addWidget(self._progress_bar)
     
     def _apply_style(self) -> None:
@@ -221,8 +221,8 @@ class ToastManager:
             cls._instance._toasts: list[Toast] = []
             cls._instance._parent = None
             cls._instance._position = "top-right"
-            cls._instance._margin = 20
-            cls._instance._spacing = 12
+            cls._instance._margin = 4
+            cls._instance._spacing = 4
         return cls._instance
     
     def set_parent(self, parent: QWidget) -> None:
@@ -284,11 +284,11 @@ class ToastManager:
         
         # Calculate base position
         if "right" in self._position:
-            x = screen_geo.right() - 380 - self._margin
+            x = screen_geo.right() - 320 - self._margin
         elif "left" in self._position:
             x = screen_geo.left() + self._margin
         else:  # center
-            x = screen_geo.center().x() - 190
+            x = screen_geo.center().x() - 160
         
         if "top" in self._position:
             y_start = screen_geo.top() + self._margin

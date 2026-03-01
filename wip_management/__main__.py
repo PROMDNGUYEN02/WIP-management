@@ -133,7 +133,7 @@ class ThemeColors:
     INFO_BG = "#cffafe"
     
     # Neutral
-    BG = "#f8fafc"
+    BG = "#ffffff"
     SURFACE = "#ffffff"
     SURFACE_HOVER = "#f1f5f9"
     BORDER = "#e2e8f0"
@@ -158,7 +158,7 @@ def get_modern_stylesheet() -> str:
        ═══════════════════════════════════════════════════════════════ */
     
     QMainWindow {{
-        background: {c.BG};
+        background: {c.SURFACE};
     }}
     
     QWidget {{
@@ -174,7 +174,7 @@ def get_modern_stylesheet() -> str:
     QFrame#metricCard {{
         background: {c.SURFACE};
         border: 1px solid {c.BORDER};
-        border-radius: 16px;
+        border-radius: 0px;
     }}
     
     QFrame#metricCard:hover {{
@@ -213,7 +213,7 @@ def get_modern_stylesheet() -> str:
     QFrame#columnCard {{
         background: {c.SURFACE};
         border: 1px solid {c.BORDER};
-        border-radius: 16px;
+        border-radius: 0px;
     }}
     
     QLabel#columnHeader {{
@@ -230,7 +230,7 @@ def get_modern_stylesheet() -> str:
     QFrame#columnHeaderFrame {{
         background: transparent;
         border-bottom: 1px solid {c.BORDER};
-        border-radius: 0;
+        border-radius: 0px;
     }}
     
     /* ═══════════════════════════════════════════════════════════════
@@ -241,11 +241,11 @@ def get_modern_stylesheet() -> str:
         background: {c.PRIMARY};
         color: {c.TEXT_INVERSE};
         border: none;
-        border-radius: 10px;
-        padding: 10px 20px;
+        border-radius: 0px;
+        padding: 4px 12px;
         font-weight: 600;
         font-size: 13px;
-        min-height: 20px;
+        min-height: 14px;
     }}
     
     QPushButton:hover {{
@@ -275,13 +275,13 @@ def get_modern_stylesheet() -> str:
     QPushButton#iconBtn {{
         background: transparent;
         border: none;
-        border-radius: 8px;
-        padding: 8px;
-        min-width: 36px;
-        max-width: 36px;
-        min-height: 36px;
-        max-height: 36px;
-        font-size: 16px;
+        border-radius: 0px;
+        padding: 2px;
+        min-width: 28px;
+        max-width: 28px;
+        min-height: 28px;
+        max-height: 28px;
+        font-size: 12px;
     }}
     
     QPushButton#iconBtn:hover {{
@@ -311,8 +311,8 @@ def get_modern_stylesheet() -> str:
     QLineEdit {{
         background: {c.SURFACE};
         border: 1px solid {c.BORDER};
-        border-radius: 10px;
-        padding: 10px 14px;
+        border-radius: 0px;
+        padding: 4px 8px;
         font-size: 13px;
         color: {c.TEXT};
         selection-background-color: {c.PRIMARY_LIGHT};
@@ -332,15 +332,14 @@ def get_modern_stylesheet() -> str:
        ═══════════════════════════════════════════════════════════════ */
     
     QCheckBox {{
-        spacing: 8px;
+        spacing: 4px;
         color: {c.TEXT};
         font-weight: 500;
     }}
     
     QCheckBox::indicator {{
-        width: 20px;
-        height: 20px;
-        border-radius: 6px;
+        width: 16px; height: 16px;
+        border-radius: 0px;
         border: 2px solid {c.BORDER};
         background: {c.SURFACE};
     }}
@@ -359,7 +358,7 @@ def get_modern_stylesheet() -> str:
        ═══════════════════════════════════════════════════════════════ */
     
     QListView {{
-        background: transparent;
+        background: {c.SURFACE};
         border: none;
         outline: none;
         padding: 4px;
@@ -368,9 +367,8 @@ def get_modern_stylesheet() -> str:
     QListView::item {{
         background: {c.SURFACE};
         border: 1px solid {c.BORDER_LIGHT};
-        border-radius: 12px;
-        padding: 14px 16px;
-        margin: 4px 8px;
+        border-radius: 0px;
+        padding: 4px 8px; margin: 1px 2px;
         color: {c.TEXT};
     }}
     
@@ -390,7 +388,7 @@ def get_modern_stylesheet() -> str:
        ═══════════════════════════════════════════════════════════════ */
     
     QTableView {{
-        background: transparent;
+        background: {c.SURFACE};
         border: none;
         gridline-color: {c.BORDER_LIGHT};
         selection-background-color: {c.PRIMARY_LIGHT};
@@ -398,7 +396,7 @@ def get_modern_stylesheet() -> str:
     }}
     
     QTableView::item {{
-        padding: 10px 12px;
+        padding: 2px 6px;
         border: none;
     }}
     
@@ -411,7 +409,7 @@ def get_modern_stylesheet() -> str:
     }}
     
     QHeaderView {{
-        background: transparent;
+        background: {c.SURFACE};
         border: none;
     }}
     
@@ -422,7 +420,7 @@ def get_modern_stylesheet() -> str:
         font-size: 11px;
         text-transform: uppercase;
         letter-spacing: 0.5px;
-        padding: 12px 8px;
+        padding: 4px 6px;
         border: none;
         border-bottom: 2px solid {c.BORDER};
     }}
@@ -443,7 +441,7 @@ def get_modern_stylesheet() -> str:
     
     QScrollBar::handle:vertical {{
         background: {c.BORDER};
-        border-radius: 4px;
+        border-radius: 0px;
         min-height: 40px;
     }}
     
@@ -464,7 +462,7 @@ def get_modern_stylesheet() -> str:
     
     QScrollBar::handle:horizontal {{
         background: {c.BORDER};
-        border-radius: 4px;
+        border-radius: 0px;
         min-width: 40px;
     }}
     
@@ -489,7 +487,7 @@ def get_modern_stylesheet() -> str:
     QStatusBar QLabel {{
         color: {c.TEXT_SECONDARY};
         font-size: 12px;
-        padding: 4px 8px;
+        padding: 1px 2px;
     }}
     
     /* ═══════════════════════════════════════════════════════════════
@@ -500,8 +498,8 @@ def get_modern_stylesheet() -> str:
         background: {c.TEXT};
         color: {c.TEXT_INVERSE};
         border: none;
-        border-radius: 8px;
-        padding: 8px 12px;
+        border-radius: 0px;
+        padding: 3px 6px;
         font-size: 12px;
     }}
     
@@ -512,13 +510,13 @@ def get_modern_stylesheet() -> str:
     QMenu {{
         background: {c.SURFACE};
         border: 1px solid {c.BORDER};
-        border-radius: 12px;
+        border-radius: 0px;
         padding: 8px;
     }}
     
     QMenu::item {{
-        padding: 10px 32px 10px 16px;
-        border-radius: 8px;
+        padding: 4px 16px 4px 8px;
+        border-radius: 0px;
         color: {c.TEXT};
     }}
     
@@ -537,7 +535,7 @@ def get_modern_stylesheet() -> str:
        ═══════════════════════════════════════════════════════════════ */
     
     QDialog {{
-        background: {c.BG};
+        background: {c.SURFACE};
     }}
     
     /* ═══════════════════════════════════════════════════════════════
@@ -547,8 +545,8 @@ def get_modern_stylesheet() -> str:
     QSpinBox, QDoubleSpinBox {{
         background: {c.SURFACE};
         border: 1px solid {c.BORDER};
-        border-radius: 8px;
-        padding: 8px 12px;
+        border-radius: 0px;
+        padding: 3px 6px;
         color: {c.TEXT};
     }}
     
@@ -563,14 +561,14 @@ def get_modern_stylesheet() -> str:
     QProgressBar {{
         background: {c.BORDER_LIGHT};
         border: none;
-        border-radius: 4px;
+        border-radius: 0px;
         height: 8px;
         text-align: center;
     }}
     
     QProgressBar::chunk {{
         background: {c.PRIMARY};
-        border-radius: 4px;
+        border-radius: 0px;
     }}
     
     /* ═══════════════════════════════════════════════════════════════
@@ -579,14 +577,14 @@ def get_modern_stylesheet() -> str:
     
     QTabWidget::pane {{
         border: 1px solid {c.BORDER};
-        border-radius: 12px;
+        border-radius: 0px;
         background: {c.SURFACE};
     }}
     
     QTabBar::tab {{
         background: transparent;
         color: {c.TEXT_SECONDARY};
-        padding: 12px 24px;
+        padding: 4px 12px;
         font-weight: 500;
         border: none;
         border-bottom: 2px solid transparent;
@@ -609,7 +607,7 @@ def get_modern_stylesheet() -> str:
         background: {c.BORDER};
         width: 2px;
         margin: 4px 2px;
-        border-radius: 1px;
+        border-radius: 0px;
     }}
     
     QSplitter::handle:hover {{
@@ -1434,8 +1432,8 @@ class _ModernMetricCard(QFrame):
     
     def _setup_ui(self, title: str, icon: str) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         
         # Top row: icon + trend
         top_row = QHBoxLayout()
@@ -1443,7 +1441,7 @@ class _ModernMetricCard(QFrame):
         
         self._icon = QLabel(icon)
         self._icon.setObjectName("metricIcon")
-        self._icon.setFont(QFont("Segoe UI Emoji", 20))
+        self._icon.setFont(QFont("Segoe UI Emoji", 12))
         top_row.addWidget(self._icon)
         
         top_row.addStretch()
@@ -1570,11 +1568,11 @@ class _TrolleyItemDelegate(QStyledItemDelegate):
             bg_color = QColor(p.surface)
             border_color = QColor(p.border_light)
         
-        # Draw rounded rectangle
+        # Draw item background
         from PySide6.QtGui import QPainterPath
         path = QPainterPath()
-        adjusted_rect = QRectF(rect).adjusted(6, 3, -6, -3)
-        path.addRoundedRect(adjusted_rect, 12, 12)
+        adjusted_rect = QRectF(rect).adjusted(2, 1, -2, -1)
+        path.addRect(adjusted_rect)
         painter.fillPath(path, bg_color)
         painter.setPen(QPen(border_color, 1))
         painter.drawPath(path)
@@ -1594,10 +1592,10 @@ class _TrolleyItemDelegate(QStyledItemDelegate):
         aging_time = str(model.data(index, TrolleyListModel.AgingTimeRole) or "-")
         
         # Layout
-        inner_rect = adjusted_rect.adjusted(14, 10, -14, -10)
+        inner_rect = adjusted_rect.adjusted(4, 2, -4, -2)
         
         # Trolley ID (main text)
-        painter.setFont(QFont("Segoe UI", 13, QFont.Weight.DemiBold))
+        painter.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold))
         painter.setPen(QColor(p.text_primary))
         painter.drawText(
             QRectF(inner_rect.left(), inner_rect.top(), inner_rect.width() * 0.5, 20),
@@ -1617,7 +1615,7 @@ class _TrolleyItemDelegate(QStyledItemDelegate):
             self._draw_badge(painter, inner_rect.right() - 80, inner_rect.top(), state, bg, fg)
         
         # Bottom row
-        bottom_y = inner_rect.bottom() - 18
+        bottom_y = inner_rect.bottom() - 14
         painter.setFont(QFont("Segoe UI", 11))
         
         # Mode badge
@@ -1657,25 +1655,25 @@ class _TrolleyItemDelegate(QStyledItemDelegate):
         *,
         small: bool = False,
     ) -> None:
-        font = QFont("Segoe UI", 10 if small else 11, QFont.Weight.DemiBold)
+        font = QFont("Segoe UI", 8 if small else 9, QFont.Weight.DemiBold)
         painter.setFont(font)
         fm = QFontMetrics(font)
         
         padding = 8
-        height = 20 if small else 24
+        height = 14 if small else 18
         width = fm.horizontalAdvance(text) + padding * 2
         
         rect = QRectF(x, y, width, height)
         from PySide6.QtGui import QPainterPath
         path = QPainterPath()
-        path.addRoundedRect(rect, height / 2, height / 2)
+        path.addRect(rect)
         painter.fillPath(path, QColor(bg_color))
         
         painter.setPen(QColor(fg_color))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
     
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
-        return QSize(option.rect.width(), 64)
+        return QSize(option.rect.width(), 44)
 
 
 class _TraySelectIconPainter:
@@ -1802,15 +1800,15 @@ class _ModernColumnCard(QFrame):
                     stop:1 transparent
                 );
                 border-bottom: 1px solid {ThemeColors.BORDER};
-                border-radius: 16px 16px 0 0;
+                border-radius: 0px;
             }}
         """)
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(20, 16, 20, 12)
+        header_layout.setContentsMargins(4, 2, 4, 2)
         
         # Icon + Title
         icon_label = QLabel(icon)
-        icon_label.setFont(QFont("Segoe UI Emoji", 18))
+        icon_label.setFont(QFont("Segoe UI Emoji", 12))
         header_layout.addWidget(icon_label)
         
         title_label = QLabel(title)
@@ -1824,9 +1822,7 @@ class _ModernColumnCard(QFrame):
         self._stats_label.setStyleSheet(f"""
             background: {ThemeColors.SURFACE_HOVER};
             color: {ThemeColors.TEXT_SECONDARY};
-            padding: 6px 14px;
-            border-radius: 14px;
-            font-size: 12px;
+            padding: 1px 6px; border-radius: 0px; font-size: 10px;
             font-weight: 500;
         """)
         header_layout.addWidget(self._stats_label)
@@ -1864,7 +1860,7 @@ class _ModernColumnCard(QFrame):
         tray_header = QFrame()
         tray_header.setStyleSheet(f"background: {ThemeColors.SURFACE_HOVER};")
         tray_header_layout = QHBoxLayout(tray_header)
-        tray_header_layout.setContentsMargins(16, 10, 16, 10)
+        tray_header_layout.setContentsMargins(4, 2, 4, 2)
         tray_header_layout.setSpacing(12)
         
         tray_label = QLabel(f"📥 {tray_title or 'Ungrouped Trays'}")
@@ -2222,12 +2218,12 @@ class _ModernSettingsDialog(QDialog):
     
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(20)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
         
         # Header
         header = QLabel("Settings")
-        header.setStyleSheet(f"font-size: 24px; font-weight: 700; color: {ThemeColors.TEXT};")
+        header.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {ThemeColors.TEXT};")
         layout.addWidget(header)
         
         # Tab widget
@@ -2260,8 +2256,8 @@ class _ModernSettingsDialog(QDialog):
     def _create_connection_tab(self) -> QWidget:
         widget = QWidget()
         form = QFormLayout(widget)
-        form.setSpacing(16)
-        form.setContentsMargins(16, 20, 16, 20)
+        form.setSpacing(4)
+        form.setContentsMargins(4, 4, 4, 4)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         
         self._host_input = QLineEdit()
@@ -2285,8 +2281,8 @@ class _ModernSettingsDialog(QDialog):
     def _create_grouping_tab(self) -> QWidget:
         widget = QWidget()
         form = QFormLayout(widget)
-        form.setSpacing(16)
-        form.setContentsMargins(16, 20, 16, 20)
+        form.setSpacing(4)
+        form.setContentsMargins(4, 4, 4, 4)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         
         self._max_trays_input = QSpinBox()
@@ -2328,8 +2324,8 @@ class _ModernSettingsDialog(QDialog):
     def _create_performance_tab(self) -> QWidget:
         widget = QWidget()
         form = QFormLayout(widget)
-        form.setSpacing(16)
-        form.setContentsMargins(16, 20, 16, 20)
+        form.setSpacing(4)
+        form.setContentsMargins(4, 4, 4, 4)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         
         self._refresh_interval_input = QDoubleSpinBox()
@@ -2415,14 +2411,14 @@ class _ModernTrolleyDetailDialog(QDialog):
     
     def _setup_ui(self, trolley_id: str, tray_rows: list[dict[str, str]]) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(20)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
         
         # Header
         header_layout = QHBoxLayout()
         
         title = QLabel(f"🚗 {trolley_id}")
-        title.setStyleSheet(f"font-size: 24px; font-weight: 700; color: {ThemeColors.TEXT};")
+        title.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {ThemeColors.TEXT};")
         header_layout.addWidget(title)
         
         header_layout.addStretch()
@@ -2435,8 +2431,8 @@ class _ModernTrolleyDetailDialog(QDialog):
         tray_badge.setStyleSheet(f"""
             background: {ThemeColors.PRIMARY_LIGHT};
             color: {ThemeColors.PRIMARY};
-            padding: 8px 16px;
-            border-radius: 16px;
+            padding: 2px 8px;
+            border-radius: 0px;
             font-weight: 600;
         """)
         header_layout.addWidget(tray_badge)
@@ -2445,8 +2441,8 @@ class _ModernTrolleyDetailDialog(QDialog):
         cell_badge.setStyleSheet(f"""
             background: {ThemeColors.SUCCESS_BG};
             color: {ThemeColors.SUCCESS};
-            padding: 8px 16px;
-            border-radius: 16px;
+            padding: 2px 8px;
+            border-radius: 0px;
             font-weight: 600;
         """)
         header_layout.addWidget(cell_badge)
@@ -2463,11 +2459,11 @@ class _ModernTrolleyDetailDialog(QDialog):
             QFrame {{
                 background: {ThemeColors.SURFACE};
                 border: 1px solid {ThemeColors.BORDER};
-                border-radius: 12px;
+                border-radius: 0px;
             }}
         """)
         summary_layout = QVBoxLayout(summary_widget)
-        summary_layout.setContentsMargins(16, 16, 16, 16)
+        summary_layout.setContentsMargins(4, 2, 4, 2)
         
         summary_header = QLabel("📋 Tray Summary")
         summary_header.setStyleSheet(f"font-size: 14px; font-weight: 600; color: {ThemeColors.TEXT}; border: none;")
@@ -2496,11 +2492,11 @@ class _ModernTrolleyDetailDialog(QDialog):
             QFrame {{
                 background: {ThemeColors.SURFACE};
                 border: 1px solid {ThemeColors.BORDER};
-                border-radius: 12px;
+                border-radius: 0px;
             }}
         """)
         cell_layout = QVBoxLayout(cell_widget)
-        cell_layout.setContentsMargins(16, 16, 16, 16)
+        cell_layout.setContentsMargins(4, 2, 4, 2)
         
         cell_header_layout = QHBoxLayout()
         cell_header = QLabel("🔋 Cell Detail")
@@ -2758,17 +2754,18 @@ class _MainWindow(QMainWindow):
     
     def _setup_ui(self) -> None:
         root = QWidget(self)
+        root.setObjectName("appRoot")
         self._root_widget = root
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         p = self._theme.palette
         
         # ═══════════════════════════════════════════════════════════════
         # TOP SECTION: Metrics
         # ═══════════════════════════════════════════════════════════════
         metrics_row = QHBoxLayout()
-        metrics_row.setSpacing(10)
+        metrics_row.setSpacing(2)
         
         self._metric_boxes = {
             "tray_count": MetricCard("Total Trays", "📦", self._theme.palette.chart_1, show_sparkline=True),
@@ -2789,8 +2786,8 @@ class _MainWindow(QMainWindow):
         
         self._metrics_skeleton_bar = QWidget()
         skeleton_row = QHBoxLayout(self._metrics_skeleton_bar)
-        skeleton_row.setContentsMargins(4, 0, 4, 0)
-        skeleton_row.setSpacing(12)
+        skeleton_row.setContentsMargins(0, 0, 0, 0)
+        skeleton_row.setSpacing(2)
         for _ in range(6):
             sk = Skeleton(height=8)
             self._metric_skeletons.append(sk)
@@ -2803,8 +2800,8 @@ class _MainWindow(QMainWindow):
         toolbar = QFrame()
         toolbar.setObjectName("card")
         toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(12, 8, 12, 8)
-        toolbar_layout.setSpacing(10)
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setSpacing(2)
         
         # Search
         self._search_bar = SearchBar("Search Tray/Cell ID...", show_button=True)
@@ -2869,19 +2866,19 @@ class _MainWindow(QMainWindow):
         ungroup_actions = QWidget()
         ungroup_actions_layout = QHBoxLayout(ungroup_actions)
         ungroup_actions_layout.setContentsMargins(0, 0, 0, 0)
-        ungroup_actions_layout.setSpacing(6)
+        ungroup_actions_layout.setSpacing(2)
         
         self._add_trolley_input = QLineEdit()
         self._add_trolley_input.setPlaceholderText("Trolley ID")
         self._add_trolley_input.setMaximumWidth(112)
-        self._add_trolley_input.setFixedHeight(34)
+        self._add_trolley_input.setFixedHeight(24)
         self._refresh_suggested_trolley_id(force=True)
         ungroup_actions_layout.addWidget(self._add_trolley_input)
         
         self._add_trolley_btn = QPushButton("+ Add")
         self._add_trolley_btn.setObjectName("addTrolleyBtn")
         self._add_trolley_btn.setMaximumWidth(86)
-        self._add_trolley_btn.setFixedHeight(34)
+        self._add_trolley_btn.setFixedHeight(24)
         ungroup_actions_layout.addWidget(self._add_trolley_btn)
         self._style_add_trolley_button()
         
@@ -2889,7 +2886,7 @@ class _MainWindow(QMainWindow):
         board_widget = QWidget()
         board = QHBoxLayout(board_widget)
         board.setContentsMargins(0, 0, 0, 0)
-        board.setSpacing(10)
+        board.setSpacing(2)
         
         self._assembly_card = _ModernColumnCard(
             "Assembly", "🏭", "#8b5cf6",
@@ -2930,7 +2927,7 @@ class _MainWindow(QMainWindow):
         self._analytics_panel = self._dashboard_panel
         
         board_row = QHBoxLayout()
-        board_row.setSpacing(8)
+        board_row.setSpacing(2)
         board_row.addWidget(board_widget, 1)
         board_row.addWidget(self._dashboard_panel)
         layout.addLayout(board_row, 1)
@@ -2945,22 +2942,22 @@ class _MainWindow(QMainWindow):
         status_bar.setSizeGripEnabled(False)
         
         self._status = QLabel("🟢 Ready")
-        self._status.setStyleSheet(f"color: {p.text_secondary}; padding: 4px 12px;")
+        self._status.setStyleSheet(f"color: {p.text_secondary}; padding: 0 4px;")
         status_bar.addWidget(self._status, 1)
         
         self._refresh_indicator = QLabel("")
-        self._refresh_indicator.setStyleSheet(f"color: {p.text_muted}; font-size: 11px; padding: 4px 8px;")
+        self._refresh_indicator.setStyleSheet(f"color: {p.text_muted}; font-size: 11px; padding: 0 2px;")
         status_bar.addPermanentWidget(self._refresh_indicator)
         
         self._connection_status = QLabel("")
         status_bar.addPermanentWidget(self._connection_status)
         
         sep = QLabel("|")
-        sep.setStyleSheet(f"color: {p.border}; padding: 4px 4px;")
+        sep.setStyleSheet(f"color: {p.border}; padding: 0 2px;")
         status_bar.addPermanentWidget(sep)
         
         self._clock_label = QLabel("")
-        self._clock_label.setStyleSheet(f"color: {p.text_muted}; padding: 4px 12px;")
+        self._clock_label.setStyleSheet(f"color: {p.text_muted}; padding: 0 4px;")
         status_bar.addPermanentWidget(self._clock_label)
         self._refresh_connection_badge()
         self._update_clock()
@@ -3009,10 +3006,10 @@ class _MainWindow(QMainWindow):
         p = self._theme.palette
         if self._viewer_mode:
             self._connection_status.setText("🟡 Viewer mode")
-            self._connection_status.setStyleSheet(f"color: {p.warning}; font-weight: 600; padding: 4px 12px;")
+            self._connection_status.setStyleSheet(f"color: {p.warning}; font-weight: 600; padding: 0 4px;")
         else:
             self._connection_status.setText("🟢 Connected")
-            self._connection_status.setStyleSheet(f"color: {p.success}; font-weight: 600; padding: 4px 12px;")
+            self._connection_status.setStyleSheet(f"color: {p.success}; font-weight: 600; padding: 0 4px;")
 
     def _toggle_theme(self) -> None:
         self._theme.toggle()
@@ -3024,7 +3021,7 @@ class _MainWindow(QMainWindow):
         mode_value = mode.value if isinstance(mode, ThemeMode) else str(mode).lower()
         is_dark = mode_value == "dark"
         self._theme_btn.setText("☀️" if is_dark else "🌙")
-        self._status.setStyleSheet(f"color: {self._theme.palette.text_secondary}; padding: 4px 12px;")
+        self._status.setStyleSheet(f"color: {self._theme.palette.text_secondary}; padding: 0 4px;")
         self._clock_label.setStyleSheet(f"color: {self._theme.palette.text_muted}; padding: 4px 12px;")
         self._style_add_trolley_button()
         self._refresh_connection_badge()
@@ -3040,18 +3037,18 @@ class _MainWindow(QMainWindow):
             return
         p = self._theme.palette
         is_dark = self._theme.is_dark
-        bg = "#000000" if is_dark else p.background_secondary
-        hover_bg = "#111111" if is_dark else p.surface_hover
-        pressed_bg = "#1a1a1a" if is_dark else p.surface
-        fg = "#f8fafc" if is_dark else p.text_primary
+        bg_color = "#334155" if is_dark else p.background_secondary
+        hover_bg = "#475569" if is_dark else p.surface_hover
+        pressed_bg = "#1e293b" if is_dark else p.surface
+        fg_color = "#f8fafc" if is_dark else p.text_primary
         self._add_trolley_btn.setStyleSheet(
             f"""
             QPushButton#addTrolleyBtn {{
-                background: {bg};
-                color: {fg};
+                background: {bg_color};
+                color: {fg_color};
                 border: 1px solid {p.border};
-                border-radius: 10px;
-                padding: 6px 12px;
+                border-radius: 0px;
+                padding: 2px 6px;
                 font-weight: 600;
             }}
             QPushButton#addTrolleyBtn:hover {{
@@ -3773,12 +3770,12 @@ class _MainWindow(QMainWindow):
             QMenu {{
                 background: {p.surface};
                 border: 1px solid {p.border};
-                border-radius: 12px;
+                border-radius: 0px;
                 padding: 8px;
             }}
             QMenu::item {{
                 padding: 10px 20px;
-                border-radius: 6px;
+                border-radius: 0px;
             }}
             QMenu::item:selected {{
                 background: {p.surface_hover};
@@ -4023,7 +4020,7 @@ class _MainWindow(QMainWindow):
 
         display_msg = f"{icon} {message}" if icon and not message.startswith(icon) else message
         self._status.setText(display_msg)
-        self._status.setStyleSheet(f"color: {color}; padding: 4px 12px; font-size: 12px;")
+        self._status.setStyleSheet(f"color: {color}; padding: 0 4px; font-size: 12px;")
         self._status_clear_timer.start(8000)
         if notify and status_type in {"success", "warning", "danger"}:
             if status_type == "success":
@@ -4047,7 +4044,7 @@ class _MainWindow(QMainWindow):
 
     def _clear_status(self) -> None:
         self._status.setText("🟢 Ready")
-        self._status.setStyleSheet(f"color: {self._theme.palette.text_secondary}; padding: 4px 12px; font-size: 12px;")
+        self._status.setStyleSheet(f"color: {self._theme.palette.text_secondary}; padding: 0 4px; font-size: 12px;")
 
     def _clear_all_selections(self) -> None:
         """Clear all selections (trolley lists and tray table)"""
@@ -4414,6 +4411,13 @@ class _MainWindow(QMainWindow):
 
 def main() -> int:
     _configure_logging()
+    
+    # DEBUG: Print theme colors
+    from wip_management.presentation.ui.theme import get_theme, LIGHT_PALETTE, DARK_PALETTE
+    print(f"DEBUG Light background: {LIGHT_PALETTE.background}")
+    print(f"DEBUG Light surface: {LIGHT_PALETTE.surface}")
+    print(f"DEBUG Dark background: {DARK_PALETTE.background}")
+    print(f"DEBUG Dark surface: {DARK_PALETTE.surface}")
     _install_crash_hooks()
     log.info("Application starting pid=%s python=%s", os.getpid(), sys.version.split()[0])
     

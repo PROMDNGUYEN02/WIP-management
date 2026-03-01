@@ -572,6 +572,7 @@ SELECT 1 AS ok;
 
 class GroupingStateDbRepo:
     _MANUAL_ASSIGNMENTS_KEY = "manual_assignments"
+    _KNOWN_TROLLEY_IDS_KEY = "known_trolley_ids"
     _LAST_PROJECTION_KEY = "last_projection"
 
     def __init__(self, connection: SQLServerConnection) -> None:
@@ -640,6 +641,21 @@ class GroupingStateDbRepo:
             return {}
         return dict(raw)
 
+    async def load_known_trolley_ids(self) -> list[str]:
+        raw = await self._read_state_json(self._KNOWN_TROLLEY_IDS_KEY)
+        values = raw.get("items") if isinstance(raw, dict) else []
+        if not isinstance(values, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            trolley_id = str(value).strip()
+            if not trolley_id or trolley_id in seen:
+                continue
+            seen.add(trolley_id)
+            out.append(trolley_id)
+        return out
+
     async def set_manual_assignment(
         self,
         tray_id: str,
@@ -697,6 +713,20 @@ class GroupingStateDbRepo:
     async def save_projection(self, projection: dict[str, Any]) -> None:
         payload = projection if isinstance(projection, dict) else {}
         await self._write_state_json(self._LAST_PROJECTION_KEY, payload)
+
+    async def save_known_trolley_ids(self, trolley_ids: list[str]) -> None:
+        unique_ids: list[str] = []
+        seen: set[str] = set()
+        for value in trolley_ids:
+            trolley_id = str(value).strip()
+            if not trolley_id or trolley_id in seen:
+                continue
+            seen.add(trolley_id)
+            unique_ids.append(trolley_id)
+        await self._write_state_json(
+            self._KNOWN_TROLLEY_IDS_KEY,
+            {"items": unique_ids},
+        )
 
     async def _read_state_json(self, state_key: str) -> dict[str, Any]:
         if not self._schema_available:

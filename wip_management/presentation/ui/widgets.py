@@ -63,7 +63,7 @@ class TrolleyItemDelegate(QStyledItemDelegate):
             bg_color = QColor(theme.palette.surface)
         
         path = QPainterPath()
-        path.addRoundedRect(QRectF(rect).adjusted(4, 2, -4, -2), 10, 10)
+        path.addRect(QRectF(rect).adjusted(4, 2, -4, -2))
         painter.fillPath(path, bg_color)
         
         # Border
@@ -85,10 +85,10 @@ class TrolleyItemDelegate(QStyledItemDelegate):
         aging_time = str(model.data(index, model.AgingTimeRole) or "-")
         
         # Layout
-        inner_rect = rect.adjusted(16, 8, -16, -8)
+        inner_rect = rect.adjusted(8, 2, -8, -2)
         
         # Trolley ID
-        painter.setFont(QFont("Segoe UI", 13, QFont.Weight.DemiBold))
+        painter.setFont(QFont("Segoe UI", 11, QFont.Weight.DemiBold))
         painter.setPen(QColor(theme.palette.text_primary))
         painter.drawText(inner_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, trolley_id)
         
@@ -105,8 +105,8 @@ class TrolleyItemDelegate(QStyledItemDelegate):
             self._draw_badge(painter, inner_rect.right() - 70, state_y, state, bg, fg)
         
         # Bottom row: mode, tray count, aging
-        bottom_y = inner_rect.bottom() - 14
-        painter.setFont(QFont("Segoe UI", 11))
+        bottom_y = inner_rect.bottom() - 12
+        painter.setFont(QFont("Segoe UI", 9))
         painter.setPen(QColor(theme.palette.text_secondary))
         
         # Mode badge
@@ -146,18 +146,18 @@ class TrolleyItemDelegate(QStyledItemDelegate):
         small: bool = False,
     ) -> None:
         fm = painter.fontMetrics()
-        padding = 6 if small else 8
-        height = 18 if small else 22
+        padding = 3 if small else 5
+        height = 14 if small else 18
         width = fm.horizontalAdvance(text) + padding * 2
         
         rect = QRectF(x, y, width, height)
         path = QPainterPath()
-        path.addRoundedRect(rect, height / 2, height / 2)
+        path.addRect(rect)
         painter.fillPath(path, QColor(bg_color))
         
         painter.setPen(QColor(fg_color))
         font = painter.font()
-        font.setPointSize(10 if small else 11)
+        font.setPointSize(8 if small else 9)
         font.setWeight(QFont.Weight.DemiBold)
         painter.setFont(font)
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
@@ -167,7 +167,7 @@ class TrolleyItemDelegate(QStyledItemDelegate):
         option: QStyleOptionViewItem,
         index: QModelIndex,
     ) -> QSize:
-        return QSize(option.rect.width(), 72)
+        return QSize(option.rect.width(), 48)
 
 
 class EnhancedColumnCard(QFrame):
@@ -217,11 +217,11 @@ class EnhancedColumnCard(QFrame):
                     stop:1 transparent
                 );
                 border-bottom: 1px solid {theme.palette.border};
-                border-radius: 16px 16px 0 0;
+                border-radius: 0px;
             }}
         """)
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(20, 16, 20, 12)
+        header_layout.setContentsMargins(4, 2, 4, 2)
         
         # Icon + Title
         title_widget = QWidget()
@@ -230,13 +230,13 @@ class EnhancedColumnCard(QFrame):
         title_layout.setSpacing(10)
         
         icon_label = QLabel(self._icon)
-        icon_label.setFont(QFont("Segoe UI Emoji", 18))
+        icon_label.setFont(QFont("Segoe UI Emoji", 12))
         title_layout.addWidget(icon_label)
         
         title_label = QLabel(self._title)
         title_label.setObjectName("columnHeader")
         title_label.setStyleSheet(f"""
-            font-size: 18px;
+            font-size: 13px;
             font-weight: 600;
             color: {theme.palette.text_primary};
         """)
@@ -250,9 +250,7 @@ class EnhancedColumnCard(QFrame):
         self._stats_badge.setStyleSheet(f"""
             background: {theme.palette.surface};
             color: {theme.palette.text_secondary};
-            padding: 6px 12px;
-            border-radius: 14px;
-            font-size: 12px;
+            padding: 1px 6px; border-radius: 0px; font-size: 10px;
             font-weight: 500;
         """)
         header_layout.addWidget(self._stats_badge)
@@ -289,7 +287,7 @@ class EnhancedColumnCard(QFrame):
         tray_header = QFrame()
         tray_header.setStyleSheet(f"background: {theme.palette.surface_hover};")
         tray_header_layout = QHBoxLayout(tray_header)
-        tray_header_layout.setContentsMargins(16, 10, 16, 10)
+        tray_header_layout.setContentsMargins(4, 2, 4, 2)
         
         tray_title = QLabel("📥 Ungrouped Trays")
         tray_title.setStyleSheet(f"""
@@ -372,7 +370,7 @@ class SummaryBar(QFrame):
     def _setup_ui(self) -> None:
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
+        layout.setSpacing(4)
         
         # Define metrics
         metrics = [
@@ -429,14 +427,14 @@ class ToolBar(QFrame):
             QFrame {{
                 background: {theme.palette.surface};
                 border: 1px solid {theme.palette.border};
-                border-radius: 12px;
-                padding: 8px;
+                border-radius: 0px;
+                padding: 0;
             }}
         """)
         
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(12)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
         
         # Search
         self._search = SearchBar("Search Tray/Cell ID...")
@@ -452,8 +450,8 @@ class ToolBar(QFrame):
                 background: {theme.palette.surface};
                 color: {theme.palette.text_primary};
                 border: 1px solid {theme.palette.border};
-                border-radius: 8px;
-                padding: 8px 16px;
+                border-radius: 0px;
+                padding: 2px 8px;
                 font-weight: 500;
             }}
             QPushButton:hover {{
@@ -514,8 +512,8 @@ class StatusBarWidget(QFrame):
     
     def _setup_ui(self) -> None:
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(16, 8, 16, 8)
-        layout.setSpacing(16)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
         
         # Status message
         self._message = QLabel("Ready")

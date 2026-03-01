@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 import logging
 import time
@@ -219,6 +219,8 @@ class OrchestratorService:
         )
         self._recompute_projection = RecomputeProjectionUseCase()
         self._manual_group = ManualGroupUseCase()
+        self._known_trolley_ids: set[str] = set()
+        self._persisted_known_trolley_ids_signature: tuple[str, ...] | None = None
         self._executor = _get_normalize_executor(
             max_workers=max(1, max_parallel_workers)
         )
@@ -737,9 +739,11 @@ class OrchestratorService:
         self, tray_ids: list[str], trolley_id: str, column: Column
     ) -> dict[str, object]:
         target_column = Column.QUEUE
-        normalized_tray_ids = [
-            t.strip() for t in tray_ids if t and t.strip()
-        ]
+        normalized_tray_ids = list(
+            dict.fromkeys(
+                t.strip() for t in tray_ids if t and t.strip()
+            )
+        )
         if not normalized_tray_ids:
             raise ValueError("tray_ids must not be empty")
         normalized_trolley_id = trolley_id.strip()
@@ -752,11 +756,34 @@ class OrchestratorService:
             target_column.value,
         )
         await self._sync_manual_assignments_from_repo(force=True)
+        projection_before = await self._compute_projection()
+        promoted_from_auto = self._promote_auto_trolleys_to_manual(
+            projection_before,
+            source_trolley_id=normalized_trolley_id,
+            target_trolley_id=normalized_trolley_id,
+            preserve_auto_mode=False,
+            only_column=target_column,
+        )
+        target_existing_tray_ids = self._collect_trolley_tray_ids(
+            projection_before,
+            trolley_id=normalized_trolley_id,
+            column=target_column,
+        )
+        target_final_count = len(
+            target_existing_tray_ids.union(set(normalized_tray_ids))
+        )
+        if target_final_count > self._max_trays_per_trolley:
+            raise ValueError(
+                "Cannot group trays: "
+                f"trolley_id={normalized_trolley_id} would exceed max_trays_per_trolley "
+                f"({target_final_count}>{self._max_trays_per_trolley})"
+            )
         applied = self._manual_group.group_many_to_trolley(
             [TrayId(t) for t in normalized_tray_ids],
             trolley_id=normalized_trolley_id,
             column=target_column,
         )
+        self._remember_trolley_ids([normalized_trolley_id])
         session_id: str | None = None
         if self._dashboard_repo is not None:
             session_id = await self._dashboard_repo.map_trays_to_open_session(
@@ -771,6 +798,7 @@ class OrchestratorService:
             "trolley_id": normalized_trolley_id,
             "column": target_column.value,
             "session_id": session_id,
+            "promoted_from_auto": promoted_from_auto,
         }
 
     async def ungroup_trays_manual(
@@ -1021,6 +1049,7 @@ class OrchestratorService:
         source_trolley_id: str | None = None,
         target_trolley_id: str | None = None,
         preserve_auto_mode: bool = False,
+        only_column: Column | None = None,
     ) -> int:
         source_id = str(source_trolley_id or "").strip()
         target_id = str(target_trolley_id or "").strip()
@@ -1028,6 +1057,8 @@ class OrchestratorService:
         current_assignments = self._manual_group.projection_assignments()
         for trolley in projection.trolleys:
             if trolley.mode is not TrolleyMode.AUTO:
+                continue
+            if only_column is not None and trolley.column is not only_column:
                 continue
             trolley_id = str(trolley.trolley_id).strip()
             if source_id and trolley_id != source_id:
@@ -1065,6 +1096,7 @@ class OrchestratorService:
                 column=trolley.column,
                 mode=assign_mode,
             )
+            self._remember_trolley_ids([assign_trolley_id])
             for t in pending_tray_ids:
                 current_assignments[t] = (
                     trolley.column, assign_trolley_id, assign_mode
@@ -2479,6 +2511,8 @@ class OrchestratorService:
         await self._save_projection_to_repo(projection)
 
     async def _publish_snapshot_ready(self, projection: Projection) -> None:
+        self._remember_projection_trolley_ids(projection)
+        await self._persist_known_trolley_ids_to_repo()
         await self._event_bus.publish(
             SnapshotReady(
                 trays=projection.trays,
@@ -2493,6 +2527,56 @@ class OrchestratorService:
     # ═══════════════════════════════════════════════════════════════════════
     # State Sync (unchanged)
     # ═══════════════════════════════════════════════════════════════════════
+    def _collect_trolley_tray_ids(
+        self,
+        projection: Projection,
+        *,
+        trolley_id: str,
+        column: Column | None = None,
+    ) -> set[str]:
+        trolley_key = str(trolley_id).strip()
+        if not trolley_key:
+            return set()
+        out: set[str] = set()
+        for trolley in projection.trolleys:
+            if column is not None and trolley.column is not column:
+                continue
+            if str(trolley.trolley_id).strip() != trolley_key:
+                continue
+            for tray_id in trolley.tray_ids:
+                tray_key = str(tray_id).strip()
+                if tray_key:
+                    out.add(tray_key)
+        return out
+
+    def _remember_projection_trolley_ids(self, projection: Projection) -> None:
+        self._remember_trolley_ids(
+            str(trolley.trolley_id) for trolley in projection.trolleys
+        )
+
+    def _remember_trolley_ids(self, trolley_ids: Iterable[object]) -> None:
+        for trolley_id in trolley_ids:
+            trolley_key = str(trolley_id).strip()
+            if trolley_key:
+                self._known_trolley_ids.add(trolley_key)
+
+    def _known_trolley_ids_payload(self) -> list[str]:
+        return sorted(self._known_trolley_ids)
+
+    async def _persist_known_trolley_ids_to_repo(self) -> None:
+        if self._grouping_state_repo is None:
+            return
+        payload = self._known_trolley_ids_payload()
+        signature = tuple(payload)
+        if signature == self._persisted_known_trolley_ids_signature:
+            return
+        try:
+            await self._grouping_state_repo.save_known_trolley_ids(payload)
+        except Exception:
+            log.exception("Failed to save known trolley ids to shared repo")
+            return
+        self._persisted_known_trolley_ids_signature = signature
+
     async def _sync_manual_assignments_from_repo(
         self, *, force: bool = False
     ) -> bool:
@@ -2504,9 +2588,12 @@ class OrchestratorService:
                 return False
         try:
             loaded = await self._grouping_state_repo.load_manual_assignments()
+            loaded_known_trolley_ids = (
+                await self._grouping_state_repo.load_known_trolley_ids()
+            )
         except Exception:
             log.exception(
-                "Failed to load manual assignments from shared repo"
+                "Failed to load grouping state from shared repo"
             )
             self._last_grouping_sync_at = now
             return False
@@ -2535,6 +2622,21 @@ class OrchestratorService:
                 )
 
         current = self._manual_group.projection_assignments()
+        loaded_known_set = {
+            str(trolley_id).strip()
+            for trolley_id in loaded_known_trolley_ids
+            if str(trolley_id).strip()
+        }
+        known_trolley_ids = set(loaded_known_set)
+        known_trolley_ids.update(
+            str(trolley_id).strip()
+            for _, trolley_id, _ in parsed.values()
+            if str(trolley_id).strip()
+        )
+        self._known_trolley_ids = known_trolley_ids
+        self._persisted_known_trolley_ids_signature = tuple(
+            sorted(loaded_known_set)
+        )
         self._last_grouping_sync_at = now
 
         if parsed == current:
@@ -2553,7 +2655,11 @@ class OrchestratorService:
         payload: dict[str, tuple[str, str, str]] = {}
         for tray_id, (column, trolley_id, mode) in projection_assignments.items():
             payload[tray_id] = (column.value, trolley_id, mode.value)
+        self._remember_trolley_ids(
+            trolley_id for _, trolley_id, _ in payload.values()
+        )
         await self._grouping_state_repo.replace_manual_assignments(payload)
+        await self._persist_known_trolley_ids_to_repo()
         self._last_grouping_sync_at = self._clock.now()
         log.debug(
             "Manual assignments persisted to shared repo count=%s",
@@ -2563,6 +2669,7 @@ class OrchestratorService:
     async def _save_projection_to_repo(self, projection: Projection) -> None:
         if self._grouping_state_repo is None:
             return
+        self._remember_projection_trolley_ids(projection)
         watermark = await self._delta_tracker.get()
         payload = _projection_grouping_payload(
             projection,
@@ -2572,6 +2679,7 @@ class OrchestratorService:
         )
         try:
             await self._grouping_state_repo.save_projection(payload)
+            await self._persist_known_trolley_ids_to_repo()
         except Exception:
             log.exception("Failed to save projection to shared repo")
 

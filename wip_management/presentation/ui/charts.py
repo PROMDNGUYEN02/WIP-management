@@ -127,7 +127,7 @@ class DonutChart(QWidget):
             # Color box
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(color))
-            painter.drawRoundedRect(QRectF(legend_x, legend_y, 12, 12), 3, 3)
+            painter.drawRect(QRectF(legend_x, legend_y, 12, 12))
             
             # Label
             painter.setPen(QColor(p.text_secondary))
@@ -264,7 +264,7 @@ class BarChart(QWidget):
             
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(gradient)
-            painter.drawRoundedRect(bar_rect, 4, 4)
+            painter.drawRect(bar_rect)
             
             # Value label
             if self._show_values and self._animation_progress >= 1.0:

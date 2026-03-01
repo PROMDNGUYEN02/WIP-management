@@ -1,141 +1,49 @@
-2026-03-02 03:47:24,402 INFO __main__ [MainThread] Logging configured level=INFO console=True file=wip_management.log
-2026-03-02 03:47:24,402 INFO __main__ [MainThread] Application starting pid=14056 python=3.11.9
-2026-03-02 03:47:24,402 WARNING __main__ [MainThread] ======================================================================
+2026-03-02 04:44:19,606 INFO __main__ [MainThread] Logging configured level=INFO console=True file=wip_management.log
+2026-03-02 04:44:19,606 INFO __main__ [MainThread] Application starting pid=21948 python=3.11.9
+2026-03-02 04:44:19,607 WARNING __main__ [MainThread] ======================================================================
 WARNING: Only legacy 'SQL Server' ODBC driver detected!
 This driver has known thread-safety issues.
 The application will run in SERIALIZED mode (slower).
 For better performance, install:
   'ODBC Driver 17 for SQL Server' or 'ODBC Driver 18 for SQL Server'
 ======================================================================
-2026-03-02 03:47:24,424 INFO __main__ [MainThread] Runtime start requested
-2026-03-02 03:47:24,432 INFO __main__ [wip-runtime] Runtime thread main started
-2026-03-02 03:47:24,433 INFO __main__ [wip-runtime] Runtime async bootstrap started
-2026-03-02 03:47:24,433 INFO __main__ [wip-runtime] Shared grouping state enabled path=C:\Users\PROMDNGUYEN02\OneDrive - Techtronic Industries Co. Ltd\AES_Mass production - WIP Management\grouping_state.json
-2026-03-02 03:47:24,453 INFO __main__ [wip-runtime] Runtime role=leader lock_path=C:\Users\PROMDNGUYEN02\OneDrive - Techtronic Industries Co. Ltd\AES_Mass production - WIP Management\.leader.lock
-2026-03-02 03:47:24,453 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU repo: using JSON_VALUE('$.TRAYID.paramValue') for tray ID extraction (MANUFACTURE_CODE contains machine codes, not tray IDs)
-2026-03-02 03:47:24,454 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator initialized sql_timeout=15s max_batch=10000 poll=6.0s today_only=True window_ccu_start=2026-03-01T18:00:00 window_fpc_start=2026-03-02T00:00:00
-2026-03-02 03:47:24,456 INFO wip_management.infrastructure.messaging.event_bus [wip-runtime] Event bus subscribe subscribers=1 queue_size=20000
-2026-03-02 03:47:24,456 INFO __main__ [wip-runtime] Runtime subscribed to event bus
-2026-03-02 03:47:24,456 INFO __main__ [wip-runtime] Runtime bootstrap signal emitted to UI thread
-2026-03-02 03:47:24,457 INFO __main__ [wip-runtime] Starting orchestrator service
-2026-03-02 03:47:24,456 INFO __main__ [MainThread] Runtime thread bootstrapped successfully
-2026-03-02 03:47:24,457 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator start begin
-2026-03-02 03:47:24,457 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] Starting SQL pool with 1 driver candidate(s): ['SQL Server']
-2026-03-02 03:47:24,457 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] Legacy SQL driver 'SQL Server' detected. Using 3-LANE SAFE mode (3 connections: ccu + fpc + ui, 1 shared ODBC thread). All ODBC calls serialised through a single OS thread to prevent access-violation crashes from the non-thread-safe driver DLL. Install 'ODBC Driver 17 for SQL Server' for true parallelism.
-2026-03-02 03:47:24,462 INFO __main__ [wip-runtime] UI event coalescer loop started
-2026-03-02 03:47:24,717 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL ODBC driver selected configured=auto active=SQL Server
-2026-03-02 03:47:24,717 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query concurrency: 3-LANE SAFE mode lanes=[ccu, fpc, ui] connections=3 shared_executor_threads=1 is_legacy=True (all ODBC calls serialised through 1 OS thread)
-2026-03-02 03:47:24,884 WARNING wip_management.infrastructure.sqlserver.dashboard_repo [wip-runtime] Dashboard repo detected read-only database; skip ensure_schema schema_available=True
-2026-03-02 03:47:24,885 INFO wip_management.application.state.state_store [wip-runtime] State store writer loop started queue_size=20000
-2026-03-02 03:47:24,887 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load window TODAY mode ccu_start=2026-03-01T18:00:00 (9.8h) fpc_start=2026-03-02T00:00:00 (3.8h) end=2026-03-02T03:47:24.887434 buffer=6.0h today_start=2026-03-02T00:00:00 filter=show_if_ccu_today_OR_fpc_today fpc_timeout=180s
-2026-03-02 03:47:24,887 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU initial fetch start start_time=2026-03-01T18:00:00 end_time=2026-03-02T03:47:24.887434 batch_size=10000
-2026-03-02 03:47:24,887 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial fetch start start_time=2026-03-02T00:00:00 end_time=2026-03-02T03:47:24.887434 filters=none
-2026-03-02 03:47:39,800 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU fetch range paged pages=4 raw_rows=30362 batch_size=10000
-2026-03-02 03:47:40,447 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU initial fetch done elapsed_ms=15559 raw_rows=30362 signals=78
-2026-03-02 03:47:40,470 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=78 changed=78 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T03:31:25
-2026-03-02 03:47:40,472 INFO __main__ [wip-runtime] UI snapshot event trays=28
-2026-03-02 03:47:40,477 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=ccu merged=78 changed=78 trays=28
-2026-03-02 03:47:40,513 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=28
-2026-03-02 03:47:43,599 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC fetch range keyset-paged pages=6 raw_rows=56002 batch_size=10000
-2026-03-02 03:47:44,450 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial fetch done elapsed_ms=19563 raw_rows=56002 signals=36
-2026-03-02 03:47:44,481 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=114 changed=36 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T03:45:34
-2026-03-02 03:47:44,481 INFO __main__ [wip-runtime] UI snapshot event trays=42
-2026-03-02 03:47:44,497 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load completed elapsed_ms=19616 merged=114 trays=42 ccu=78 fpc=36 overlap=36 backfill_scheduled=False watermark=2026-03-02T03:47:24.887434 partial_source=ccu fpc_timed_out=False mode=today
-2026-03-02 03:47:44,497 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator start completed
-2026-03-02 03:47:44,497 INFO __main__ [wip-runtime] Orchestrator started successfully
-2026-03-02 03:47:44,497 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh loop started interval_seconds=6.0
-2026-03-02 03:47:44,513 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=42
-2026-03-02 03:47:50,926 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=1 changed=0 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=1 next_wm=2026-03-02T03:45:34
-2026-03-02 03:47:50,926 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #1 completed elapsed_ms=440 merged=1 changed=0
-2026-03-02 03:48:50,630 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=0 changed=0 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T03:48:05.531656
-2026-03-02 03:48:50,634 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #5 completed elapsed_ms=89 merged=0 changed=0
-2026-03-02 03:49:50,664 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=0 changed=0 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T03:49:05.593328
-2026-03-02 03:49:50,668 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #9 completed elapsed_ms=57 merged=0 changed=0
-2026-03-02 03:50:50,701 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=0 changed=0 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T03:50:05.642845
-2026-03-02 03:50:50,703 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #13 completed elapsed_ms=45 merged=0 changed=0
-2026-03-02 03:51:37,192 INFO __main__ [MainThread] Qt event loop exited code=0
-2026-03-02 03:51:37,193 INFO __main__ [MainThread] Runtime stop requested
-2026-03-02 03:51:37,193 INFO __main__ [wip-runtime] Runtime shutdown sequence started
-2026-03-02 03:51:37,194 INFO __main__ [wip-runtime] UI event coalescer loop cancelled
-2026-03-02 03:51:37,195 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator stop begin
-2026-03-02 03:51:37,195 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh loop stopped
-2026-03-02 03:51:37,196 INFO wip_management.application.services.orchestrator [wip-runtime] Tray detail cache stats: hits=0 misses=0 evictions=0 hit_rate=0.0%
-2026-03-02 03:51:37,197 INFO wip_management.application.state.state_store [wip-runtime] State store stopping writer loop
-2026-03-02 03:51:37,197 INFO wip_management.application.state.state_store [wip-runtime] State store writer loop stopped
-2026-03-02 03:51:37,198 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] Closing SQL pool
-2026-03-02 03:51:37,199 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query statistics:
-2026-03-02 03:51:37,199 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime]   ccu.fetch_range: {'total_queries': 8, 'total_time_ms': 8004, 'total_queue_wait_ms': 0, 'total_db_exec_ms': 803, 'total_fetch_ms': 7201, 'slow_queries': 0, 'errors': 0, 'avg_recent_ms': 1000.5, 'avg_total_ms': 1000.5, 'avg_queue_wait_ms': 0.0, 'avg_db_exec_ms': 100.4, 'avg_fetch_ms': 900.1}
-2026-03-02 03:51:37,200 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime]   dashboard.check_schema_available: {'total_queries': 1, 'total_time_ms': 151, 'total_queue_wait_ms': 0, 'total_db_exec_ms': 151, 'total_fetch_ms': 0, 'slow_queries': 0, 'errors': 0, 'avg_recent_ms': 151.0, 'avg_total_ms': 151.0, 'avg_queue_wait_ms': 0.0, 'avg_db_exec_ms': 151.0, 'avg_fetch_ms': 0.0}
-2026-03-02 03:51:37,200 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime]   dashboard.db_updateability: {'total_queries': 1, 'total_time_ms': 7, 'total_queue_wait_ms': 0, 'total_db_exec_ms': 7, 'total_fetch_ms': 0, 'slow_queries': 0, 'errors': 0, 'avg_recent_ms': 7.0, 'avg_total_ms': 7.0, 'avg_queue_wait_ms': 0.0, 'avg_db_exec_ms': 7.0, 'avg_fetch_ms': 0.0}
-2026-03-02 03:51:37,201 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime]   fpc.fetch_range: {'total_queries': 10, 'total_time_ms': 19098, 'total_queue_wait_ms': 0, 'total_db_exec_ms': 1484, 'total_fetch_ms': 17614, 'slow_queries': 0, 'errors': 0, 'avg_recent_ms': 1909.8, 'avg_total_ms': 1909.8, 'avg_queue_wait_ms': 0.0, 'avg_db_exec_ms': 148.4, 'avg_fetch_ms': 1761.4}
-2026-03-02 03:51:37,202 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL pool closed
-2026-03-02 03:51:37,202 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU repo closed cache_stats={'tray_cells': {'name': 'tray_cells', 'size': 0, 'maxsize': 1000, 'hits': 0, 'misses': 0, 'hit_rate': '0.0%'}, 'disk': {'size': 0, 'max_entries': 2000, 'ttl_hours': 24.0, 'hits': 0, 'misses': 0, 'hit_rate': '0.0%', 'writes': 0, 'read_errors': 0, 'total_bytes': 0}, 'cell_owner': {'name': 'cell_owner', 'size': 0, 'maxsize': 1000, 'hits': 0, 'misses': 0, 'hit_rate': '0.0%'}, 'known_trays': 78, 'lookup_strategy': 'json_value', 'json_tray_path': '$.TRAYID.paramValue'}
-2026-03-02 03:51:37,203 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator stop completed
-2026-03-02 03:51:37,203 INFO wip_management.infrastructure.messaging.event_bus [wip-runtime] Event bus unsubscribe subscribers=0
-2026-03-02 03:51:37,203 INFO __main__ [wip-runtime] Runtime shutdown sequence completed
-2026-03-02 03:51:37,203 INFO __main__ [wip-runtime] Runtime thread main exited
-2026-03-02 03:51:37,203 INFO __main__ [MainThread] Runtime thread stopped (graceful)
-2026-03-02 03:51:37,204 INFO __main__ [MainThread] Application stopped
-2026-03-02 03:51:54,687 INFO __main__ [MainThread] Logging configured level=INFO console=True file=wip_management.log
-2026-03-02 03:51:54,688 INFO __main__ [MainThread] Application starting pid=18408 python=3.11.9
-2026-03-02 03:51:54,688 WARNING __main__ [MainThread] ======================================================================
-WARNING: Only legacy 'SQL Server' ODBC driver detected!
-This driver has known thread-safety issues.
-The application will run in SERIALIZED mode (slower).
-For better performance, install:
-  'ODBC Driver 17 for SQL Server' or 'ODBC Driver 18 for SQL Server'
-======================================================================
-2026-03-02 03:51:54,991 INFO __main__ [MainThread] Runtime start requested
-2026-03-02 03:51:54,992 INFO __main__ [wip-runtime] Runtime thread main started
-2026-03-02 03:51:54,994 INFO __main__ [wip-runtime] Runtime async bootstrap started
-2026-03-02 03:51:54,994 INFO __main__ [wip-runtime] Shared grouping state enabled path=C:\Users\PROMDNGUYEN02\OneDrive - Techtronic Industries Co. Ltd\AES_Mass production - WIP Management\grouping_state.json
-2026-03-02 03:51:55,002 INFO __main__ [wip-runtime] Runtime role=leader lock_path=C:\Users\PROMDNGUYEN02\OneDrive - Techtronic Industries Co. Ltd\AES_Mass production - WIP Management\.leader.lock
-2026-03-02 03:51:55,003 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU repo: using JSON_VALUE('$.TRAYID.paramValue') for tray ID extraction (MANUFACTURE_CODE contains machine codes, not tray IDs)
-2026-03-02 03:51:55,005 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator initialized sql_timeout=15s max_batch=10000 poll=6.0s today_only=True window_ccu_start=2026-03-01T18:00:00 window_fpc_start=2026-03-02T00:00:00
-2026-03-02 03:51:55,006 INFO wip_management.infrastructure.messaging.event_bus [wip-runtime] Event bus subscribe subscribers=1 queue_size=20000
-2026-03-02 03:51:55,006 INFO __main__ [wip-runtime] Runtime subscribed to event bus
-2026-03-02 03:51:55,007 INFO __main__ [wip-runtime] Runtime bootstrap signal emitted to UI thread
-2026-03-02 03:51:55,007 INFO __main__ [wip-runtime] Starting orchestrator service
-2026-03-02 03:51:55,007 INFO __main__ [MainThread] Runtime thread bootstrapped successfully
-2026-03-02 03:51:55,007 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator start begin
-2026-03-02 03:51:55,008 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] Starting SQL pool with 1 driver candidate(s): ['SQL Server']
-2026-03-02 03:51:55,008 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] Legacy SQL driver 'SQL Server' detected. Using 3-LANE SAFE mode (3 connections: ccu + fpc + ui, 1 shared ODBC thread). All ODBC calls serialised through a single OS thread to prevent access-violation crashes from the non-thread-safe driver DLL. Install 'ODBC Driver 17 for SQL Server' for true parallelism.
-2026-03-02 03:51:55,013 INFO __main__ [wip-runtime] UI event coalescer loop started
-2026-03-02 03:51:55,294 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL ODBC driver selected configured=auto active=SQL Server
-2026-03-02 03:51:55,295 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query concurrency: 3-LANE SAFE mode lanes=[ccu, fpc, ui] connections=3 shared_executor_threads=1 is_legacy=True (all ODBC calls serialised through 1 OS thread)
-2026-03-02 03:51:55,316 WARNING wip_management.infrastructure.sqlserver.dashboard_repo [wip-runtime] Dashboard repo detected read-only database; skip ensure_schema schema_available=True
-2026-03-02 03:51:55,316 INFO wip_management.application.state.state_store [wip-runtime] State store writer loop started queue_size=20000
-2026-03-02 03:51:55,317 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load window TODAY mode ccu_start=2026-03-01T18:00:00 (9.9h) fpc_start=2026-03-02T00:00:00 (3.9h) end=2026-03-02T03:51:55.317663 buffer=6.0h today_start=2026-03-02T00:00:00 filter=show_if_ccu_today_OR_fpc_today fpc_timeout=180s
-2026-03-02 03:51:55,318 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU initial fetch start start_time=2026-03-01T18:00:00 end_time=2026-03-02T03:51:55.317663 batch_size=10000
-2026-03-02 03:51:55,318 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial fetch start start_time=2026-03-02T00:00:00 end_time=2026-03-02T03:51:55.317663 filters=none
-2026-03-02 03:52:11,489 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU fetch range paged pages=4 raw_rows=30362 batch_size=10000
-2026-03-02 03:52:12,019 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU initial fetch done elapsed_ms=16701 raw_rows=30362 signals=78
-2026-03-02 03:52:12,042 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=78 changed=78 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T03:31:25
-2026-03-02 03:52:12,044 INFO __main__ [wip-runtime] UI snapshot event trays=28
-2026-03-02 03:52:12,049 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=ccu merged=78 changed=78 trays=28
-2026-03-02 03:52:12,101 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=28
-2026-03-02 03:52:15,503 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC fetch range keyset-paged pages=6 raw_rows=57602 batch_size=10000
-2026-03-02 03:52:16,240 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial fetch done elapsed_ms=20921 raw_rows=57602 signals=37
-2026-03-02 03:52:16,267 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=115 changed=37 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T03:50:05
-2026-03-02 03:52:16,270 INFO __main__ [wip-runtime] UI snapshot event trays=42
-2026-03-02 03:52:16,294 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load completed elapsed_ms=20978 merged=115 trays=42 ccu=78 fpc=37 overlap=37 backfill_scheduled=False watermark=2026-03-02T03:51:55.317663 partial_source=ccu fpc_timed_out=False mode=today
-2026-03-02 03:52:16,294 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator start completed
-2026-03-02 03:52:16,294 INFO __main__ [wip-runtime] Orchestrator started successfully
-2026-03-02 03:52:16,294 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh loop started interval_seconds=6.0
-2026-03-02 03:52:16,323 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=42
-2026-03-02 03:52:22,886 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=2 changed=1 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=2 next_wm=2026-03-02T03:51:35
-2026-03-02 03:52:22,903 INFO __main__ [wip-runtime] UI projection event
-2026-03-02 03:52:22,906 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #1 completed elapsed_ms=604 merged=2 changed=1
-2026-03-02 03:53:13,626 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=1 changed=1 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=1 next_wm=2026-03-02T03:52:19
-2026-03-02 03:53:13,630 INFO __main__ [wip-runtime] UI projection event
-2026-03-02 03:53:13,634 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #5 completed elapsed_ms=300 merged=1 changed=1
-2026-03-02 03:54:06,441 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=0 changed=0 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T03:53:19.350262
-2026-03-02 03:54:06,445 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #9 completed elapsed_ms=2079 merged=0 changed=0
-2026-03-02 03:55:04,464 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=0 changed=0 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T03:54:19.404987
-2026-03-02 03:55:04,465 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #13 completed elapsed_ms=57 merged=0 changed=0
-2026-03-02 03:56:04,469 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=0 changed=0 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T03:55:19.411377
-2026-03-02 03:56:04,472 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #17 completed elapsed_ms=47 merged=0 changed=0
-2026-03-02 03:57:04,612 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=0 changed=0 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T03:56:19.475072
-2026-03-02 03:57:04,614 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #21 completed elapsed_ms=132 merged=0 changed=0
-2026-03-02 03:58:04,569 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=0 changed=0 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T03:57:19.523496
-2026-03-02 03:58:04,569 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #25 completed elapsed_ms=41 merged=0 changed=0
+2026-03-02 04:44:19,961 INFO __main__ [MainThread] Runtime start requested
+2026-03-02 04:44:19,961 INFO __main__ [wip-runtime] Runtime thread main started
+2026-03-02 04:44:19,961 INFO __main__ [wip-runtime] Runtime async bootstrap started
+2026-03-02 04:44:19,961 INFO __main__ [wip-runtime] Shared grouping state enabled path=C:\Users\PROMDNGUYEN02\OneDrive - Techtronic Industries Co. Ltd\AES_Mass production - WIP Management\grouping_state.json
+2026-03-02 04:44:19,961 INFO __main__ [wip-runtime] Runtime role=leader lock_path=C:\Users\PROMDNGUYEN02\OneDrive - Techtronic Industries Co. Ltd\AES_Mass production - WIP Management\.leader.lock
+2026-03-02 04:44:19,961 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU repo: using JSON_VALUE('$.TRAYID.paramValue') for tray ID extraction (MANUFACTURE_CODE contains machine codes, not tray IDs)
+2026-03-02 04:44:19,961 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator initialized sql_timeout=15s max_batch=10000 poll=6.0s today_only=True window_ccu_start=2026-03-01T18:00:00 window_fpc_start=2026-03-02T00:00:00
+2026-03-02 04:44:19,961 INFO wip_management.infrastructure.messaging.event_bus [wip-runtime] Event bus subscribe subscribers=1 queue_size=20000
+2026-03-02 04:44:19,961 INFO __main__ [wip-runtime] Runtime subscribed to event bus
+2026-03-02 04:44:19,961 INFO __main__ [wip-runtime] Runtime bootstrap signal emitted to UI thread
+2026-03-02 04:44:19,961 INFO __main__ [MainThread] Runtime thread bootstrapped successfully
+2026-03-02 04:44:19,961 INFO __main__ [wip-runtime] Starting orchestrator service
+2026-03-02 04:44:19,961 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator start begin
+2026-03-02 04:44:19,961 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] Starting SQL pool with 1 driver candidate(s): ['SQL Server']
+2026-03-02 04:44:19,961 WARNING wip_management.infrastructure.sqlserver.connection [wip-runtime] Legacy SQL driver 'SQL Server' detected. Using 3-LANE SAFE mode (3 connections: ccu + fpc + ui, 1 shared ODBC thread). All ODBC calls serialised through a single OS thread to prevent access-violation crashes from the non-thread-safe driver DLL. Install 'ODBC Driver 17 for SQL Server' for true parallelism.
+2026-03-02 04:44:19,973 INFO __main__ [wip-runtime] UI event coalescer loop started
+2026-03-02 04:44:20,192 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL ODBC driver selected configured=auto active=SQL Server
+2026-03-02 04:44:20,193 INFO wip_management.infrastructure.sqlserver.connection [wip-runtime] SQL query concurrency: 3-LANE SAFE mode lanes=[ccu, fpc, ui] connections=3 shared_executor_threads=1 is_legacy=True (all ODBC calls serialised through 1 OS thread)
+2026-03-02 04:44:20,212 WARNING wip_management.infrastructure.sqlserver.dashboard_repo [wip-runtime] Dashboard repo detected read-only database; skip ensure_schema schema_available=True
+2026-03-02 04:44:20,213 INFO wip_management.application.state.state_store [wip-runtime] State store writer loop started queue_size=20000
+2026-03-02 04:44:20,214 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load window TODAY mode ccu_start=2026-03-01T18:00:00 (10.7h) fpc_start=2026-03-02T00:00:00 (4.7h) end=2026-03-02T04:44:20.214489 buffer=6.0h today_start=2026-03-02T00:00:00 filter=show_if_ccu_today_OR_fpc_today fpc_timeout=180s
+2026-03-02 04:44:20,214 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU initial fetch start start_time=2026-03-01T18:00:00 end_time=2026-03-02T04:44:20.214489 batch_size=10000
+2026-03-02 04:44:20,214 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial fetch start start_time=2026-03-02T00:00:00 end_time=2026-03-02T04:44:20.214489 filters=none
+2026-03-02 04:44:37,410 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU fetch range paged pages=4 raw_rows=33602 batch_size=10000
+2026-03-02 04:44:37,910 INFO wip_management.infrastructure.sqlserver.ccu_repo [wip-runtime] CCU initial fetch done elapsed_ms=17703 raw_rows=33602 signals=87
+2026-03-02 04:44:37,937 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=87 changed=87 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T04:43:05
+2026-03-02 04:44:37,941 INFO __main__ [wip-runtime] UI snapshot event trays=37
+2026-03-02 04:44:37,946 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load partial published source=ccu merged=87 changed=87 trays=37
+2026-03-02 04:44:37,985 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=37
+2026-03-02 04:44:44,146 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC fetch range keyset-paged pages=7 raw_rows=68882 batch_size=10000
+2026-03-02 04:44:44,913 INFO wip_management.infrastructure.sqlserver.fpc_repo [wip-runtime] FPC initial fetch done elapsed_ms=24695 raw_rows=68882 signals=45
+2026-03-02 04:44:44,942 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=132 changed=45 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=0 next_wm=2026-03-02T04:43:11
+2026-03-02 04:44:44,945 INFO __main__ [wip-runtime] UI snapshot event trays=51
+2026-03-02 04:44:44,975 INFO wip_management.application.services.orchestrator [wip-runtime] Initial load completed elapsed_ms=24759 merged=132 trays=51 ccu=87 fpc=45 overlap=45 backfill_scheduled=False watermark=2026-03-02T04:44:20.214489 partial_source=ccu fpc_timed_out=False mode=today
+2026-03-02 04:44:44,977 INFO wip_management.application.services.orchestrator [wip-runtime] Orchestrator start completed
+2026-03-02 04:44:44,977 INFO __main__ [wip-runtime] Orchestrator started successfully
+2026-03-02 04:44:44,977 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh loop started interval_seconds=6.0
+2026-03-02 04:44:44,993 INFO wip_management.presentation.ui.viewmodels [MainThread] BoardViewModel snapshot applied trays=51
+2026-03-02 04:44:51,225 INFO wip_management.application.use_cases.ingest_signals [wip-runtime] Ingest execute merged=2 changed=0 missing_ccu=0 remapped_fpc_by_lot=0 unmapped_fpc_by_lot=1 next_wm=2026-03-02T04:43:11
+2026-03-02 04:44:51,225 INFO wip_management.application.services.orchestrator [wip-runtime] Refresh #1 completed elapsed_ms=248 merged=2 changed=0

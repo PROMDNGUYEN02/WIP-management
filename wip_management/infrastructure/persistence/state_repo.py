@@ -38,6 +38,13 @@ class SharedGroupingStateRepository:
             out[tray_key] = (column, trolley_id, mode)
         return out
 
+    async def load_known_trolley_ids(self) -> list[str]:
+        document = await asyncio.to_thread(self._read_document_sync)
+        raw = document.get("known_trolley_ids")
+        if not isinstance(raw, list):
+            return []
+        return _sanitize_trolley_ids(raw)
+
     async def load_projection(self) -> dict[str, Any]:
         document = await asyncio.to_thread(self._read_document_sync)
         raw = document.get("last_projection")
@@ -77,6 +84,13 @@ class SharedGroupingStateRepository:
         await asyncio.to_thread(
             self._update_document_sync,
             _replace_assignments_mutator(sanitized),
+        )
+
+    async def save_known_trolley_ids(self, trolley_ids: list[str]) -> None:
+        sanitized = _sanitize_trolley_ids(trolley_ids)
+        await asyncio.to_thread(
+            self._update_document_sync,
+            _replace_known_trolley_ids_mutator(sanitized),
         )
 
     async def save_projection(self, projection: dict[str, Any]) -> None:
@@ -135,7 +149,13 @@ class SharedGroupingStateRepository:
 
 
 def _empty_document() -> dict[str, Any]:
-    return {"version": 1, "manual_assignments": {}, "last_projection": {}, "updated_at": None}
+    return {
+        "version": 1,
+        "manual_assignments": {},
+        "known_trolley_ids": [],
+        "last_projection": {},
+        "updated_at": None,
+    }
 
 
 def _set_assignment_mutator(tray_id: str, column: str, trolley_id: str, mode: str = "manual"):
@@ -174,3 +194,22 @@ def _replace_assignments_mutator(assignments: dict[str, tuple[str, str, str]]):
         document["manual_assignments"] = manual_assignments
 
     return _mutate
+
+
+def _replace_known_trolley_ids_mutator(trolley_ids: list[str]):
+    def _mutate(document: dict[str, Any]) -> None:
+        document["known_trolley_ids"] = list(trolley_ids)
+
+    return _mutate
+
+
+def _sanitize_trolley_ids(values: list[object]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        trolley_id = str(value).strip()
+        if not trolley_id or trolley_id in seen:
+            continue
+        seen.add(trolley_id)
+        out.append(trolley_id)
+    return out
