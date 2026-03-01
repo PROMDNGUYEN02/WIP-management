@@ -81,6 +81,26 @@ from wip_management.infrastructure.sqlserver.connection import SQLServerConnecti
 from wip_management.infrastructure.sqlserver.dashboard_repo import DashboardRepo
 from wip_management.infrastructure.sqlserver.delta_tracker import InMemoryDeltaTracker
 from wip_management.infrastructure.sqlserver.fpc_repo import FpcRepo
+from wip_management.presentation.ui.charts import BarChart, DonutChart, GaugeChart, LineChart
+from wip_management.presentation.ui.components import (
+    Divider,
+    EmptyState,
+    IconButton,
+    LoadingOverlay,
+    MetricCard,
+    SearchBar,
+    Skeleton,
+    ToggleSwitch,
+)
+from wip_management.presentation.ui.dialogs import (
+    ConfirmDialog,
+    DashboardPanel,
+    SettingsDialog,
+    TrayPickerDialog,
+    TrolleyDetailDialog,
+)
+from wip_management.presentation.ui.notifications import ToastType, toast_manager
+from wip_management.presentation.ui.theme import ThemeMode, get_theme
 from wip_management.presentation.ui.viewmodels import BoardViewModel, TrolleyListModel, UNGROUP_CHECK_VISUAL_ROLE
 from wip_management.presentation.ui.mapper import parse_datetime
 
@@ -601,6 +621,22 @@ def get_modern_stylesheet() -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _configure_logging() -> None:
+    class _SafeConsoleStream:
+        def __init__(self, stream) -> None:
+            self._stream = stream
+            self.encoding = getattr(stream, "encoding", None)
+
+        def write(self, text: str) -> int:
+            try:
+                return self._stream.write(text)
+            except UnicodeEncodeError:
+                encoding = self.encoding or "utf-8"
+                safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+                return self._stream.write(safe_text)
+
+        def flush(self) -> None:
+            self._stream.flush()
+
     level_name = settings.log_level.upper().strip() or "INFO"
     level = getattr(logging, level_name, logging.INFO)
     formatter = logging.Formatter(
@@ -610,7 +646,7 @@ def _configure_logging() -> None:
     root.handlers.clear()
     root.setLevel(level)
     if settings.log_to_console:
-        console_handler = logging.StreamHandler(stream=sys.stdout)
+        console_handler = logging.StreamHandler(stream=_SafeConsoleStream(sys.stdout))
         console_handler.setFormatter(formatter)
         root.addHandler(console_handler)
     log_path = settings.log_file.strip()
@@ -2580,7 +2616,13 @@ class _MainWindow(QMainWindow):
         self._suggested_trolley_id = ""
         self._centered_once = False
         self._last_update_time: datetime | None = None
+        self._pending_search_query = ""
+        self._dashboard_panel: DashboardPanel | None = None
+        self._dashboard_visible = False
         self._viewer_mode = self._runtime.is_viewer_mode()
+        self._theme = get_theme()
+        self._metrics_loaded = False
+        self._metric_skeletons: list[Skeleton] = []
         
         self._window_status_timer = QTimer(self)
         self._window_status_timer.setInterval(2000)
@@ -2591,16 +2633,23 @@ class _MainWindow(QMainWindow):
         self._clock_timer.timeout.connect(self._update_clock)
         self._clock_timer.start()
         
+        self._status_clear_timer = QTimer(self)
+        self._status_clear_timer.setSingleShot(True)
+        self._status_clear_timer.timeout.connect(self._clear_status)
+        
         self._event_filter_installed = False
         
         self.setWindowTitle("🏭 WIP Management")
         self.resize(1500, 900)
-        self.setStyleSheet(get_modern_stylesheet())
+        
         
         self._setup_ui()
-        self._auto_group_last_state = bool(self._auto_group_checkbox.isChecked())
+        self._auto_group_last_state = bool(self._auto_group_checkbox.is_checked())
         self._setup_connections()
         self._setup_shortcuts()
+        self._on_theme_changed(self._theme.mode.value)
+        toast_manager.set_parent(self)
+        toast_manager.set_position("top-right")
         self._apply_runtime_mode()
         
         app = QApplication.instance()
@@ -2610,9 +2659,11 @@ class _MainWindow(QMainWindow):
     
     def _setup_ui(self) -> None:
         root = QWidget(self)
+        self._root_widget = root
         layout = QVBoxLayout(root)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(20)
+        p = self._theme.palette
         
         # ═══════════════════════════════════════════════════════════════
         # TOP SECTION: Metrics
@@ -2621,12 +2672,12 @@ class _MainWindow(QMainWindow):
         metrics_row.setSpacing(16)
         
         self._metric_boxes = {
-            "tray_count": _ModernMetricCard("Total Trays", "📦", ThemeColors.PRIMARY),
-            "group_count": _ModernMetricCard("Grouped", "✓", ThemeColors.SUCCESS),
-            "assembly_ungroup_count": _ModernMetricCard("Ungrouped", "⏳", ThemeColors.WARNING),
-            "assembly_trolley_count": _ModernMetricCard("Assembly", "🏭", "#8b5cf6"),
-            "queue_trolley_count": _ModernMetricCard("Queue", "📋", ThemeColors.INFO),
-            "precharge_trolley_count": _ModernMetricCard("Precharge", "⚡", "#f59e0b"),
+            "tray_count": MetricCard("Total Trays", "📦", self._theme.palette.chart_1, show_sparkline=True),
+            "group_count": MetricCard("Grouped", "✓", self._theme.palette.success, show_sparkline=True),
+            "assembly_ungroup_count": MetricCard("Ungrouped", "⏳", self._theme.palette.warning),
+            "assembly_trolley_count": MetricCard("Assembly", "🏭", self._theme.palette.chart_2),
+            "queue_trolley_count": MetricCard("Queue", "📋", self._theme.palette.chart_6),
+            "precharge_trolley_count": MetricCard("Precharge", "⚡", self._theme.palette.chart_4),
         }
         
         for key in ["tray_count", "group_count", "assembly_ungroup_count", 
@@ -2637,50 +2688,29 @@ class _MainWindow(QMainWindow):
         
         layout.addLayout(metrics_row)
         
+        self._metrics_skeleton_bar = QWidget()
+        skeleton_row = QHBoxLayout(self._metrics_skeleton_bar)
+        skeleton_row.setContentsMargins(4, 0, 4, 0)
+        skeleton_row.setSpacing(12)
+        for _ in range(6):
+            sk = Skeleton(height=8)
+            self._metric_skeletons.append(sk)
+            skeleton_row.addWidget(sk)
+        layout.addWidget(self._metrics_skeleton_bar)
+        
         # ═══════════════════════════════════════════════════════════════
         # TOOLBAR
         # ═══════════════════════════════════════════════════════════════
         toolbar = QFrame()
-        toolbar.setStyleSheet(f"""
-            QFrame {{
-                background: {ThemeColors.SURFACE};
-                border: 1px solid {ThemeColors.BORDER};
-                border-radius: 12px;
-            }}
-        """)
+        toolbar.setObjectName("card")
         toolbar_layout = QHBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(16, 12, 16, 12)
         toolbar_layout.setSpacing(12)
         
         # Search
-        search_container = QFrame()
-        search_container.setStyleSheet(f"""
-            QFrame {{
-                background: {ThemeColors.BG};
-                border: 1px solid {ThemeColors.BORDER};
-                border-radius: 10px;
-            }}
-        """)
-        search_layout = QHBoxLayout(search_container)
-        search_layout.setContentsMargins(12, 0, 4, 0)
-        search_layout.setSpacing(8)
-        
-        search_icon = QLabel("🔍")
-        search_layout.addWidget(search_icon)
-        
-        self._search_input = QLineEdit()
-        self._search_input.setPlaceholderText("Search Tray/Cell ID...")
-        self._search_input.setFrame(False)
-        self._search_input.setStyleSheet("background: transparent; border: none; padding: 10px 0;")
-        self._search_input.setMinimumWidth(180)
-        search_layout.addWidget(self._search_input)
-        
-        self._search_btn = QPushButton("Search")
-        self._search_btn.setObjectName("secondaryBtn")
-        self._search_btn.setMaximumWidth(80)
-        search_layout.addWidget(self._search_btn)
-        
-        toolbar_layout.addWidget(search_container)
+        self._search_bar = SearchBar("Search Tray/Cell ID...", show_button=True)
+        self._search_bar.setMinimumWidth(320)
+        toolbar_layout.addWidget(self._search_bar)
         toolbar_layout.addStretch()
         
         # Action buttons
@@ -2697,27 +2727,50 @@ class _MainWindow(QMainWindow):
         # Separator
         sep1 = QFrame()
         sep1.setFrameShape(QFrame.Shape.VLine)
-        sep1.setStyleSheet(f"background: {ThemeColors.BORDER};")
+        sep1.setStyleSheet(f"background: {p.border};")
         sep1.setMaximumWidth(1)
         toolbar_layout.addWidget(sep1)
         
         # Auto group toggle
-        self._auto_group_checkbox = QCheckBox("Auto Group")
-        self._auto_group_checkbox.setChecked(settings.auto_group_default_enabled)
+        auto_group_label = QLabel("Auto Group")
+        auto_group_label.setStyleSheet(f"color: {p.text_secondary}; font-weight: 600;")
+        toolbar_layout.addWidget(auto_group_label)
+        self._auto_group_checkbox = ToggleSwitch(checked=settings.auto_group_default_enabled)
         self._auto_group_checkbox.setToolTip("Enable automatic tray grouping")
         toolbar_layout.addWidget(self._auto_group_checkbox)
+        
+        self._theme_btn = IconButton("🌙")
+        self._theme_btn.setToolTip("Toggle dark/light mode (Ctrl+T)")
+        toolbar_layout.addWidget(self._theme_btn)
+        
+        self._analytics_btn = IconButton("📊")
+        self._analytics_btn.setCheckable(True)
+        self._analytics_btn.setToolTip("Toggle analytics dashboard (Ctrl+D)")
+        toolbar_layout.addWidget(self._analytics_btn)
         
         # Separator
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.VLine)
-        sep2.setStyleSheet(f"background: {ThemeColors.BORDER};")
+        sep2.setStyleSheet(f"background: {p.border};")
         sep2.setMaximumWidth(1)
         toolbar_layout.addWidget(sep2)
         
+        gauge_container = QFrame()
+        gauge_container.setObjectName("card")
+        gauge_layout = QVBoxLayout(gauge_container)
+        gauge_layout.setContentsMargins(8, 4, 8, 4)
+        gauge_layout.setSpacing(2)
+        gauge_title = QLabel("Grouped %")
+        gauge_title.setStyleSheet(f"font-size: 11px; color: {p.text_muted};")
+        gauge_layout.addWidget(gauge_title, alignment=Qt.AlignmentFlag.AlignCenter)
+        self._grouping_gauge = GaugeChart(value=0.0, max_value=100.0, label="", color=p.primary)
+        self._grouping_gauge.setFixedSize(120, 70)
+        gauge_layout.addWidget(self._grouping_gauge, alignment=Qt.AlignmentFlag.AlignCenter)
+        toolbar_layout.addWidget(gauge_container)
+        
         # Settings button
-        self._settings_btn = QPushButton("⚙")
-        self._settings_btn.setObjectName("iconBtn")
-        self._settings_btn.setToolTip("Open settings")
+        self._settings_btn = IconButton("⚙")
+        self._settings_btn.setToolTip("Settings (Ctrl+,)")
         toolbar_layout.addWidget(self._settings_btn)
         
         layout.addWidget(toolbar)
@@ -2743,8 +2796,10 @@ class _MainWindow(QMainWindow):
         self._add_trolley_btn.setMaximumWidth(80)
         ungroup_actions_layout.addWidget(self._add_trolley_btn)
         
-        # Board with 3 columns
-        board = QHBoxLayout()
+        # Board with 3 columns + dashboard sidebar
+        board_widget = QWidget()
+        board = QHBoxLayout(board_widget)
+        board.setContentsMargins(0, 0, 0, 0)
         board.setSpacing(16)
         
         self._assembly_card = _ModernColumnCard(
@@ -2779,9 +2834,19 @@ class _MainWindow(QMainWindow):
         board.addWidget(self._queue_card, 1)
         board.addWidget(self._precharge_card, 1)
         
-        layout.addLayout(board, 1)
+        self._dashboard_panel = DashboardPanel()
+        self._dashboard_panel.setFixedWidth(340)
+        self._dashboard_panel.setVisible(False)
+        self._analytics_panel = self._dashboard_panel
+        
+        board_row = QHBoxLayout()
+        board_row.setSpacing(12)
+        board_row.addWidget(board_widget, 1)
+        board_row.addWidget(self._dashboard_panel)
+        layout.addLayout(board_row, 1)
         
         self.setCentralWidget(root)
+        self._loading_overlay = LoadingOverlay(root)
         
         # ═══════════════════════════════════════════════════════════════
         # STATUS BAR
@@ -2789,17 +2854,25 @@ class _MainWindow(QMainWindow):
         status_bar = self.statusBar()
         status_bar.setSizeGripEnabled(False)
         
-        self._status = QLabel("Ready")
-        self._status.setStyleSheet(f"color: {ThemeColors.TEXT_SECONDARY}; padding: 4px 8px;")
+        self._status = QLabel("🟢 Ready")
+        self._status.setStyleSheet(f"color: {p.text_secondary}; padding: 4px 12px;")
         status_bar.addWidget(self._status, 1)
         
-        self._connection_status = QLabel("🟢 Connected")
-        self._connection_status.setStyleSheet(f"color: {ThemeColors.SUCCESS}; font-weight: 500; padding: 4px 12px;")
+        self._refresh_indicator = QLabel("")
+        self._refresh_indicator.setStyleSheet(f"color: {p.text_muted}; font-size: 11px; padding: 4px 8px;")
+        status_bar.addPermanentWidget(self._refresh_indicator)
+        
+        self._connection_status = QLabel("")
         status_bar.addPermanentWidget(self._connection_status)
         
+        sep = QLabel("|")
+        sep.setStyleSheet(f"color: {p.border}; padding: 4px 4px;")
+        status_bar.addPermanentWidget(sep)
+        
         self._clock_label = QLabel("")
-        self._clock_label.setStyleSheet(f"color: {ThemeColors.TEXT_MUTED}; padding: 4px 12px;")
+        self._clock_label.setStyleSheet(f"color: {p.text_muted}; padding: 4px 12px;")
         status_bar.addPermanentWidget(self._clock_label)
+        self._refresh_connection_badge()
         self._update_clock()
     
     def _setup_connections(self) -> None:
@@ -2807,10 +2880,12 @@ class _MainWindow(QMainWindow):
         self._quick_refresh_btn.clicked.connect(self._on_quick_refresh)
         self._full_refresh_btn.clicked.connect(self._on_full_refresh)
         self._add_trolley_btn.clicked.connect(self._on_add_trolley)
-        self._search_btn.clicked.connect(self._on_search)
-        self._search_input.returnPressed.connect(self._on_search)
+        self._search_bar.search_triggered.connect(self._on_search)
         self._settings_btn.clicked.connect(self._on_settings)
+        self._theme_btn.clicked.connect(self._toggle_theme)
+        self._analytics_btn.toggled.connect(self._toggle_dashboard)
         self._auto_group_checkbox.toggled.connect(self._on_auto_group_toggled)
+        self._theme.theme_changed.connect(self._on_theme_changed)
         self._action_bridge.action_done.connect(self._on_action_done)
     
     def _setup_shortcuts(self) -> None:
@@ -2819,20 +2894,59 @@ class _MainWindow(QMainWindow):
         # Ctrl+Shift+R: Full refresh
         QShortcut(QKeySequence("Ctrl+Shift+R"), self, self._on_full_refresh)
         # Ctrl+F: Focus search
-        QShortcut(QKeySequence("Ctrl+F"), self, lambda: self._search_input.setFocus())
+        QShortcut(QKeySequence("Ctrl+F"), self, lambda: self._search_bar.setFocus())
         # Ctrl+,: Settings
         QShortcut(QKeySequence("Ctrl+,"), self, self._on_settings)
+        # Ctrl+D: Analytics toggle
+        QShortcut(QKeySequence("Ctrl+D"), self, lambda: self._analytics_btn.toggle())
+        # Ctrl+T: Theme toggle
+        QShortcut(QKeySequence("Ctrl+T"), self, self._toggle_theme)
         # Escape: Clear selection
         QShortcut(QKeySequence("Escape"), self, self._clear_all_selections)
+        # F5: Quick refresh
+        QShortcut(QKeySequence("F5"), self, self._on_quick_refresh)
     
     def _update_clock(self) -> None:
         now = datetime.now()
-        self._clock_label.setText(now.strftime("%H:%M:%S"))
+        self._clock_label.setText(f"🕐 {now.strftime('%H:%M:%S')}")
 
     def _set_auto_group_checkbox_safely(self, checked: bool) -> None:
         blocker = QSignalBlocker(self._auto_group_checkbox)
-        self._auto_group_checkbox.setChecked(bool(checked))
+        self._auto_group_checkbox.set_checked(bool(checked), animate=False)
         del blocker
+
+    def _refresh_connection_badge(self) -> None:
+        p = self._theme.palette
+        if self._viewer_mode:
+            self._connection_status.setText("🟡 Viewer mode")
+            self._connection_status.setStyleSheet(f"color: {p.warning}; font-weight: 600; padding: 4px 12px;")
+        else:
+            self._connection_status.setText("🟢 Connected")
+            self._connection_status.setStyleSheet(f"color: {p.success}; font-weight: 600; padding: 4px 12px;")
+
+    def _toggle_theme(self) -> None:
+        self._theme.toggle()
+
+    def _on_theme_changed(self, mode: str | ThemeMode) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(self._theme.get_stylesheet())
+        mode_value = mode.value if isinstance(mode, ThemeMode) else str(mode).lower()
+        is_dark = mode_value == "dark"
+        self._theme_btn.setText("☀️" if is_dark else "🌙")
+        self._status.setStyleSheet(f"color: {self._theme.palette.text_secondary}; padding: 4px 12px;")
+        self._clock_label.setStyleSheet(f"color: {self._theme.palette.text_muted}; padding: 4px 12px;")
+        self._refresh_connection_badge()
+        if self.isVisible():
+            toast_manager.info(
+                f"Switched to {'dark' if is_dark else 'light'} mode",
+                duration_ms=2000,
+            )
+
+    def _toggle_dashboard(self, visible: bool) -> None:
+        if self._dashboard_panel is not None:
+            self._dashboard_panel.setVisible(visible)
+        self._dashboard_visible = bool(visible)
 
     def _apply_runtime_mode(self) -> None:
         if not self._viewer_mode:
@@ -2843,8 +2957,7 @@ class _MainWindow(QMainWindow):
         self._settings_btn.setEnabled(False)
         self._add_trolley_input.setEnabled(False)
         self._add_trolley_btn.setEnabled(False)
-        self._connection_status.setText("🟡 Viewer mode")
-        self._connection_status.setStyleSheet(f"color: {ThemeColors.WARNING}; font-weight: 500; padding: 4px 12px;")
+        self._refresh_connection_badge()
         self._show_status("⚠️ Viewer mode: use leader instance for Auto group and manual grouping", "warning")
     
     def showEvent(self, event) -> None:
@@ -2869,11 +2982,21 @@ class _MainWindow(QMainWindow):
     
     def _on_updated(self, payload: dict[str, int]) -> None:
         self._last_update_time = datetime.now()
-        
+        if not self._metrics_loaded:
+            self._metrics_loaded = True
+            self._metrics_skeleton_bar.setVisible(False)
+            for sk in self._metric_skeletons:
+                with contextlib.suppress(Exception):
+                    sk.stop()
+
         # Update metric cards
         for key, box in self._metric_boxes.items():
             box.set_value(int(payload.get(key, 0)))
-        
+        grouped = int(payload.get("group_count", 0))
+        total_trays = int(payload.get("tray_count", 0))
+        grouped_pct = (100.0 * grouped / total_trays) if total_trays > 0 else 0.0
+        self._grouping_gauge.set_value(grouped_pct)
+
         # Update column stats
         self._assembly_card.set_stats_text(
             f"🚗 {payload.get('assembly_trolley_count', 0)} • "
@@ -2890,7 +3013,10 @@ class _MainWindow(QMainWindow):
             f"📦 {payload.get('precharge_tray_count', 0)} • "
             f"🔋 {payload.get('precharge_cell_count', 0):,}"
         )
-        
+
+        if self._dashboard_panel is not None and self._dashboard_visible:
+            self._dashboard_panel.update_data(payload)
+        self._refresh_indicator.setText(f"Updated {datetime.now().strftime('%H:%M:%S')}")
         self._refresh_suggested_trolley_id(force=False)
     
     # ═══════════════════════════════════════════════════════════════════════════
@@ -2911,8 +3037,8 @@ class _MainWindow(QMainWindow):
             lock_ui=False,
         )
     
-    def _on_search(self) -> None:
-        raw = self._search_input.text().strip()
+    def _on_search(self, query: str = "") -> None:
+        raw = (query or self._search_bar.text()).strip()
         if not raw:
             self._show_status("⚠️ Search input is empty", "warning")
             return
@@ -3015,7 +3141,7 @@ class _MainWindow(QMainWindow):
         )
     
     def _on_settings(self) -> None:
-        dialog = _ModernSettingsDialog(self)
+        dialog = SettingsDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         payload = dialog.payload()
@@ -3177,15 +3303,16 @@ class _MainWindow(QMainWindow):
         trolley_id = trolley.get("trolley_id", "")
         mode = str(trolley.get("mode", "")).lower()
         is_manual = mode == "manual"
-        auto_group_enabled = self._auto_group_checkbox.isChecked()
+        auto_group_enabled = self._auto_group_checkbox.is_checked()
         is_editable = is_manual or not auto_group_enabled
         multi_selected = len(selected_trolleys) > 1
+        p = self._theme.palette
         
         menu = QMenu(self)
         menu.setStyleSheet(f"""
             QMenu {{
-                background: {ThemeColors.SURFACE};
-                border: 1px solid {ThemeColors.BORDER};
+                background: {p.surface};
+                border: 1px solid {p.border};
                 border-radius: 12px;
                 padding: 8px;
             }}
@@ -3194,7 +3321,7 @@ class _MainWindow(QMainWindow):
                 border-radius: 6px;
             }}
             QMenu::item:selected {{
-                background: {ThemeColors.SURFACE_HOVER};
+                background: {p.surface_hover};
             }}
         """)
         
@@ -3247,16 +3374,48 @@ class _MainWindow(QMainWindow):
             if not tray_ids:
                 self._show_status("⚠️ No trays to remove", "warning")
                 return
+            picker = TrayPickerDialog(
+                tray_ids=[str(t).strip() for t in tray_ids if str(t).strip()],
+                title=f"Select trays in {trolley_id}",
+                parent=self,
+            )
+            if picker.exec() != QDialog.DialogCode.Accepted:
+                return
+            selected_tray_ids = picker.selected_tray_ids()
+            if not selected_tray_ids:
+                self._show_status("⚠️ No trays selected", "warning")
+                return
             self._run_action(
                 action_name="Remove trays",
-                action=lambda: self._runtime.manual_ungroup_many(tray_ids),
+                action=lambda: self._runtime.manual_ungroup_many(selected_tray_ids),
             )
         elif chosen == clear_action:
+            clear_confirm = ConfirmDialog(
+                title="Clear trolley",
+                message=f"Remove all trays from {trolley_id}?",
+                confirm_text="Clear",
+                danger=True,
+                icon="🗑️",
+                parent=self,
+            )
+            if clear_confirm.exec() != QDialog.DialogCode.Accepted:
+                return
             self._run_action(
                 action_name="Clear trolley",
                 action=lambda: self._runtime.clear_trolley(trolley_id),
             )
         elif chosen == delete_action:
+            target_text = f"{len(selected_trolleys)} selected trolleys" if multi_selected else f"trolley {trolley_id}"
+            delete_confirm = ConfirmDialog(
+                title="Delete trolley",
+                message=f"This will permanently delete {target_text}. Continue?",
+                confirm_text="Delete",
+                danger=True,
+                icon="❌",
+                parent=self,
+            )
+            if delete_confirm.exec() != QDialog.DialogCode.Accepted:
+                return
             if multi_selected:
                 ids = [t["trolley_id"] for t in selected_trolleys]
                 self._run_action(
@@ -3275,19 +3434,11 @@ class _MainWindow(QMainWindow):
             self._show_status("⚠️ Trolley has no trays", "warning")
             return
         tray_payloads = self._vm.tray_payloads(tray_ids)
-        rows = self._build_
-
-    def _show_trolley_detail_dialog(self, trolley: dict[str, Any]) -> None:
-        tray_ids = [str(t).strip() for t in trolley.get("tray_ids", []) if str(t).strip()]
-        if not tray_ids:
-            self._show_status("⚠️ Trolley has no trays", "warning")
-            return
-        tray_payloads = self._vm.tray_payloads(tray_ids)
         rows = self._build_tray_summary_rows(tray_payloads)
         if not rows:
             self._show_status("⚠️ No tray data available", "warning")
             return
-        dialog = _ModernTrolleyDetailDialog(
+        dialog = TrolleyDetailDialog(
             runtime=self._runtime,
             trolley_id=str(trolley.get("trolley_id", "")),
             tray_rows=rows,
@@ -3392,8 +3543,9 @@ class _MainWindow(QMainWindow):
         if force or not current_text or current_text.upper() == previous_suggestion.upper():
             self._add_trolley_input.setText(next_suggestion)
     
-    def _show_status(self, message: str, status_type: str = "info") -> None:
+    def _show_status(self, message: str, status_type: str = "info", *, notify: bool = True) -> None:
         """Show status message with appropriate styling"""
+        p = self._theme.palette
         icons = {
             "success": "✅",
             "warning": "⚠️",
@@ -3401,18 +3553,30 @@ class _MainWindow(QMainWindow):
             "info": "ℹ️",
         }
         colors = {
-            "success": ThemeColors.SUCCESS,
-            "warning": ThemeColors.WARNING,
-            "danger": ThemeColors.DANGER,
-            "info": ThemeColors.TEXT_SECONDARY,
+            "success": p.success,
+            "warning": p.warning,
+            "danger": p.danger,
+            "info": p.text_secondary,
         }
         icon = icons.get(status_type, "")
-        color = colors.get(status_type, ThemeColors.TEXT_SECONDARY)
-        
+        color = colors.get(status_type, p.text_secondary)
+
         display_msg = f"{icon} {message}" if icon and not message.startswith(icon) else message
         self._status.setText(display_msg)
-        self._status.setStyleSheet(f"color: {color}; padding: 4px 8px;")
-    
+        self._status.setStyleSheet(f"color: {color}; padding: 4px 12px; font-size: 12px;")
+        self._status_clear_timer.start(8000)
+        if notify and status_type in {"success", "warning", "danger"}:
+            if status_type == "success":
+                toast_manager.success(message, duration_ms=2600)
+            elif status_type == "warning":
+                toast_manager.warning(message, duration_ms=3200)
+            else:
+                toast_manager.error(message, duration_ms=3800)
+
+    def _clear_status(self) -> None:
+        self._status.setText("🟢 Ready")
+        self._status.setStyleSheet(f"color: {self._theme.palette.text_secondary}; padding: 4px 12px; font-size: 12px;")
+
     def _clear_all_selections(self) -> None:
         """Clear all selections (trolley lists and tray table)"""
         self._clear_all_trolley_selections()
@@ -3471,6 +3635,7 @@ class _MainWindow(QMainWindow):
             self._show_status("⏳ Settings update in progress...", "warning")
             return
         self._settings_inflight = True
+        self._loading_overlay.start("Applying settings...")
         self._show_status(f"⏳ {action_name}...", "info")
         log.info("UI action started action=%s", action_name)
         
@@ -3530,6 +3695,7 @@ class _MainWindow(QMainWindow):
         # Handle settings action
         if action_name == "Apply settings":
             self._settings_inflight = False
+            self._loading_overlay.stop()
             if error:
                 self._show_status(f"❌ Settings failed: {error}", "danger")
                 self._pending_settings_context = None
@@ -3622,7 +3788,7 @@ class _MainWindow(QMainWindow):
         
         # Handle auto group
         if action_name == "Auto group":
-            self._auto_group_last_state = bool(self._auto_group_checkbox.isChecked())
+            self._auto_group_last_state = bool(self._auto_group_checkbox.is_checked())
             QTimer.singleShot(100, self._vm.force_refresh_summary)
         
         # Generic success
@@ -3635,8 +3801,9 @@ class _MainWindow(QMainWindow):
         self._full_refresh_btn.setEnabled(allow_mutation)
         self._auto_group_checkbox.setEnabled(allow_mutation)
         self._settings_btn.setEnabled(allow_mutation)
-        self._search_input.setEnabled(enabled)
-        self._search_btn.setEnabled(enabled)
+        self._search_bar.setEnabled(enabled)
+        self._theme_btn.setEnabled(enabled)
+        self._analytics_btn.setEnabled(enabled)
         self._add_trolley_input.setEnabled(allow_mutation)
         self._add_trolley_btn.setEnabled(allow_mutation)
         self._assembly_card.trolley_list.setEnabled(enabled)
@@ -3644,6 +3811,10 @@ class _MainWindow(QMainWindow):
         self._precharge_card.trolley_list.setEnabled(enabled)
         if self._assembly_card.tray_table is not None:
             self._assembly_card.tray_table.setEnabled(enabled)
+        if enabled:
+            self._loading_overlay.stop()
+        else:
+            self._loading_overlay.start("Processing...")
     
     # ═══════════════════════════════════════════════════════════════════════════
     # EVENT FILTER
@@ -3661,9 +3832,10 @@ class _MainWindow(QMainWindow):
                     # Widgets that should keep selection
                     keep_widgets = {
                         self._add_trolley_btn, self._add_trolley_input,
-                        self._search_btn, self._search_input,
+                        self._search_bar,
                         self._quick_refresh_btn, self._full_refresh_btn,
                         self._auto_group_checkbox, self._settings_btn,
+                        self._theme_btn, self._analytics_btn,
                     }
                     
                     keep_selection = target_widget is not None and any(
@@ -3693,6 +3865,8 @@ class _MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self._stop_window_load_monitor()
         self._clock_timer.stop()
+        self._loading_overlay.stop()
+        toast_manager.clear_all()
         app = QApplication.instance()
         if self._event_filter_installed and app is not None:
             app.removeEventFilter(self)
@@ -3731,6 +3905,7 @@ def main() -> int:
     # Set application-wide font
     font = QFont("Segoe UI", 10)
     app.setFont(font)
+    app.setStyleSheet(get_theme().get_stylesheet())
     
     # Create view model and bridge
     vm = BoardViewModel()
@@ -3744,6 +3919,11 @@ def main() -> int:
     # Create main window
     window = _MainWindow(vm=vm, runtime=runtime)
     window.show()
+    QTimer.singleShot(800, lambda: toast_manager.success(
+        "WIP Management loaded successfully",
+        title="🏭 Welcome",
+        duration_ms=3000,
+    ))
     
     try:
         exit_code = app.exec()
